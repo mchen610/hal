@@ -2,14 +2,14 @@ import builtins
 import functools
 import os
 import time
-from typing import Callable, Dict, Iterable, Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 import torch.distributed
 import tqdm as tqdm_module
 from tqdm import tqdm
 
-from hal.config import TrainerConfig
+from hal.later_use.config import TrainerConfig
 
 
 def barrier() -> None:
