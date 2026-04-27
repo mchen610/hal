@@ -156,7 +156,7 @@ matplotlib==3.10.1
     #   -r test_requirements.in
     #   mosaicml-streaming
     #   seaborn
-melee @ git+https://github.com/vladfi1/libmelee@b4a1a2585119bcedc398a512990dd9b95102eb74
+melee @ git+https://github.com/vladfi1/libmelee@a6ad70f1024f698461ef0b91078fa3ca3ef5157f
     # via -r test_requirements.in
 more-itertools==10.6.0
     # via

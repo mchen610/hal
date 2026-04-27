@@ -160,6 +160,7 @@ class MatchupMenuHelper:
 
     # Internal use
     _player_1_character_selected: bool = False
+    _menu_helper: melee.menuhelper.MenuHelper = attr.Factory(melee.menuhelper.MenuHelper)
 
     def select_character_and_stage(self, gamestate: melee.GameState) -> None:
         """
@@ -171,7 +172,7 @@ class MatchupMenuHelper:
             melee.menuhelper.MenuHelper.choose_versus_mode(gamestate=gamestate, controller=self.controller_1)
         # If we're at the character select screen, choose our character
         elif gamestate.menu_state == enums.Menu.CHARACTER_SELECT:
-            melee.menuhelper.MenuHelper.choose_character(
+            self._menu_helper.choose_character(
                 character=self.character_1,
                 gamestate=gamestate,
                 controller=self.controller_1,
@@ -182,7 +183,7 @@ class MatchupMenuHelper:
             )
             if self.character_2 is None:
                 return
-            melee.menuhelper.MenuHelper.choose_character(
+            self._menu_helper.choose_character(
                 character=self.character_2,
                 gamestate=gamestate,
                 controller=self.controller_2,
@@ -195,12 +196,16 @@ class MatchupMenuHelper:
         elif gamestate.menu_state == enums.Menu.STAGE_SELECT:
             if self.stage is None:
                 return
-            melee.menuhelper.MenuHelper.choose_stage(
-                stage=self.stage, gamestate=gamestate, controller=self.controller_1, character=self.character_1
+            self._menu_helper.choose_stage(
+                stage=self.stage,
+                gamestate=gamestate,
+                controller=self.controller_1,
+                character=self.character_1,
+                autostart=True,
             )
         # If we're at the postgame scores screen, spam START
         elif gamestate.menu_state == enums.Menu.POSTGAME_SCORES:
-            melee.menuhelper.MenuHelper.skip_postgame(controller=self.controller_1)
+            self._menu_helper.skip_postgame(controller=self.controller_1)
 
 
 @contextmanager
