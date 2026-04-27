@@ -6,7 +6,6 @@ from streaming.base.stream import Stream
 from hal.local_paths import REPO_DIR
 
 AWS_BUCKET = os.getenv("AWS_BUCKET")
-assert AWS_BUCKET is not None, "AWS_BUCKET environment variable is not set"
 
 
 class StreamRegistry:
@@ -20,6 +19,7 @@ class StreamRegistry:
 
     @classmethod
     def get(cls, name: str) -> Stream:
+        assert AWS_BUCKET, "AWS_BUCKET environment variable must be set to use registered streams"
         if name in cls.STREAMS:
             return cls.STREAMS[name]
         raise ValueError(f"Stream {name} not registered")
