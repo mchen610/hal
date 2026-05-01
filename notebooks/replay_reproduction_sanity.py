@@ -14,10 +14,10 @@ processor turns back into the slp's recorded values. Naive values cause
 double-quantization and divergence — see the README's "Why" sections for
 concrete numeric traces.
 
-Status (2026-05-01): in `normal` mode, `start_frame=0 prefix=300` of the
-dev replay reproduces with 21 hitlag_left mismatches at hit moments —
-all other fields bit-exact. `ffw` mode has separate staleness issues
-(EXI override race). See the README + `replay_reproduction_sanity.repro_log.md`.
+Status (2026-05-01): both `normal` and `ffw` modes reproduce
+`Game_20201215T165952.slp` with 4-21 `hitlag_left` mismatches per
+prefix (residual drift on hit moments) — all other comparison fields
+match bit-exactly. See the README + `replay_reproduction_sanity.repro_log.md`.
 """
 
 from __future__ import annotations
@@ -536,7 +536,7 @@ def mode_console_kwargs(
         "tmp_home_directory": True,
         "copy_home_directory": False,
         "replay_dir": str(replay_dir),
-        "blocking_input": False,
+        "blocking_input": True,
         "polling_mode": True,
         "polling_timeout": timeouts.poll_s,
         "slippi_port": port,

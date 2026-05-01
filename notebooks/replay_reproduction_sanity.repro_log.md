@@ -1,5 +1,27 @@
 # Replay reproduction — investigation log
 
+## 2026-05-01 update #5 — `blocking_input=True` is the libmelee escape hatch for FFW
+
+Found by reading `~/src/libmelee/test_live.py` (libmelee's own canonical
+DolphinTest). It uses `blocking_input=True, polling_mode` not set
+(default False). The flag wires through to Slippi-Ishiiruka's
+`Pipes::UpdateInput` → `m_blockingPipes`, which makes the input pipe
+block on `select()` until the bot writes a complete frame ending in
+`FLUSH`. This synchronizes pipe writes with the game's per-frame SI
+poll, so EXI override / FFW path can't read stale `padBuf` between our
+writes.
+
+Switching to `blocking_input=True` (kept `polling_mode=True` so
+`console.step()` still returns promptly): FFW mode's 151 mismatches
+collapsed to **4** at frames 42-45 — same `hitlag_left` pattern as
+normal mode. Both modes are now equivalent.
+
+Net: `normal` and `ffw` both reproduce
+`Game_20201215T165952.slp` with the same residual: a handful of hit
+moments where live has 4-7 extra hitlag frames vs source. All other
+fields (action, position, controller, shield, hitstun, speeds) match
+bit-exact.
+
 ## 2026-05-01 update #4 — byte-level diff explained: source has wider effective stick range
 
 Diagnosed by re-running with `save_replays=True` and parsing the live
