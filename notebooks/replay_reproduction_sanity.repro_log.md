@@ -1,5 +1,65 @@
 # Replay reproduction — investigation log
 
+## 2026-05-01 update #7 — UCF 0.74 vs 0.84 isolated, but disabling new patches breaks gameplay
+
+Found that the modern (current build, exi-ai-rebase) `Sys/GameSettings/GALE01r2.ini`
+ships **UCF 0.84**, while v2.2.3 (Oct 2020 — the build closest to source's
+2020-12-15 recording) shipped **UCF 0.74**. UCF 0.84 added five patches
+that 0.74 didn't have:
+
+- `External/UCF 0.84/UCF/UCF DBOOC SquatRv Fix.asm` at 0x800D65EC
+- `External/UCF 0.84/UCF/UCF Pad Buffer + 1.0 Cardinals.asm` at 0x806B460
+- `External/UCF 0.84/UCF/UCF SDI.asm` at 0x808E54C
+- `External/UCF 0.84/UCF/UCF Shield Drop Extended.asm` at 0x809A0B8
+- `External/UCF 0.84/UCF/UCF Shield SDI.asm` at 0x8093294
+
+Tested by editing `/home/ericgu/data/ssbm/squashfs-root/usr/bin/Sys/GameSettings/GALE01r2.ini`:
+
+1. **Removed `Pad Buffer + 1.0 Cardinals` block alone** (lines 285-369).
+   Result: 274 mismatches over 300 frames — actions, positions,
+   on_ground all diverge. The Pad Buffer is foundational; later UCF
+   patches (DB, SD, SDI) read state set up by it. Can't surgically
+   remove.
+2. **Replaced `$Required: General Codes` body with the 2020-07
+   (UCF 0.74) version**, kept rest of modern ini. Result: menu setup
+   timed out after 90s — old General Codes is incompatible with
+   modern Slippi Online / Recording patches.
+3. **Replaced entire ini with v2.2.3's Sys ini.** Result: same menu
+   setup timeout. The modern slippi-Ishiiruka binary expects modern
+   gecko codes.
+
+Other modern-only patches we noticed:
+
+- `Online/Core/BrawlOffscreenDamage` was extended (24 → 27 lines)
+  in current vs v2.2.3, with a new SI-device check at the head.
+- `Online/Core/FreezeDeadUpFallPhysics` — three new patches in
+  current, none in v2.2.3. Modifies fall physics for KO'd characters.
+  Not relevant to the on-stage hitlag drift we observe.
+- `Online/Core/ForceInputRefetchOnAdvance` — new in current. Forces
+  input refetch when frame advances. Could affect input-vs-frame
+  synchronization for rollback playback, but our offline replay
+  shouldn't trigger rollback paths.
+- `041239A8 60000000 #FreezeGlitchFix.asm` is in BOTH v2.2.3 and
+  current — not new.
+
+**Conclusion of this round**: the version delta between source's
+recording build (~v2.2.3, slp 3.7.0) and the live build (exi-ai-rebase,
+slp 3.19.0) is real and includes at least UCF 0.74→0.84 plus some
+Slippi Online netcode evolution — but the modern binary refuses to
+load the old gecko codeset, so we can't trivially A/B test from this
+side.
+
+**Concrete next step** (out of scope for this session): build
+slippi-Ishiiruka v2.2.3 (`git checkout v2.2.3` in
+`~/src/slippi-Ishiiruka`) as an AppImage and re-run the harness
+against it. If hitlag matches under the older build, the hypothesis is
+confirmed and the residual is correctly attributed to "slippi-Ishiiruka
+build drift" — not something fixable in our harness.
+
+The hitlag-only residual (21 mismatches over 300 frames, all hit
+moments, recovers within 7 frames) is now the floor we can reach
+without rebuilding the emulator.
+
 ## 2026-05-01 update #6 — per-port UCF matches; build-version drift is the leading suspect
 
 Parsed GameStart event in both source slp and a saved live slp:

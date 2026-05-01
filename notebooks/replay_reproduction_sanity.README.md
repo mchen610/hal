@@ -67,21 +67,34 @@ Two-mode trigger inverse:
 
 `ReplayControllerSender(use_exi_inputs=True/False)` switches.
 
-## Open: hitlag_left drift on hit moments
+## Open: hitlag_left drift on hit moments — slippi-Ishiiruka build drift
 
-Source has hitlag_left = 0 by frame 42 (post-hitlag); live has 4 (still
-in hitlag). Identical action and position. At frame 41-42 in source,
-port 2 (Marth) was attacking with FAIR and got hit by port 1 (Falco)'s
-laser. Hit-detection landed in both source and live (action transitions
-match), but live's hitlag duration was 4 frames longer.
+Source replay was recorded 2020-12-15 with slp version 3.7.0
+(slippi-Ishiiruka ~v2.2.3 era). Our live emulator is the current
+exi-ai-rebase build (slp 3.19.0). Between v2.2.3 and current the
+gecko codeset shipped major changes:
 
-slp 0x3B (raw byte) trace for the relevant frames shows source's bytes
-are larger-magnitude than ours (raw=-84 vs our injected -63 for the
-same processed=-0.7875). The processed value matches because UCF's
-"Pad Buffer + 1.0 Cardinals" or the game's clamp-to-80 logic produces
-the same float for both. But the BYTE difference may flip a hit
-attribute selection (e.g., which sub-hitbox of the laser). Worth
-investigating but not fundamentally blocking.
+- UCF 0.74 → UCF 0.84 (5 new patches: Pad Buffer + 1.0 Cardinals,
+  SDI, Shield Drop Extended, Shield SDI, DBOOC SquatRv Fix).
+- `Online/Core/BrawlOffscreenDamage` extended.
+- `Online/Core/FreezeDeadUpFallPhysics` and `ForceInputRefetchOnAdvance`
+  added.
+
+We tried surgically reverting Pad Buffer + 1.0 Cardinals (which UCF
+DB / SD / SDI read state from) — it broke 274 frames worth of
+gameplay because the later UCF patches depend on its setup. We tried
+swapping the entire Sys ini with v2.2.3's — the modern binary refuses
+to boot. So we cannot A/B-test on this side.
+
+The hitlag drift is consistent with this hypothesis: at hit moments
+where stick byte / hitbox attributes are read, the modern UCF Pad
+Buffer modifies bytes in ways the old build didn't, leading to a
+different sub-hitbox selection (different damage / attribute /
+electric attribute) and thus +4-7 frames of hitlag.
+
+**To resolve**: build slippi-Ishiiruka v2.2.3 from source and re-run
+the harness against it. See `replay_reproduction_sanity.repro_log.md`
+update #7 for the full investigation.
 
 ## Investigation log
 
