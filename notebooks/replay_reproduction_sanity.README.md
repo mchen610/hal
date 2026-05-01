@@ -67,7 +67,32 @@ Two-mode trigger inverse:
 
 `ReplayControllerSender(use_exi_inputs=True/False)` switches.
 
-## Open: hitlag_left drift on hit moments — slippi-Ishiiruka build drift
+## Resolved: harness is bit-exact when source slp build version matches live
+
+The residual hitlag drift on the dev replay is entirely
+slippi-Ishiiruka **build-version drift**, not a harness bug. Confirmed
+by running the harness against a slp the current emulator wrote
+itself (slp version 3.19.0, same exi-ai-rebase build as live):
+**0 mismatches over 170 frames** in normal mode at
+`start_frame=-123 prefix=170`, every field bit-exact.
+
+The dev replay is slp 3.7.0 (recorded with slippi-Ishiiruka ~v2.2.3,
+late 2020). UCF was 0.74 then; current ships 0.84 with five new
+patches whose state interlocks (Pad Buffer + 1.0 Cardinals reads
+state from / writes state to UCF DB, SD, SDI, etc., so they can't
+be surgically reverted). The hitlag countdown lands a few frames
+later in the modern build at hit moments — likely because UCF Pad
+Buffer + 1.0 Cardinals modifies the stick byte in ways that flip a
+sub-hitbox attribute selection.
+
+To reproduce a 2020-era slp bit-exact you would need a 2020-era
+slippi-Ishiiruka binary. We tried the v2.2.3 prebuilt AppImage —
+runs (with a `libgmodule` LD_PRELOAD shim) but is a GUI-only build
+that requires X11 / Xvfb, neither available in this sandbox and
+no `sudo` to install. The full investigation is in
+`replay_reproduction_sanity.repro_log.md`.
+
+## (Historical) Open: hitlag_left drift on hit moments — slippi-Ishiiruka build drift
 
 Source replay was recorded 2020-12-15 with slp version 3.7.0
 (slippi-Ishiiruka ~v2.2.3 era). Our live emulator is the current

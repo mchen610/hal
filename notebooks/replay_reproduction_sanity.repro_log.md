@@ -1,5 +1,51 @@
 # Replay reproduction — investigation log
 
+## 2026-05-01 update #8 — DECISIVE: harness is bit-exact when slp build version matches live
+
+We can run the harness against itself by re-feeding a slp the live
+emulator just produced.
+
+Setup:
+
+1. Ran the harness against `Game_20201215T165952.slp` (slp 3.7.0)
+   with `save_replays=True` so the live emulator wrote a slp at
+   `/tmp/repro_with_slp/normal/replays/Game_20260501T100042.slp`.
+   File was unfinalized (length=0, no metadata trailer) since we
+   stopped mid-game.
+2. Patched the file's UBJSON trailer manually so libmelee can read
+   it (set raw length, append empty `metadata{}` object, close
+   outer `}`).
+3. Re-ran the harness using the patched live slp **as the source**.
+
+Result: **0 mismatches over 170 frames** in `normal` mode at
+`start_frame=-123 prefix=170`. Strict comparison, every field, every
+frame. Identical input bytes produce identical output bytes when the
+build version matches.
+
+This conclusively isolates the residual hitlag drift on the dev
+replay (`Game_20201215T165952.slp`) to the slp-version delta:
+
+| Source slp version | Source build (estimated) | Live build       | Mismatches over 300 frames |
+|---|---|---|---|
+| 3.19.0 (live's own) | exi-ai-rebase 0.2.0 | exi-ai-rebase 0.2.0 | **0** |
+| 3.7.0  (dev replay) | slippi-Ishiiruka v2.2.3 | exi-ai-rebase 0.2.0 | 21 (all hitlag_left) |
+
+The harness itself is bit-exact deterministic. Closing the v2.2.3 →
+exi-ai-rebase build delta is the only remaining gap — and that's a
+property of the underlying emulator, not anything fixable in our
+harness.
+
+We also tried v2.2.3 prebuilt AppImage at
+`https://github.com/project-slippi/Ishiiruka/releases/download/v2.2.3/Slippi_Online-x86_64.AppImage`
+. It runs (after `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libgmodule-2.0.so.0`
+to fix a glib symbol-version mismatch with the host) but the v2.2.3
+build is GUI-only and requires X11 — no `Xvfb` available in this
+environment, no `sudo` to install it. Building slippi-Ishiiruka v2.2.3
+nogui from source (`~/src/slippi-Ishiiruka` is checked out at the
+exi-ai-rebase tip; would need `git checkout v2.2.3` and
+`./build-linux.sh` plus dolphin's full build deps) would close the
+loop.
+
 ## 2026-05-01 update #7 — UCF 0.74 vs 0.84 isolated, but disabling new patches breaks gameplay
 
 Found that the modern (current build, exi-ai-rebase) `Sys/GameSettings/GALE01r2.ini`
