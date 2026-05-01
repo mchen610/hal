@@ -23,11 +23,16 @@ LDFLAGS="-L$(brew --prefix enet)/lib -lenet" \
 uv sync
 ```
 
-## Building Dolphin emulator
+## Dolphin emulator
 
-An AppImage is provided in the `emulator` directory and can be called directly from `libmelee`. 
+Download the latest Slippi ExiAI AppImage (e.g. `Slippi_Online-x86_64-ExiAI.AppImage`) into `~/data/ssbm/` and extract it once:
 
-To build the emulator from source, follow the instructions [here](https://github.com/ericyuegu/slippi-Ishiiruka/tree/ubuntu-20.04).
+```bash
+chmod +x ~/data/ssbm/Slippi_Online-x86_64-ExiAI.AppImage
+( cd ~/data/ssbm && ./Slippi_Online-x86_64-ExiAI.AppImage --appimage-extract )
+```
+
+`libmelee` should be pointed at `~/data/ssbm/squashfs-root/AppRun`. The ExiAI build forces a Null video backend, so it runs headless with no X display required. To build the emulator from source instead, follow the instructions [here](https://github.com/ericyuegu/slippi-Ishiiruka/tree/ubuntu-20.04).
 
 ## Downloading data
 
