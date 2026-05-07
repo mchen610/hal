@@ -2,30 +2,33 @@
 
 # About the project
 
-- We are training a decoder-only Transformer on Super Smash Bros. Melee using imitation learning & offline RL
-- We have preprocessed human replays using libmelee and stored them as MDS shards following the schema in schema.py
+The goal of this project is to train Transformer models on Super Smash Bros. Melee using imitation learning & offline RL
+
+We're rebooting the project after a long hiatus, and we're in the midst of rewriting everything from scratch.
+
+For context, here is how we did it previously:
+- We preprocess human .slp replays using libmelee and stored them as MDS shards following the schema in schema.py
 - We sample trajectories from the dataset by choosing a random episode, random starting frame, and preprocessing seq_len subsequent frames to predict controller inputs as next-token prediction
 - Preprocessing and target feature discretization are defined as functions in configs: input_configs.py, target_configs.py, postprocess_configs.py
     - Currently, the best working configs are `fine_main_analog_shoulder`, which discretizes the analog main stick into 37 joint x, y positions, predicts analog shoulder presses (no digital button L/R), all as single-label classification problems
 - Model definitions are under models/gpt.py. Ignore lstm.py and mlp.py, they are deprecated
-- We have a closed loop eval harness that runs dolphin emulator and batches inputs on GPU in eval/eval.py. This is a very precise script that writes directly to shared memory buffers, do not touch it. 
+- We have a closed loop eval harness that runs Dolphin emulator and batches inputs on GPU in eval/eval.py. This is a very precise script that writes directly to shared memory buffers, be careful when touching it. 
 
-# Making changes
+Going forward, I would like to: 
+- simplify & rewrite the data preprocessing pipeline from .slp to .mds for reliability, scalability & speed
+- establish sanity checks for closed loop gamestate reproducibility from .slp to nparrays/tensors back through the melee.Controller interface into Dolphin
+- modeling
+    - use receding horizon control with flow matching action heads instead of classification
+    - action chunk predictions should directly regress on continuous (float) values, either in time or frequency domain (i.e. DCT)
+- revisit training loop
+- revisit use of tensordicts (need to profile speed)
+- revisit eval harness interface
+- simplify and delete lots of old code, including old notebooks, feature preprocessing logic, model architectures, evals, and training loop
+- investigate resuming from arbitrary frames in replay and forking/performing controller takeover in Dolphin to perform efficient rollouts for RL
 
-- Never edit existing configs or model definitions to maintain backwards compatability & experiment reproducibility. To add a new class definition, append towards the bottom of the files (e.g. gpt.py or input_configs.py) and register a configuration with a sensible name at the bottom
-    - I generally don't prioritize DRY across input/target configs or model versions
-- Please feel free to test code by creating new scratch files in notebooks/ at the root of the repo
-- Please help me keep the code readable, composable, and modular without sacrificing reproducibility and experimental isolation
-- When generating edits to code, do not add comments or references to previous code or current instruction, unless you are explicitly told to do so
+# Principles
 
-# Running experiments
-
-- A training command looks like so (never run this without permission): `CUDA_VISIBLE_DEVICES=0 uv run python hal/training/simple_trainer.py --n_gpus 1 --data.streams cody --data.stream_stats data/top_players/Cody/stats.json --arch GPTv5Controller-512-6-8-dropout --data.input_preprocessing_fn baseline_controller_fine_main_analog_shoulder_early_release --data.target_preprocessing_fn fine_main_analog_shoulder_early_release --data.pred_postprocessing_fn fine_main_analog_shoulder`
-
-# Future directions
-
-I want to train multi-token prediction, N frame latency, and an off-policy value model using offline RL. Eventually self-play PPO. 
-
+- Existing code is not precious. Code is tech debt. Delete liberally. The marginal cost of rewriting code rounds to zero, but the benefit of cleaner, better abstractions is high.
 
 ## Code Style
 - **Formatting**: Black with line_length=119, isort with black profile
@@ -33,6 +36,15 @@ I want to train multi-token prediction, N frame latency, and an off-policy value
 - **Imports**: Group order: stdlib, third-party, first-party (hal). Single line imports.
 - **Naming**: snake_case for functions/variables, CamelCase for classes, UPPERCASE for constants
 - **Error Handling**: Use descriptive exception messages, contextmanager for resources
+    - Never swallow exceptions (i.e. just `pass`), never use bare `except`
+    - Don't catch exceptions just to log and rethrow—only wrap an exception if that part of the stack can add helpful context for debugging
+    - Always name the exceptions being caught, ideally with extremely specific clauses; do not write `except Exception` unless it is a crucial runtime code path that must never crash—these cases are uncommon but readily apparent
+
+### Suggested Libraries
+- Use `loguru` for logging
+- Use MosaicML Streaming `streaming` and MDS format for datasets: https://docs.mosaicml.com/projects/streaming/en/stable/index.html
+- Use `libmelee` for interacting with the Melee emulator (Dolphin)
+- Prefer pathlib for manipulating file paths
 
 ## Project Structure
 This codebase is a machine learning project for Super Smash Bros Melee AI, with model training, 
