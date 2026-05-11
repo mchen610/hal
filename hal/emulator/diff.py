@@ -81,16 +81,21 @@ def diff(
                 continue
             a_arr = a_cols[field_name][:n]
             b_arr = b_cols[field_name][:n]
-            if np.array_equal(a_arr, b_arr, equal_nan=np.issubdtype(a_arr.dtype, np.floating)):
+            a_floating = np.issubdtype(a_arr.dtype, np.floating)
+            b_floating = np.issubdtype(b_arr.dtype, np.floating)
+            if np.array_equal(a_arr, b_arr, equal_nan=a_floating and b_floating):
                 continue
-            # NaN-aware mismatch detection: positions where both are NaN are
-            # equal under the mask convention (see Trajectory.from_slp).
-            both_nan = (
-                np.isnan(a_arr) & np.isnan(b_arr)
-                if np.issubdtype(a_arr.dtype, np.floating) and np.issubdtype(b_arr.dtype, np.floating)
-                else np.zeros(n, dtype=bool)
-            )
-            mismatches = np.flatnonzero((a_arr != b_arr) & ~both_nan)
+            # Mask convention: NaN on EITHER side means "this source didn't
+            # record the field at this position" (slp version gap, no live
+            # capture, etc.). Skip those positions — equality there is
+            # unknowable, and the alternative (false-positive divergence) is
+            # noise we always have to filter out by hand.
+            either_nan = np.zeros(n, dtype=bool)
+            if a_floating:
+                either_nan |= np.isnan(a_arr)
+            if b_floating:
+                either_nan |= np.isnan(b_arr)
+            mismatches = np.flatnonzero((a_arr != b_arr) & ~either_nan)
             if mismatches.size == 0:
                 continue
             i = int(mismatches[0])

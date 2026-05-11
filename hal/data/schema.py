@@ -34,6 +34,18 @@ encoders look up `p{ego_port}_*` / `p{3-ego_port}_*` directly.
 import numpy as np
 from numpy.typing import DTypeLike
 
+# Bump on any breaking change to MDS_PER_FRAME_DTYPES (column add/remove/dtype
+# change) or to the extraction semantics that produce them. Consumers of a
+# manifest verify the version matches before reading; mismatch is a hard error,
+# not a silent one. Two manifests built with different schema versions must be
+# reprocessed, not co-mingled.
+#
+# 2: add raw_analog_cstick_x/y columns (slp >= 3.17) for bit-exact c-stick
+#    replay; main stick raw bytes alone left the c-stick on a lossy logical
+#    round-trip that drifted physics during smashes.
+# 1: initial introduction of the version field.
+SCHEMA_VERSION: int = 2
+
 PLAYER_PREFIXES: tuple[str, ...] = ("p1", "p2")
 
 # peppi pre.buttons_physical bitmask per slp spec. Single source of truth for
@@ -83,6 +95,8 @@ def _controller_columns(prefix: str) -> dict[str, DTypeLike]:
             f"{prefix}_trigger_r_physical": np.float32,
             f"{prefix}_main_stick_raw_x": np.int8,
             f"{prefix}_main_stick_raw_y": np.int8,
+            f"{prefix}_c_stick_raw_x": np.int8,  # slp >= 3.17.0; mask sentinel otherwise
+            f"{prefix}_c_stick_raw_y": np.int8,
         }
     )
     return cols

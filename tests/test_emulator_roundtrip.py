@@ -37,16 +37,20 @@ from hal.emulator.controller_sources import ControllerSource
 from hal.emulator.controller_sources import InternalControllerSource
 from hal.emulator.controller_sources import MdsControllerSource
 from hal.emulator.controller_sources import ScriptedControllerSource
+from hal.emulator.controller_sources import demo_sequence
 from hal.emulator.diff import diff
 from hal.emulator.drive import drive
-from hal.emulator.session import Matchup
 from hal.emulator.session import PlayerSetup
+from hal.emulator.session import ReplayMatchup
 from hal.emulator.session import Session
 from hal.emulator.trajectory import Trajectory
+from hal.local_paths import DEV_MDS_DIR as _DEV_MDS_DIR
+from hal.local_paths import EMULATOR_PATH
+from hal.local_paths import ISO_PATH as _ISO_PATH
 
-ISO_PATH = Path.home() / "data" / "ssbm" / "ssbm.ciso"
-DOLPHIN_PATH = Path.home() / "data" / "ssbm" / "squashfs-root" / "AppRun"
-DEV_MDS_DIR = Path.home() / "data" / "ssbm" / "dev" / "mds"
+ISO_PATH = Path(_ISO_PATH)
+DOLPHIN_PATH = Path(EMULATOR_PATH)
+DEV_MDS_DIR = Path(_DEV_MDS_DIR)
 
 # Stage filter — peppi/slp-native ids for BF, FD, DL, YS — and no Peach
 # (turnips) or G&W (hammer). Picked for stability across runs.
@@ -95,7 +99,7 @@ def test_controller_wire_format_faithful() -> None:
         allow_unsafe_types=False,
     )
     row = ds[entry.annotation.mds_row_idx]
-    matchup = Matchup.from_replay(entry)
+    matchup = ReplayMatchup.from_replay(entry)
 
     sources: dict[int, ControllerSource] = {}
     for port, prefix in matchup.port_to_mds_prefix.items():
@@ -123,7 +127,7 @@ def test_fresh_recording_roundtrip_bit_exact(tmp_path: Path) -> None:
     """
     _check_prereqs()
     n_frames = 200
-    matchup = Matchup(
+    matchup = ReplayMatchup(
         stage=melee.Stage.FINAL_DESTINATION,
         players=(
             PlayerSetup(port=1, character=melee.Character.FOX, costume=0),
@@ -133,8 +137,8 @@ def test_fresh_recording_roundtrip_bit_exact(tmp_path: Path) -> None:
     )
 
     record_sources: dict[int, ControllerSource] = {
-        1: ScriptedControllerSource(sequence=[]),
-        2: ScriptedControllerSource(sequence=[]),
+        1: ScriptedControllerSource(sequence=demo_sequence(n_frames, port="p1")),
+        2: ScriptedControllerSource(sequence=demo_sequence(n_frames, port="p2")),
     }
     with Session(
         iso_path=ISO_PATH,

@@ -26,7 +26,7 @@ from hal.emulator.controller_sources import InternalControllerSource
 from hal.emulator.controller_sources import MdsControllerSource
 from hal.emulator.diff import diff
 from hal.emulator.drive import drive
-from hal.emulator.session import Matchup
+from hal.emulator.session import ReplayMatchup
 from hal.emulator.session import Session
 from hal.emulator.trajectory import Trajectory
 
@@ -92,7 +92,7 @@ def roundtrip(
 
     sample = _read_mds_row(mds_dir, entry.annotation.split, entry.annotation.mds_row_idx)
 
-    matchup = Matchup.from_replay(entry)
+    matchup = ReplayMatchup.from_replay(entry)
     logger.info(
         f"matchup: stage={matchup.stage} players={[(p.port, p.character.name) for p in matchup.players]} "
         f"port_to_mds={matchup.port_to_mds_prefix}"

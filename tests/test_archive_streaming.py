@@ -1,11 +1,11 @@
 """End-to-end smoke tests for the .7z streaming pipeline.
 
 Exercises hal.data.archive_iter, build_index --archive, and process_replays
-against ~/data/ssbm/dev.7z (the small archive we use as a fixture) and
-verifies parity with on-disk extraction.
+against ``$HAL_DEV_ARCHIVE`` (the small archive we use as a fixture; default
+``~/data/ssbm/dev.7z``) and verifies parity with on-disk extraction.
 
-Skipped when dev.7z isn't present so the suite still runs on CI / fresh
-checkouts that don't have the fixture downloaded.
+Skipped when the dev archive isn't present so the suite still runs on CI /
+fresh checkouts that don't have the fixture downloaded.
 """
 
 import json
@@ -21,8 +21,9 @@ from streaming import StreamingDataset
 from hal.data.archive_iter import archive_member_path
 from hal.data.archive_iter import iter_archive_members
 from hal.data.archive_iter import parse_archive_member_path
+from hal.local_paths import DEV_ARCHIVE_PATH
 
-DEV_ARCHIVE: Path = Path("/home/ericgu/data/ssbm/dev.7z")
+DEV_ARCHIVE: Path = Path(DEV_ARCHIVE_PATH)
 TMPFS_ROOT: Path = Path("/dev/shm/hal_archive_streaming_test")
 
 pytestmark = pytest.mark.skipif(
@@ -50,12 +51,13 @@ def _run_module(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def _by_sha(jsonl: Path) -> dict[str, dict]:
-    return {json.loads(line)["sha1_partial"]: json.loads(line) for line in jsonl.open()}
+    return {json.loads(line)["sha1"]: json.loads(line) for line in jsonl.open()}
 
 
 def _by_basename(jsonl: Path) -> dict[str, dict]:
-    """Key entries by the .slp basename — unique even when sha1_partial collides
-    (replays with identical character/stage settings share their first 4 KB)."""
+    """Key entries by the .slp basename. sha1 is a full-file hash so it would
+    also work as a key, but the basename is stable across the
+    archive-vs-disk paths and easier to debug from."""
     out: dict[str, dict] = {}
     for line in jsonl.open():
         d = json.loads(line)
@@ -134,7 +136,7 @@ def test_build_index_archive_matches_root(tmp_path: Path, tmpfs: Path) -> None:
         "outcome",
         "rank_filename",
         "players",
-        "sha1_partial",
+        "sha1",
     )
     for name, a in arc.items():
         d = disk[name]

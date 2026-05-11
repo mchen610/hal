@@ -28,9 +28,11 @@ Going forward, I would like to:
 
 # Principles
 
+- Be concise.
 - Existing code is not precious. Code is tech debt. Delete liberally. The marginal cost of rewriting code rounds to zero, but the benefit of cleaner, better abstractions is high.
 - Don't make references to "existing convention" from other parts of the repo in your comments unless asked.
 - Invalid states should be impossible to represent.
+- Don't re-implement library helpers. If a dependency (libmelee, peppi-py, streaming, torch, ...) already exposes the function you need, call it directly even if a local re-implementation looks tidier. Local re-implementations drift away from upstream over time and turn library upgrades into silent behavioral changes. The exception is when the upstream function genuinely doesn't exist for your case — then write the smallest primitive that fills the gap and reuse the library for everything else.
 
 ## Code Style
 - **Formatting**: Black with line_length=119, isort with black profile

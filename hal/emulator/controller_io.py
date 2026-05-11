@@ -71,6 +71,8 @@ class ControllerInputs(Protocol):
     buttons: int  # uint16 bitmask matching BUTTON_BIT_TO_MELEE
     raw_main_x: int  # int8 from slp (>= 1.2.0), or RAW_BYTE_MASK if unrecorded
     raw_main_y: int  # int8 from slp (>= 3.15.0), or RAW_BYTE_MASK if unrecorded
+    raw_c_x: int  # int8 from slp (>= 3.17.0), or RAW_BYTE_MASK if unrecorded
+    raw_c_y: int  # int8 from slp (>= 3.17.0), or RAW_BYTE_MASK if unrecorded
 
 
 @attrs.frozen(slots=True)
@@ -91,12 +93,15 @@ class ControllerInputsValue:
     buttons: int
     raw_main_x: int = RAW_BYTE_MASK
     raw_main_y: int = RAW_BYTE_MASK
+    raw_c_x: int = RAW_BYTE_MASK
+    raw_c_y: int = RAW_BYTE_MASK
 
 
-# Mutable so callers can advance ``frame_idx`` in place without reallocating
-# (the hot path for batched parallel emulators). Frozen would force one
-# instance per frame per port.
-@attrs.define(slots=True)
+# Frozen: one instance per (port, frame) is fine. ``attrs.frozen(slots=True)``
+# construction is ~50 ns; per-frame view allocation is dominated by the
+# libmelee pipe write and Dolphin frame budget. Frozen also lets callers
+# safely share a view across threads/emulator instances if that ever lands.
+@attrs.frozen(slots=True)
 class MdsControllerView:
     """Zero-copy view over MDS columns at a given frame index.
 
@@ -145,11 +150,23 @@ class MdsControllerView:
 
     @property
     def raw_main_x(self) -> int:
-        return int(self.columns[f"{self.port_prefix}_main_stick_raw_x"][self.frame_idx])
+        col = self.columns.get(f"{self.port_prefix}_main_stick_raw_x")
+        return int(col[self.frame_idx]) if col is not None else RAW_BYTE_MASK
 
     @property
     def raw_main_y(self) -> int:
-        return int(self.columns[f"{self.port_prefix}_main_stick_raw_y"][self.frame_idx])
+        col = self.columns.get(f"{self.port_prefix}_main_stick_raw_y")
+        return int(col[self.frame_idx]) if col is not None else RAW_BYTE_MASK
+
+    @property
+    def raw_c_x(self) -> int:
+        col = self.columns.get(f"{self.port_prefix}_c_stick_raw_x")
+        return int(col[self.frame_idx]) if col is not None else RAW_BYTE_MASK
+
+    @property
+    def raw_c_y(self) -> int:
+        col = self.columns.get(f"{self.port_prefix}_c_stick_raw_y")
+        return int(col[self.frame_idx]) if col is not None else RAW_BYTE_MASK
 
 
 # Pre-resolved (bit, MDS-column-suffix) pairs to keep the hot-path button
@@ -185,16 +202,15 @@ def apply_inputs(controller: melee.Controller, src: ControllerInputs) -> None:
     main_y_wire = _stick_axis_wire(src.raw_main_y, src.main_y)
     controller.tilt_analog(melee.enums.Button.BUTTON_MAIN, main_x_wire, main_y_wire)
 
-    # MDS doesn't store raw c-stick bytes today (slp >= 3.17 would have them);
-    # fall back to the logical-to-wire path. C-stick is mostly used as a
-    # binary smash-direction indicator, so the ±1 raw round-trip risk is small.
-    controller.tilt_analog(
-        melee.enums.Button.BUTTON_C,
-        _logical_to_wire(src.c_x),
-        _logical_to_wire(src.c_y),
-    )
-    controller.press_shoulder(melee.enums.Button.BUTTON_L, src.trigger_l)
-    controller.press_shoulder(melee.enums.Button.BUTTON_R, src.trigger_r)
+    # C-stick: same raw-byte-first / logical-fallback rule as main stick. Raw
+    # bytes exist only for slp >= 3.17.0; older replays fall back through
+    # ``_stick_axis_wire``, which is lossy by ±1 raw byte and cascades into
+    # ~0.0025/frame physics drift during c-stick smashes.
+    c_x_wire = _stick_axis_wire(src.raw_c_x, src.c_x)
+    c_y_wire = _stick_axis_wire(src.raw_c_y, src.c_y)
+    controller.tilt_analog(melee.enums.Button.BUTTON_C, c_x_wire, c_y_wire)
+    controller.press_shoulder(melee.enums.Button.BUTTON_L, melee.controller.fix_analog_trigger(src.trigger_l))
+    controller.press_shoulder(melee.enums.Button.BUTTON_R, melee.controller.fix_analog_trigger(src.trigger_r))
 
     buttons = src.buttons
     for bit, button in BUTTON_BIT_TO_MELEE:
@@ -205,22 +221,20 @@ def apply_inputs(controller: melee.Controller, src: ControllerInputs) -> None:
 
 
 def _stick_axis_wire(raw_byte: int, logical: float) -> float:
-    """Pick the per-axis wire float: raw byte if recorded, else logical fallback."""
+    """Pick the per-axis wire float: raw byte if recorded, else logical fallback.
+
+    Logical path delegates to libmelee's ``fix_analog_stick`` (which expects
+    [0, 1] with 0.5 neutral, so we shift peppi's [-1, 1]). Raw path uses our
+    primitive because libmelee has no direct raw-byte → wire helper.
+    """
     if raw_byte != RAW_BYTE_MASK:
         return _raw_byte_to_wire(raw_byte)
-    return _logical_to_wire(logical)
+    return melee.controller.fix_analog_stick((logical + 1.0) / 2.0)
 
 
 def _raw_byte_to_wire(raw: int) -> float:
     """Convert int8 raw byte to wire float that round-trips through Dolphin's
-    pipe-input parser. Mirrors libmelee.controller.fix_analog_stick's wire
-    fudge (+0.1) so Dolphin's rounding lands at exactly ``raw``."""
+    pipe-input parser. Mirrors ``fix_analog_stick``'s +0.1 fudge so Dolphin's
+    floor lands at exactly ``raw``. libmelee has no public raw-byte entry
+    point, so we keep this primitive."""
     return (raw + 0.1) / 254.0 + 0.5
-
-
-def _logical_to_wire(logical: float) -> float:
-    """Convert peppi-logical [-1, 1] stick value to wire format. Equivalent
-    to the tilt_analog_unit + fix_analog_stick path; recomputed here so
-    ``Controller(fix_analog_inputs=False)`` doesn't double-process it."""
-    raw = round(logical * 80)
-    return _raw_byte_to_wire(raw)

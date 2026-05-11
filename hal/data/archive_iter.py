@@ -226,6 +226,7 @@ def iter_archive_members(
     producer = threading.Thread(target=_producer, name=f"py7zr-producer-{archive.name}", daemon=True)
     producer.start()
 
+    seen_members: set[str] = set()
     drained = False
     try:
         while True:
@@ -234,6 +235,7 @@ def iter_archive_members(
                 drained = True
                 break
             member, tmpfs_path = item
+            seen_members.add(member)
             synthetic = archive_member_path(archive, member)
             try:
                 yield synthetic, tmpfs_path
@@ -259,3 +261,15 @@ def iter_archive_members(
 
     if producer_exc:
         raise producer_exc[0]
+
+    # Drained cleanly. If the caller filtered to a specific member set, surface
+    # any entries that the archive did not contain — without this they're a
+    # silent absence (caller asked for {A, B}, got just {A}, never knew).
+    if drained and filter_paths is not None:
+        missing = filter_paths - seen_members
+        if missing:
+            preview = sorted(missing)[:5]
+            logger.warning(
+                f"{archive.name}: {len(missing)}/{len(filter_paths)} requested members not in archive "
+                f"(first few: {preview})"
+            )

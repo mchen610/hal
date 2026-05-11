@@ -50,6 +50,7 @@ from hal.data.manifest import read_jsonl
 from hal.data.manifest import replay_uuid_from_path
 from hal.data.manifest import write_jsonl
 from hal.data.schema import MDS_DTYPE_STR_BY_COLUMN
+from hal.data.schema import SCHEMA_VERSION
 
 SHARD_SIZE_LIMIT: int = 1 << 31  # 2 GiB; data is repetitive, compression is 10-20x
 _DEFAULT_TMPFS: Path = Path("/dev/shm/hal_process_replays")
@@ -62,9 +63,15 @@ _INT32_RANGE: int = 1 << 31
 def bucket_fraction(replay_uuid: int) -> float:
     """Map a signed int32 replay_uuid to a stable fraction in [0, 1).
 
+    ``replay_uuid`` is derived from the replay PATH (md5 of the absolute or
+    synthetic path), not the file content. The same .slp copied to two
+    locations — e.g. ``archive://X.7z!Game.slp`` vs. ``/tmp/Game.slp`` —
+    therefore lands in different splits. Don't mix the on-disk and
+    archive-streaming variants of the same corpus in one training run.
+
     Folds the sign bit (top half of the int32 space) onto the bottom half.
-    Used by ``_split_for``; readers reconstructing the split from a uuid
-    must use this same function (a plain ``uuid % N`` will not agree).
+    Readers reconstructing the split from a uuid must use this same function
+    (a plain ``uuid % N`` will not agree).
     """
     return (replay_uuid & _INT32_SIGN_MASK) / _INT32_RANGE
 
@@ -263,6 +270,7 @@ def process_replays(
                             split=split,
                             mds_row_idx=row_idx,
                             frame_count_actual=int(sample["frame"].shape[0]),
+                            schema_version=SCHEMA_VERSION,
                         ),
                     )
                 )

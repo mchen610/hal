@@ -29,27 +29,32 @@ class ControllerSource(Protocol):
     def __call__(self, frame_index: int, last_gamestate: dict | None) -> ControllerInputs | None: ...
 
 
-@attrs.define(slots=True)
+@attrs.frozen(slots=True)
 class MdsControllerSource:
     """Replay an MDS-recorded port of inputs.
 
-    Reuses one ``MdsControllerView`` and advances ``frame_idx`` in place — no
-    per-frame allocation on the hot path.
+    Returns a fresh ``MdsControllerView`` each frame. The view itself is
+    zero-copy over the column dict; constructing the wrapper is ~50 ns.
+
+    Frame alignment: drive's ``captured[0]`` is the gamestate returned by
+    ``start_match`` — its slp pre-frame inputs are already locked in by the
+    menu-to-game transition and cannot be replayed. Iteration ``t`` punches
+    inputs that produce ``captured[t+1]``, which corresponds to slp
+    ``pre[t+1]``. So we index forward by one: replay iteration ``t`` reads
+    ``columns[t+1]``, matching the same input that record iteration ``t``
+    sent. Without this shift, replay lags record by one frame — invisible
+    on a neutral sequence but a real bit-exact failure on varying inputs.
     """
 
     columns: dict[str, np.ndarray]
     port_prefix: Literal["p1", "p2"]
-    _view: MdsControllerView = attrs.field(init=False)
-
-    def __attrs_post_init__(self) -> None:
-        self._view = MdsControllerView(columns=self.columns, port_prefix=self.port_prefix, frame_idx=0)
 
     def __call__(self, frame_index: int, last_gamestate: dict | None) -> ControllerInputs | None:
+        next_idx = frame_index + 1
         n = len(self.columns[f"{self.port_prefix}_main_stick_x"])
-        if frame_index >= n:
+        if next_idx >= n:
             return None
-        self._view.frame_idx = frame_index
-        return self._view
+        return MdsControllerView(columns=self.columns, port_prefix=self.port_prefix, frame_idx=next_idx)
 
 
 class InternalControllerSource:
@@ -79,3 +84,70 @@ class ScriptedControllerSource:
         if frame_index < len(self.sequence):
             return self.sequence[frame_index]
         return self._neutral
+
+
+# Button bitmasks (mirror BUTTON_BIT_TO_MELEE in controller_io). Kept local to
+# keep this module decoupled from melee imports.
+_BTN_A = 0x0100
+_BTN_B = 0x0200
+_BTN_X = 0x0400
+_BTN_Z = 0x0010
+_BTN_L = 0x0040
+
+
+def demo_sequence(n_frames: int, *, port: Literal["p1", "p2"]) -> list[ControllerInputs]:
+    """Non-trivial controller sequence for round-trip tests.
+
+    Exercises every input axis the wire path can carry: main-stick excursions,
+    c-stick smashes in all four quadrants, staggered button press/release
+    boundaries (A, B, X, Z, L), and an analog trigger ramp. ``port`` flips
+    several phases so the two ports drive asymmetric inputs — catches
+    port-mapping or per-port carry-over bugs that symmetric scripts hide.
+
+    Inputs are deterministic; for bit-exact replay tests, record with one
+    instance and replay from the resulting MDS row, not from this sequence.
+    """
+    p2 = port == "p2"
+    sign = -1.0 if p2 else 1.0
+    out: list[ControllerInputs] = []
+    for t in range(n_frames):
+        main_x = main_y = c_x = c_y = trigger_l = trigger_r = 0.0
+        buttons = 0
+        if 30 <= t < 60:
+            # Hold main stick down-and-toward-center; sign flips per port.
+            main_x = 0.75 * sign
+            main_y = -0.5
+        elif 60 <= t < 90:
+            # C-stick smashes through all four quadrants, 7 frames per quadrant.
+            quadrant = (t - 60) // 7
+            c_x = (1.0, 0.0, -1.0, 0.0)[quadrant % 4]
+            c_y = (0.0, 1.0, 0.0, -1.0)[quadrant % 4]
+        elif 90 <= t < 120:
+            # Staggered button stagger. Each press is 3 frames, 4-frame gap.
+            phase = (t - 90) % 7
+            if phase < 3:
+                buttons = (_BTN_A, _BTN_B, _BTN_X, _BTN_Z)[((t - 90) // 7) % 4]
+        elif 120 <= t < 150:
+            # Trigger ramp 0 -> 1 -> 0 over 30 frames. trigger_l on p1, trigger_r on p2
+            # so asymmetric per port.
+            ramp = 1.0 - abs(((t - 120) - 15) / 15.0)
+            if p2:
+                trigger_r = ramp
+            else:
+                trigger_l = ramp
+        elif 150 <= t < 180:
+            # Z + L combo bursts of 5 frames every 10.
+            if (t - 150) % 10 < 5:
+                buttons = _BTN_Z | _BTN_L
+        out.append(
+            ControllerInputsValue(
+                main_x=main_x,
+                main_y=main_y,
+                c_x=c_x,
+                c_y=c_y,
+                trigger_l=trigger_l,
+                trigger_r=trigger_r,
+                buttons=buttons,
+            )
+        )
+    return out

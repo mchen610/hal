@@ -9,8 +9,13 @@ Key choices:
 - **No mutation.** Sticks stay peppi-native [-1, 1]. Direction stays
   peppi-native -1.0/1.0. Ego/opponent perspective is a runtime concern.
 - **Buttons** are unpacked from `pre.buttons_physical` bitmask (slp spec).
-- **Raw analog bytes** (slp version-gated) are filled with NP_MASK_VALUE
-  when peppi reports None.
+- **Raw analog bytes** (slp version-gated) are filled with the per-dtype mask
+  sentinel (``np.iinfo(int8).min = -128``) when peppi reports None.
+- **Sentinel detection**: float columns are masked with ``float("nan")``;
+  callers MUST use ``np.isnan(arr)`` to detect masked entries, not ``==``,
+  because ``nan != nan``. Int columns use ``np.iinfo(dtype).min`` for signed
+  (``np.iinfo(dtype).max`` for unsigned), which round-trips through ``==``
+  normally.
 - **action_frame** is derived as a 1-indexed run-length counter on
   `post.state` — this matches libmelee's `action_frame` convention bit-for-bit
   (verified in notebooks/peppi_vs_libmelee.py).
@@ -59,9 +64,14 @@ def _mask_value(dtype: DTypeLike) -> float | int:
 
     NP_MASK_VALUE (= INT32_MAX) doesn't fit in int8/uint8, so we pick a
     per-dtype "out of normal range" value:
-      - floats: NaN
+      - floats: NaN  (DETECT WITH ``np.isnan(arr)`` — ``arr == nan`` is False!)
       - signed int: dtype min  (e.g. -128 for int8, INT_MIN for int32)
       - unsigned int: dtype max (e.g. 255 for uint8)
+
+    NaN is the correct float sentinel — it propagates through arithmetic and
+    is the numpy idiom — but every consumer that wants to detect masked
+    entries on float columns must use ``np.isnan`` and not ``==``. Int
+    sentinels round-trip through equality normally.
     """
     np_dtype = np.dtype(dtype)
     if np.issubdtype(np_dtype, np.floating):
@@ -183,9 +193,13 @@ def _extract_player(leader: object, prefix: str, frame_slice: slice, length: int
     out[f"{prefix}_trigger_l_physical"] = _arr_to_np(tp.l if tp is not None else None, np.float32, length)[frame_slice]
     out[f"{prefix}_trigger_r_physical"] = _arr_to_np(tp.r if tp is not None else None, np.float32, length)[frame_slice]
 
-    # Raw analog bytes (slp-version gated)
+    # Raw analog bytes (slp-version gated). Main stick: x >= 1.2.0, y >= 3.15.0.
+    # C-stick: both axes >= 3.17.0. Older slps backfill with the int8 mask
+    # sentinel so apply_inputs falls back to the lossy logical-to-wire path.
     out[f"{prefix}_main_stick_raw_x"] = _arr_to_np(pre.raw_analog_x, np.int8, length)[frame_slice]
     out[f"{prefix}_main_stick_raw_y"] = _arr_to_np(pre.raw_analog_y, np.int8, length)[frame_slice]
+    out[f"{prefix}_c_stick_raw_x"] = _arr_to_np(pre.raw_analog_cstick_x, np.int8, length)[frame_slice]
+    out[f"{prefix}_c_stick_raw_y"] = _arr_to_np(pre.raw_analog_cstick_y, np.int8, length)[frame_slice]
 
     return out
 

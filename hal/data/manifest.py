@@ -72,6 +72,8 @@ from typing import Literal
 
 import peppi_py
 
+from hal.data.schema import SCHEMA_VERSION
+
 
 class EndMethod(IntEnum):
     """slp end.method values per the Slippi spec.
@@ -144,15 +146,21 @@ class GameOutcome:
 class Stage3Annotation:
     """Atomic annotation written by process_replays when an entry lands in MDS.
 
-    Either all four fields are populated together or the entire annotation is
+    Either all five fields are populated together or the entire annotation is
     None — the per-field nullability of the previous design is no longer
     representable.
+
+    ``schema_version`` pins the column set the shards were written with. A
+    consumer (training, round-trip) refuses to load a manifest whose version
+    doesn't match its expected ``SCHEMA_VERSION``; this prevents silent
+    drift between schema-incompatible builds.
     """
 
     replay_uuid: int
     split: Split
     mds_row_idx: int
     frame_count_actual: int
+    schema_version: int
 
     def __post_init__(self) -> None:
         if self.split not in ("train", "val", "test"):
@@ -163,6 +171,11 @@ class Stage3Annotation:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Stage3Annotation:
+        if "schema_version" not in data:
+            raise ValueError(
+                "manifest entry has no schema_version; this manifest was built "
+                "before SCHEMA_VERSION was introduced. Rerun process_replays."
+            )
         return cls(**data)
 
 
@@ -198,7 +211,7 @@ class ReplayIndexEntry:
     played_on: PlayedOn | None
     outcome: GameOutcome | None  # None iff slp has no end block (truncated / in-progress)
     rank_filename: str | None  # heuristic rank label inferred from filename
-    sha1_partial: str | None  # first 4KB sha1 hex digest (for dedupe)
+    sha1: str | None  # sha1 hex digest of the whole file (None if compute_sha1=False)
 
     annotation: Stage3Annotation | None = None
 
@@ -223,7 +236,7 @@ class ReplayIndexEntry:
             "played_on": self.played_on,
             "outcome": self.outcome.to_dict() if self.outcome is not None else None,
             "rank_filename": self.rank_filename,
-            "sha1_partial": self.sha1_partial,
+            "sha1": self.sha1,
             "annotation": self.annotation.to_dict() if self.annotation is not None else None,
         }
 
@@ -241,7 +254,7 @@ class ReplayIndexEntry:
             played_on=data.get("played_on"),
             outcome=GameOutcome.from_dict(outcome) if outcome is not None else None,
             rank_filename=data.get("rank_filename"),
-            sha1_partial=data.get("sha1_partial"),
+            sha1=data.get("sha1"),
             annotation=Stage3Annotation.from_dict(annotation) if annotation is not None else None,
         )
 
@@ -252,10 +265,17 @@ def replay_uuid_from_path(path: str | Path) -> int:
     return struct.unpack("i", digest[:4])[0]
 
 
-def _sha1_partial(path: Path, n_bytes: int = 4096) -> str:
+def _sha1(path: Path, chunk_bytes: int = 1 << 20) -> str:
+    """Streaming sha1 over the whole file.
+
+    Full-file hash costs ~5 ms / MB; index builds are once-off so the extra I/O
+    is acceptable. For archive-streaming, the file is already in tmpfs so the
+    second read is essentially free.
+    """
     h = hashlib.sha1()
     with path.open("rb") as f:
-        h.update(f.read(n_bytes))
+        while chunk := f.read(chunk_bytes):
+            h.update(chunk)
     return h.hexdigest()
 
 
@@ -350,7 +370,7 @@ def extract_index_entry(replay_path: Path, *, compute_sha1: bool = True) -> Repl
         played_on=md.get("playedOn"),
         outcome=outcome,
         rank_filename=_rank_from_filename(replay_path),
-        sha1_partial=_sha1_partial(replay_path) if compute_sha1 else None,
+        sha1=_sha1(replay_path) if compute_sha1 else None,
     )
 
 
@@ -361,10 +381,28 @@ def write_jsonl(path: Path, entries: list[ReplayIndexEntry], *, append: bool = F
             f.write(json.dumps(entry.to_dict()) + "\n")
 
 
-def read_jsonl(path: Path) -> Iterator[ReplayIndexEntry]:
+def read_jsonl(path: Path, *, verify_schema_version: bool = True) -> Iterator[ReplayIndexEntry]:
+    """Read a jsonl of ``ReplayIndexEntry`` rows.
+
+    When ``verify_schema_version`` is True (default), each row that carries a
+    ``Stage3Annotation`` must have ``schema_version == hal.data.schema.SCHEMA_VERSION``.
+    Mismatch raises — a manifest from a different schema build is not safe to
+    co-mingle with shards built against the current schema. Unannotated rows
+    (Stage 1 index) skip the check.
+    """
     with path.open() as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            yield ReplayIndexEntry.from_dict(json.loads(line))
+            entry = ReplayIndexEntry.from_dict(json.loads(line))
+            if (
+                verify_schema_version
+                and entry.annotation is not None
+                and entry.annotation.schema_version != SCHEMA_VERSION
+            ):
+                raise ValueError(
+                    f"manifest {path} row schema_version={entry.annotation.schema_version} "
+                    f"!= SCHEMA_VERSION={SCHEMA_VERSION}. Rerun process_replays."
+                )
+            yield entry

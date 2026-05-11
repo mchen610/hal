@@ -11,11 +11,13 @@ match. Use as a context manager.
 """
 
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
+from typing import Literal
 from typing import Self
 
 import melee
@@ -46,19 +48,29 @@ class PlayerSetup:
 @dataclass(frozen=True, slots=True)
 class Matchup:
     """Stage + per-port player setup. Independent of how the match's data
-    was sourced (replay manifest, hand-rolled config, RL spec)."""
+    was sourced (synthetic config, RL spec, replay manifest)."""
 
     stage: melee.Stage
     players: tuple[PlayerSetup, ...]
-    # MDS-prefix mapping for replay-driven matches; absent for synthetic matchups.
-    port_to_mds_prefix: dict[int, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayMatchup(Matchup):
+    """Matchup whose inputs/gamestate come from an MDS row.
+
+    Carries the libmelee-port → MDS-prefix mapping (``{1: "p1", 2: "p2"}``)
+    so round-trip / diff tooling knows which columns belong to which
+    port. Synthetic matchups (RL self-play, eval-vs-CPU, smoke tests)
+    use the plain ``Matchup`` and never construct this.
+    """
+
+    port_to_mds_prefix: dict[int, Literal["p1", "p2"]] = field(default_factory=dict)
 
     @classmethod
-    def from_replay(cls, entry: ReplayIndexEntry) -> Matchup:
-        """Derive from a manifest entry. Each PlayerEntry in entry.players is
-        mapped to a STANDARD-controller PlayerSetup on its original port; the
-        two lowest-port players are tagged with MDS prefixes p1 / p2 so the
-        round-trip diff knows which MDS columns belong to which libmelee port.
+    def from_replay(cls, entry: ReplayIndexEntry) -> ReplayMatchup:
+        """Derive from a manifest entry. Each PlayerEntry is mapped to a
+        STANDARD-controller PlayerSetup on its original port; the two
+        lowest-port players are tagged with MDS prefixes p1 / p2.
         """
         sorted_entries = sorted(entry.players, key=lambda p: p.port)
         if len(sorted_entries) < 2:
@@ -227,12 +239,24 @@ class Session:
         return gamestate.to_canonical_dict(), gamestate.menu_state in LIVE_MENU_STATES
 
     def _step_blocking(self) -> melee.GameState:
-        """``console.step`` retry-poll, dropping intermediate Nones."""
+        """``console.step`` retry-poll, dropping intermediate Nones.
+
+        Bounded by ``step_timeout_seconds`` per call. Raises ``TimeoutError``
+        if Dolphin produces no frame within the budget — guards against
+        emulator hangs and disconnected slippstream sessions that would
+        otherwise spin forever.
+        """
         assert self._console is not None
+        deadline = time.monotonic() + self.step_timeout_seconds
         while True:
             gs = self._console.step()
             if gs is not None:
                 return gs
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"Dolphin produced no frame in {self.step_timeout_seconds:.1f}s; "
+                    "emulator hung or slippstream disconnected"
+                )
 
     def _drive_menus(self, gamestate: melee.GameState) -> None:
         assert self._matchup is not None
