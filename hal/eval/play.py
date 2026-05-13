@@ -9,6 +9,7 @@ from loguru import logger
 from melee.enums import Character
 from tensordict import TensorDict
 
+from hal.data.stats import load_dataset_stats
 from hal.emulator_helper import MatchupMenuHelper
 from hal.emulator_helper import console_manager
 from hal.emulator_helper import get_gui_console_kwargs
@@ -20,20 +21,16 @@ from hal.local_paths import EVAL_REPLAY_DIR
 from hal.local_paths import ISO_PATH
 from hal.preprocess.preprocessor import Preprocessor
 from hal.training.config import TrainConfig
-from hal.training.config import ValueTrainerConfig
+from hal.training.io import STATS_FILENAME
 from hal.training.io import load_config_from_artifact_dir
 from hal.training.io import load_model_from_artifact_dir
-from hal.training.io import override_stats_path
-from hal.training.utils import get_git_repo_root
 
-REPO_ROOT = get_git_repo_root()
-STATS_PATH = REPO_ROOT / "hal/data/stats.json"
 BOT_PLAYER = "p1"
 
 
 def load_model(artifact_dir: str, device: torch.device) -> torch.nn.Module:
     torch.set_float32_matmul_precision("high")
-    model, _ = load_model_from_artifact_dir(Path(artifact_dir), device=device, stats_path_override=STATS_PATH)
+    model, _ = load_model_from_artifact_dir(Path(artifact_dir), device=device)
     model.eval()
     model.to(device)
     return model
@@ -43,9 +40,9 @@ def play(artifact_dir: str, character: str):
     device: torch.device = torch.device(
         "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     )
-    train_config: TrainConfig | ValueTrainerConfig = load_config_from_artifact_dir(Path(artifact_dir))
-    train_config = override_stats_path(train_config, STATS_PATH)
-    preprocessor = Preprocessor(data_config=train_config.data)
+    train_config: TrainConfig = load_config_from_artifact_dir(Path(artifact_dir))
+    stats = load_dataset_stats(Path(artifact_dir) / STATS_FILENAME)
+    preprocessor = Preprocessor(data_config=train_config.data, stats=stats)
     seq_len = preprocessor.seq_len
 
     model = load_model(artifact_dir, device)

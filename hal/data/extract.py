@@ -4,7 +4,7 @@
 per column in ``MDS_PER_FRAME_DTYPES`` ready to feed into ``MDSWriter.write``.
 Returns ``None`` on any unrecoverable parse failure.
 
-See ``ARCHITECTURE.md`` for the conventions this module assumes:
+See CLAUDE.md (Architecture → Conventions) for the rules this module assumes:
 no value mutation (peppi-native ranges), bitmask button unpacking, dtype-
 specific mask sentinels for slp-version-unavailable fields, and the post-
 countdown frame-id trim at ``wire.GAME_START_FRAME``.

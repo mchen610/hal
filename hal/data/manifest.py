@@ -4,8 +4,8 @@ Stage 1 emits one entry per slp into ``index.jsonl`` (start/end/metadata
 blocks only, no frame iteration). Stage 3 writes the subset that landed in
 MDS into ``manifest.jsonl`` with ``Stage3Annotation`` populated.
 
-Integer ids are slp-native (peppi-py vocabulary) — see ARCHITECTURE.md
-"Conventions" and "Footguns" for the stage/character/port translation rules.
+Integer ids are slp-native (peppi-py vocabulary) — see CLAUDE.md
+(Architecture → Conventions / Footguns) for the stage/character/port translation rules.
 LRAS = "L + R + A + Start" controller-combo forfeit; valid only when the slp
 ended via ``NO_CONTEST`` — ``GameOutcome`` enforces this at construction.
 

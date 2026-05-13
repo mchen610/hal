@@ -10,6 +10,9 @@ from hal.constants import IDX_BY_CHARACTER
 from hal.constants import IDX_BY_STAGE
 from hal.constants import INCLUDED_CHARACTERS
 from hal.constants import INCLUDED_STAGES
+from hal.data.stats import FeatureStats
+from hal.data.stats import load_and_merge_stats
+from hal.data.stats import load_dataset_stats
 from hal.data.streams import StreamRegistry
 
 
@@ -42,7 +45,6 @@ class DataConfig:
     # Must specify `data_dir` or `streams` but NOT BOTH
     data_dir: str = ""
     streams: str = ""
-    stream_stats: str = ""
     # Number of input and target frames in example
     seq_len: int = 256
     replay_filter: ReplayFilter = ReplayFilter()
@@ -72,16 +74,27 @@ class DataConfig:
         if self.streams and self.data_dir:
             raise ValueError("Cannot specify both streams and data_dir")
 
-    @property
-    def stats_path(self) -> Path:
-        if self.streams:
-            return Path(self.stream_stats)
-        return Path(self.data_dir) / "stats.json"
-
     def get_streams(self) -> list[Stream]:
-        assert self.streams is not None
         stream_names = self.streams.split(",")
         return [StreamRegistry.get(name) for name in stream_names]
+
+    def resolve_stats(self) -> dict[str, FeatureStats]:
+        """Resolve the per-feature stats for this training config.
+
+        Single-stream / data_dir: load and finalize sibling ``stats.json``.
+        Multi-stream: load each stream's sufficient stats and merge under the
+        per-stream sampling proportions, producing the mixture distribution
+        the trainer will actually see (matches Mosaic's ``proportion``-based
+        sampling).
+        """
+        if not self.streams and not self.data_dir:
+            raise ValueError("DataConfig.resolve_stats: neither streams nor data_dir is set")
+        if self.streams:
+            streams = self.get_streams()
+            paths = [Path(s.local) / "stats.json" for s in streams]
+            proportions = [s.proportion if s.proportion is not None else 1.0 for s in streams]
+            return load_and_merge_stats(paths, proportions)
+        return load_dataset_stats(Path(self.data_dir) / "stats.json")
 
 
 @attr.s(auto_attribs=True, frozen=True)
@@ -126,18 +139,6 @@ class TrainConfig(BaseConfig):
     # Path to resume directory
     resume_dir: str | None = None
     resume_idx: int | None = None
-
-
-@attr.s(auto_attribs=True, frozen=True)
-class ValueTrainerConfig(TrainConfig):
-    value_fn_loss_weight: float = 0.5
-
-    advantage_weighted_loss: bool = False
-    beta: float = 0.05
-    weight_clip: float = 20.0
-
-
-TrainerConfigT = TrainConfig | ValueTrainerConfig
 
 
 def create_parser_for_attrs_class(

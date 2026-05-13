@@ -25,9 +25,6 @@ class TargetConfig:
     reference_points: np.ndarray | None = None
     sigma: float = 0.08
 
-    # If specified, we will predict multiple heads at once
-    multi_token_heads: tuple[int, ...] | None = None
-
     @property
     def target_size(self) -> int:
         """Total dimension of target features."""

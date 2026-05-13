@@ -23,6 +23,7 @@ from hal.training.distributed import is_master
 from hal.training.distributed import log_if_master
 from hal.training.distributed import maybe_wrap_model_distributed
 from hal.training.distributed import trange
+from hal.training.io import STATS_FILENAME
 from hal.training.io import Checkpoint
 from hal.training.io import WandbConfig
 from hal.training.io import Writer
@@ -84,6 +85,13 @@ class Trainer(torch.nn.Module, abc.ABC):
         self.ckpt = Checkpoint(
             model=self.model, config=self.config, artifact_dir=self.artifact_dir, keep_ckpts=self.config.keep_ckpts
         )
+
+        # Snapshot the resolved (post-mixture) normalization stats next to the
+        # checkpoint at launch. Eval reloads from here so the inference-time
+        # distribution exactly matches what the model trained against.
+        if is_master():
+            self.artifact_dir.mkdir(parents=True, exist_ok=True)
+            self.preprocessor.save_stats(self.artifact_dir / STATS_FILENAME)
 
     def __str__(self) -> str:
         return "\n".join(

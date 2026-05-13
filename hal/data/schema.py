@@ -5,7 +5,7 @@ replay frame count). Per-replay scalars (``slp_version``, ``stage``, etc.)
 live in ``hal.data.manifest.ReplayIndexEntry``. Slp-native vocabulary
 (button bits, mask sentinels, player prefixes) lives in ``hal.wire``.
 
-See ``ARCHITECTURE.md`` for naming, mask sentinels, and slp-version gating.
+See CLAUDE.md (Architecture) for naming, mask sentinels, and slp-version gating.
 """
 
 import numpy as np

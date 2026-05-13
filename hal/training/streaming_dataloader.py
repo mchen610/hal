@@ -93,8 +93,11 @@ def get_dataloaders(config: TrainConfig) -> tuple[StreamingDataLoader, Streaming
     else:
         local_dir = config.data.data_dir
 
-    logger.info(f"rank {get_device_id()}: {tuple(train_stream.local for train_stream in train_streams)}")
-    logger.info(f"rank {get_device_id()}: {tuple(val_stream.local for val_stream in val_streams)}")
+    if train_streams is not None:
+        logger.info(f"rank {get_device_id()}: train streams {tuple(s.local for s in train_streams)}")
+        logger.info(f"rank {get_device_id()}: val streams   {tuple(s.local for s in val_streams)}")
+    else:
+        logger.info(f"rank {get_device_id()}: local data_dir {local_dir}")
 
     train_dataset = HALStreamingDataset(
         streams=train_streams,

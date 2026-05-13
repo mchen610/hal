@@ -1,4 +1,5 @@
 import random
+from pathlib import Path
 from typing import Any
 
 import attr
@@ -8,8 +9,9 @@ from tensordict import TensorDict
 
 from hal.constants import Player
 from hal.constants import get_opponent
+from hal.data.schema import SCHEMA_VERSION
 from hal.data.stats import FeatureStats
-from hal.data.stats import load_dataset_stats
+from hal.data.stats import dump_finalized_stats
 from hal.preprocess.input_config import InputConfig
 from hal.preprocess.input_configs import DEFAULT_HEAD_NAME
 from hal.preprocess.postprocess_config import PostprocessConfig
@@ -35,9 +37,22 @@ class Preprocessor:
     - hidden dim sizes by input embedding head at runtime
     """
 
-    def __init__(self, data_config: DataConfig) -> None:
+    def __init__(
+        self,
+        data_config: DataConfig,
+        *,
+        stats: dict[str, FeatureStats] | None = None,
+    ) -> None:
+        """Construct the preprocessor.
+
+        ``stats=None`` resolves per-feature stats from the data config —
+        loading a single dataset's ``stats.json`` or merging per-stream
+        sufficient stats under sampling proportions. Pass ``stats`` explicitly
+        at eval time to read the finalized mixture snapshot written next to
+        the model checkpoint.
+        """
         self.data_config = data_config
-        self.stats = load_dataset_stats(data_config.stats_path)
+        self.stats = stats if stats is not None else data_config.resolve_stats()
         self.normalization_fn_by_feature_name: dict[str, Transformation] = {}
         self.seq_len = data_config.seq_len
 
@@ -129,6 +144,15 @@ class Preprocessor:
 
     def postprocess_preds(self, preds_C: TensorDict) -> dict[str, Any]:
         return postprocess_predictions(preds_C, self.postprocess_preds_fn)
+
+    def save_stats(self, path: Path) -> None:
+        """Snapshot the finalized (post-mixture) stats next to the checkpoint.
+
+        Called from rank 0 at training launch so eval can reload the *same*
+        distribution the model trained against — without needing access to
+        the original streams.
+        """
+        dump_finalized_stats(path, self.stats, mds_schema_version=SCHEMA_VERSION)
 
     def mock_preds_as_tensordict(self) -> TensorDict:
         """Mock a single model prediction."""

@@ -15,10 +15,10 @@ from tensordict import TensorDict
 from yasoo import deserialize
 from yasoo import serialize
 
+from hal.data.stats import load_dataset_stats
 from hal.preprocess.preprocessor import Preprocessor
 from hal.training.config import BaseConfig
 from hal.training.config import TrainConfig
-from hal.training.config import ValueTrainerConfig
 from hal.training.distributed import is_master
 from hal.training.models.registry import Arch
 from hal.training.streaming_dataloader import load_dataloader_state
@@ -26,6 +26,7 @@ from hal.training.streaming_dataloader import save_dataloader_state
 from hal.training.utils import get_git_repo_root
 
 ARTIFACT_DIR_ROOT = "runs"
+STATS_FILENAME: str = "stats.json"
 
 
 def get_path_friendly_datetime() -> str:
@@ -71,27 +72,24 @@ CONFIG_FILENAME: str = "config.json"
 
 def load_config_from_artifact_dir(artifact_dir: Path) -> TrainConfig:
     with open(artifact_dir / "config.json", encoding="utf-8") as f:
-        config: TrainConfig | ValueTrainerConfig = deserialize(json.load(f))  # type: ignore
+        config: TrainConfig = deserialize(json.load(f))  # type: ignore
     return config
-
-
-def override_stats_path(config: TrainConfig, stats_path: Path) -> TrainConfig:
-    return attr.evolve(
-        config,
-        data=attr.evolve(config.data, stream_stats=str(stats_path.absolute())),
-    )
 
 
 def load_model_from_artifact_dir(
     artifact_dir: Path,
     idx: int | None = None,
     device: str | torch.device = "cpu",
-    stats_path_override: Path | None = None,
 ) -> tuple[torch.nn.Module, TrainConfig]:
+    """Load a trained model + its config.
+
+    Stats are loaded from ``artifact_dir / "stats.json"`` — written by the
+    training run at launch time — so eval sees the exact distribution the
+    model trained against without reaching back to the source dataset.
+    """
     config = load_config_from_artifact_dir(artifact_dir)
-    if stats_path_override is not None:
-        config = override_stats_path(config, stats_path_override)
-    preprocessor = Preprocessor(data_config=config.data)
+    stats = load_dataset_stats(artifact_dir / STATS_FILENAME)
+    preprocessor = Preprocessor(data_config=config.data, stats=stats)
     model = Arch.get(config.arch, preprocessor=preprocessor)
     ckpt = Checkpoint(model, config, artifact_dir, keep_ckpts=config.keep_ckpts)
     ckpt.restore(idx=idx, device=device)

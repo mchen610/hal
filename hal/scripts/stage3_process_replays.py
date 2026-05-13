@@ -51,7 +51,11 @@ from hal.data.manifest import read_jsonl
 from hal.data.manifest import replay_uuid_from_path
 from hal.data.manifest import write_jsonl
 from hal.data.schema import MDS_DTYPE_STR_BY_COLUMN
+from hal.data.schema import MDS_PER_FRAME_DTYPES
 from hal.data.schema import SCHEMA_VERSION
+from hal.data.stats import StatsAccumulator
+from hal.data.stats import dump_sufficient_stats
+from hal.data.stats import float_feature_names
 
 SHARD_SIZE_LIMIT: int = 1 << 31  # 2 GiB; data is repetitive, compression is 10-20x
 _DEFAULT_TMPFS: Path = Path("/dev/shm/hal_process_replays")
@@ -237,6 +241,12 @@ def process_replays(
     annotated: list[ReplayIndexEntry] = []
     failed = 0
 
+    # Train-split normalization stats: feed every continuous column from each
+    # written train sample into a Welford accumulator. Categorical columns
+    # (action ids, button bits, stocks) are skipped by dtype.
+    stat_features = float_feature_names(MDS_PER_FRAME_DTYPES)
+    stats = StatsAccumulator(stat_features)
+
     ctx = mp.get_context("fork")
     try:
         with ctx.Pool(workers) as pool:
@@ -263,6 +273,10 @@ def process_replays(
                 writer.write(sample)
                 rows_written[split] += 1
 
+                if split == "train":
+                    for name in stat_features:
+                        stats.update(name, sample[name])
+
                 annotated.append(
                     dataclasses.replace(
                         entry,
@@ -280,13 +294,23 @@ def process_replays(
             w.finish()
 
     write_jsonl(manifest_path, annotated)
+
+    stats_path = output / "stats.json"
+    dump_sufficient_stats(
+        stats_path,
+        stats.to_sufficient(),
+        split="train",
+        mds_schema_version=SCHEMA_VERSION,
+    )
+
     logger.info(
-        "wrote {tr} train, {v} val, {te} test ({f} failures); manifest -> {m}",
+        "wrote {tr} train, {v} val, {te} test ({f} failures); manifest -> {m}; stats -> {s}",
         tr=rows_written["train"],
         v=rows_written["val"],
         te=rows_written["test"],
         f=failed,
         m=manifest_path,
+        s=stats_path,
     )
 
 

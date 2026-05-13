@@ -5,8 +5,8 @@ and ``hal.emulator`` (controller_io, trajectory, session). Anything declared
 here is the canonical encoding shared across offline-dataset and online-
 emulator code — no other module should re-state what's defined here.
 
-See ``ARCHITECTURE.md`` for terminology (raw / wire / logical / physical) and
-the data-flow diagram (peppi → MDS → controller view → libmelee → Dolphin).
+See CLAUDE.md (Architecture) for terminology (raw / wire / logical / physical)
+and the data-flow diagram (peppi → MDS → controller view → libmelee → Dolphin).
 """
 
 from typing import Final
@@ -141,8 +141,8 @@ def slp_stage_to_libmelee(slp_stage_id: int) -> melee.Stage:
 def slp_character_to_libmelee(slp_character_id: int) -> melee.Character:
     """slp-native character id -> ``melee.Character`` enum.
 
-    The two value spaces *happen* to coincide today (verified in
-    ``notebooks/peppi_vs_libmelee.py``); the bridge exists anyway so intent
+    The two value spaces *happen* to coincide today (pinned by
+    ``tests/test_wire_bridges.py``); the bridge exists anyway so intent
     is explicit and a future divergence shows up as a localized failure.
     """
     return melee.Character(slp_character_id)

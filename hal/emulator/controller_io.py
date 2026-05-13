@@ -10,7 +10,7 @@ otherwise fall back to the ``logical`` float via libmelee's
 ``fix_analog_stick``. The Controller is constructed with
 ``fix_analog_inputs=False`` so the composed wire byte reaches Dolphin
 unmodified. Slp-version gating and the fallback-path physics drift are
-documented in ARCHITECTURE.md (Footguns).
+documented in CLAUDE.md (Architecture → Footguns).
 """
 
 from dataclasses import dataclass
