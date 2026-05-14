@@ -2,7 +2,7 @@
 
 Exercises hal.data.archive_iter, build_index --archive, and process_replays
 against ``$HAL_DEV_ARCHIVE`` (the small archive we use as a fixture; default
-``~/data/ssbm/dev.7z``) and verifies parity with on-disk extraction.
+``~/data/raw/dev.7z``) and verifies parity with on-disk extraction.
 
 Skipped when the dev archive isn't present so the suite still runs on CI /
 fresh checkouts that don't have the fixture downloaded.

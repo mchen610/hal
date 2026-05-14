@@ -9,7 +9,7 @@ Run:
         --mds-dir /path/to/mds \
         --replay-uuid 12345678 \
         --iso /path/to/melee.iso \
-        --dolphin-path ~/data/ssbm/squashfs-root/AppRun \
+        --dolphin-path ~/data/dolphin/exiai/squashfs-root/AppRun \
         --max-frames 600
 """
 

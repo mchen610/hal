@@ -31,14 +31,33 @@ uv sync
 
 ## Dolphin emulator
 
-Download the latest Slippi ExiAI AppImage (e.g. `Slippi_Online-x86_64-ExiAI.AppImage`) into `~/data/ssbm/` and extract it once:
+Two builds of [Slippi-Ishiiruka](https://github.com/project-slippi/Ishiiruka) are supported, side by side:
 
-```bash
-chmod +x ~/data/ssbm/Slippi_Online-x86_64-ExiAI.AppImage
-( cd ~/data/ssbm && ./Slippi_Online-x86_64-ExiAI.AppImage --appimage-extract )
+- **`exiai`** — the headless ExiAI fork. Forces a Null video backend, no X display required. This is the default for training/eval rollouts.
+- **`slippi`** — the upstream Slippi netplay build with the WX GUI. Use this for interactive debugging, replay playback, or watching rollouts.
+
+Place each build under `~/data/dolphin/<name>/` with the AppImage extracted once. The ISO sits next to them:
+
+```
+~/data/
+  dolphin/
+    ssbm.ciso
+    exiai/
+      Slippi_Online-x86_64-ExiAI.AppImage
+      squashfs-root/   # AppRun
+    slippi/
+      Slippi_Online-x86_64.AppImage
+      squashfs-root/   # AppRun
 ```
 
-`libmelee` should be pointed at `~/data/ssbm/squashfs-root/AppRun`. The ExiAI build forces a Null video backend, so it runs headless with no X display required. To build the emulator from source instead, follow the instructions [here](https://github.com/ericyuegu/slippi-Ishiiruka/tree/ubuntu-20.04).
+To extract an AppImage:
+
+```bash
+chmod +x ~/data/dolphin/exiai/Slippi_Online-x86_64-ExiAI.AppImage
+( cd ~/data/dolphin/exiai && ./Slippi_Online-x86_64-ExiAI.AppImage --appimage-extract )
+```
+
+`libmelee` defaults to `~/data/dolphin/exiai/squashfs-root/AppRun`. Override via `HAL_EMULATOR_PATH` to point at the slippi build instead. To build either from source, follow the instructions [here](https://github.com/ericyuegu/slippi-Ishiiruka/tree/ubuntu-20.04).
 
 ## Downloading data
 
@@ -46,7 +65,7 @@ You can obtain raw `.slp` files from the [Slippi Discord](https://discord.gg/qaH
 
 # HOW-TO
 
-Paths to the repo, Dolphin, ISO, and replay directory are resolved by `hal/local_paths.py` from environment variables, with defaults that match the layout above (`~/data/ssbm/...`). To override, copy `.env.example` to `.env` and edit, or `export` the variables in your shell profile.
+Paths to the repo, Dolphin, ISO, and data directories are resolved by `hal/local_paths.py` from environment variables, with defaults rooted at `~/data/` (override via `HAL_DATA_HOME`). The layout below uses `~/data/raw/` for human-source `.7z` archives + extracted `.slp` trees, `~/data/processed/` for pipeline outputs (index, MDS shards, manifests), `~/data/scratch/` for throwaway recordings, and `~/data/runs/<run_id>/` for eval rollouts. To override individual paths, copy `.env.example` to `.env` and edit, or `export` the variables in your shell profile.
 
 ## Processing replays to MDS format
 
@@ -61,38 +80,38 @@ The data pipeline lives in `hal/scripts/` and runs in three numbered stages:
 ```bash
 # Stage 1 — index loose .slp files on disk
 uv run python -m hal.scripts.stage1_build_index \
-    --root ~/data/ssbm/dev \
-    --output ~/data/hal/index.jsonl
+    --root ~/data/raw/dev \
+    --output ~/data/processed/index.jsonl
 
 # Stage 1 — index .slp members directly from a .7z (no extraction; tmpfs-backed)
 uv run python -m hal.scripts.stage1_build_index \
-    --archive ~/data/ssbm/melee_public_slp_dataset_v2.7z \
-    --output ~/data/hal/index.jsonl
+    --archive ~/data/raw/melee_public_slp_dataset_v2.7z \
+    --output ~/data/processed/index.jsonl
 
 # Stage 1 — fold another archive into the same index
 uv run python -m hal.scripts.stage1_build_index \
-    --archive ~/data/ssbm/ranked-anonymized-2-151807.7z \
-    --output ~/data/hal/index.jsonl \
+    --archive ~/data/raw/ranked-anonymized-2-151807.7z \
+    --output ~/data/processed/index.jsonl \
     --incremental
 
 # Stage 2 — filter to a paths.txt (no .slp opens; runs in seconds)
 uv run python -m hal.scripts.stage2_filter_replays \
-    --index ~/data/hal/index.jsonl \
-    --output ~/data/hal/paths.txt \
+    --index ~/data/processed/index.jsonl \
+    --output ~/data/processed/paths.txt \
     --min-frames 1500 \
     --rank master diamond platinum
 
 # Stage 3 — paths.txt + index.jsonl → MDS shards + manifest.jsonl
 # (Archive entries in paths.txt are streamed automatically; no --archive flag.)
 uv run python -m hal.scripts.stage3_process_replays \
-    --paths-file ~/data/hal/paths.txt \
-    --index ~/data/hal/index.jsonl \
-    --output ~/data/hal/mds
+    --paths-file ~/data/processed/paths.txt \
+    --index ~/data/processed/index.jsonl \
+    --output ~/data/processed/mds
 ```
 
 In archive mode `stage1_build_index` and `stage3_process_replays` materialize each member to a bounded tmpfs ring (default `/dev/shm/...`, ~64 files in flight) just long enough for `peppi-py` to parse it, then unlink — the archive itself is never extracted to persistent storage.
 
-End-to-end smoke tests live in `tests/test_archive_streaming.py` and skip automatically when the `~/data/ssbm/dev.7z` fixture isn't present:
+End-to-end smoke tests live in `tests/test_archive_streaming.py` and skip automatically when the `~/data/raw/dev.7z` fixture isn't present:
 
 ```bash
 uv run pytest tests/test_archive_streaming.py -v

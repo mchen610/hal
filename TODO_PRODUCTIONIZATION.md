@@ -21,7 +21,7 @@ README.md + scripts/setup.sh) with a pinned GitHub-release download.
   - Pin tag via `HAL_SLIPPI_RELEASE_TAG` env (default to known-good).
   - `curl -L` the AppImage asset; verify sha256 against
     `scripts/bootstrap_manifest.toml`.
-  - Run `--appimage-extract` into `$HAL_SSBM_HOME/squashfs-root`.
+  - Run `--appimage-extract` into `$HAL_DATA_HOME/dolphin/exiai/squashfs-root`.
   - `uv sync`.
   - Drop the `aws s3 cp "$SSBM_ISO_PATH"` step entirely; ISO acquisition
     is user-responsibility (legal). Just check presence and print a
@@ -51,7 +51,7 @@ r2://hal-datasets-raw/<stream_name>.7z   # raw .slp bundle, only for re-extracti
   instances for the training dataloader, plus a manifest URL and the
   `SCHEMA_VERSION` it was built with.
 - `hal-fetch-manifest <stream>` CLI: downloads manifest.jsonl from R2 to
-  `$HAL_SSBM_HOME/<stream>/manifest.jsonl` for local introspection /
+  `$HAL_DATA_HOME/processed/<stream>/manifest.jsonl` for local introspection /
   filter chaining.
 
 ### What "frozen index" buys us (for the README)
@@ -75,7 +75,7 @@ r2://hal-datasets-raw/<stream_name>.7z   # raw .slp bundle, only for re-extracti
 
 - `Makefile` (new):
   - `bootstrap` → `scripts/bootstrap.sh` (system deps + uv sync + Dolphin)
-  - `bootstrap-dev` → fetch `dev` stream from R2 to `$HAL_SSBM_HOME`
+  - `bootstrap-dev` → fetch `dev` stream from R2 to `$HAL_DATA_HOME/processed`
   - `test` → `uv run pytest -m "not integration"`
   - `test-integration` → `uv run pytest -m integration` (requires ISO +
     Dolphin)
