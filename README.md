@@ -1,40 +1,94 @@
 # HAL
 
-Training superhuman AI for *Super Smash Bros. Melee*.
+Training superhuman AI for *Super Smash Bros. Melee* via imitation learning and RL.
 
-This project is under active development and is not ready for public use.
-
-Blog post: https://ericyuegu.com/melee-pt1
+Blog: https://ericyuegu.com/melee-pt1.
 
 ## Setup
 
-Python ≥ 3.14 on Ubuntu 20.04+. Dependencies are managed by [uv](https://docs.astral.sh/uv/). `peppi-py` is built from source via `maturin`, so a Rust toolchain is required.
+Tested on Ubuntu 20.04+. Linux is highly recommended, macOS/Window support is dodgy.
+
+### 1. Install tooling
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh   # if you don't have uv
+# uv (Python + project manager)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Rust (for peppi-py — one-time compile via maturin)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
 . "$HOME/.cargo/env"
-uv sync                                            # peppi-py compile ~35s; cached after
 ```
 
-macOS additionally needs `enet`:
+**macOS only**: `libmelee` needs a system `enet`:
+
+```bash
+brew install enet
+```
+
+### 2. Clone and sync dependencies
+
+```bash
+git clone git@github.com:ericyuegu/hal.git
+cd hal
+uv sync                # ~35s for the peppi-py compile on first sync; cached after
+```
+
+On macOS pass the enet paths through:
 
 ```bash
 brew install enet
 CFLAGS="-I$(brew --prefix enet)/include" LDFLAGS="-L$(brew --prefix enet)/lib -lenet" uv sync
 ```
 
-## Fetching integration fixtures
+### 3. Set up Cloudflare R2 credentials
 
-The dev replay archive, pre-built MDS bundle, ISO, and Dolphin (exi-ai) build are pulled from a private Cloudflare R2 bucket plus the upstream GitHub release. Credentials are out-of-band — ask Eric.
+Integration fixtures (dev replay archive, pre-built MDS bundle, Melee ISO, Dolphin build) live in a private R2 bucket. Ask Eric for credentials.
 
 ```bash
-cp .env.example .env && $EDITOR .env               # fill in R2_* creds
-uv run python -m hal.scripts.fetch                 # one-time; ~2 GB into <repo>/fixtures/
-uv run pytest -q tests/                            # 39 tests; integration tests now run
+cp .env.example .env
+$EDITOR .env           # fill in AWS_ENDPOINT_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_BUCKET=hal
 ```
 
-Re-running `fetch` no-ops when local sha256 matches. Fetch one at a time with `--name dev.7z | dev-mds | ssbm.ciso | dolphin-exiai`. All paths are env-overridable (`HAL_ISO_PATH`, `HAL_EMULATOR_PATH`, `HAL_DEV_ARCHIVE`, `HAL_DEV_MDS_DIR`) if you keep fixtures elsewhere — see `hal/paths.py`.
+Then either use [direnv](https://direnv.net/) (`direnv allow`) or source manually each shell / add it as an alias in your ~/.bashrc:
+
+```bash
+set -a; source .env; set +a
+```
+
+### 4. Fetch fixtures
+
+One command pulls everything you need into `<repo>/fixtures/`.
+
+```bash
+uv run python -m hal.scripts.fetch
+```
+
+After it finishes, `fixtures/` looks like:
+
+```
+fixtures/
+  dev.7z                        # 37 MB — slp archive
+  dev/mds/                      # train/, val/, test/, manifest.jsonl, stats.json
+  ssbm.ciso
+  dolphin/exiai/squashfs-root/  # AppRun + game files for the headless build
+```
+
+Re-running `fetch` is idempotent (logs `skip <name> (sha match)`). Fetch a single fixture with `--name {dev.7z | dev-mds | ssbm.ciso | dolphin-exiai}`. All paths are env-overridable (`HAL_ISO_PATH`, `HAL_EMULATOR_PATH`, `HAL_DEV_ARCHIVE`, `HAL_DEV_MDS_DIR`) if you keep fixtures elsewhere — see `hal/paths.py`.
+
+### 5. Verify
+
+```bash
+uv run pytest -q tests/
+```
+
+Expected: **39 passed**. If you see `9 skipped` instead, fetch hasn't run yet (or the env vars aren't sourced).
+
+A closed-loop bit-exact round-trip through Dolphin is the strongest end-to-end check:
+
+```bash
+uv run python -m hal.scripts.roundtrip --max-frames 200
+# expect: PASS (bit-exact across 11 post-fields × 2 ports)
+```
 
 ## Data pipeline
 
@@ -60,15 +114,14 @@ uv run python -m hal.scripts.materialize \
     --paths-file /tmp/paths.txt --index /tmp/index.jsonl --output /tmp/mds
 ```
 
-You can fold additional archives into one `index.jsonl` with `--incremental` on Stage 1.
+Fold additional archives into one `index.jsonl` with `--incremental` on Stage 1.
 
 ## Closed-loop round-trip
 
-The closed-loop driver in `hal/sim/` plays an MDS row back through Dolphin and diffs against the original `.slp`:
+The driver in `hal/sim/` plays an MDS row back through Dolphin and diffs against the original `.slp`:
 
 ```bash
 uv run python -m hal.scripts.roundtrip --max-frames 200
-# expect: PASS (bit-exact across 11 post-fields × 2 ports)
 ```
 
 Defaults read from `fixtures/`; override via flags. Training and evaluation drivers are being rewritten on top of `hal/sim/` and the new MDS schema; nothing here ships yet.

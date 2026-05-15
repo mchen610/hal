@@ -7,8 +7,8 @@ already matches.
 
 Two download backends, picked per-fixture:
 - Private artifacts (slp data, MDS, ISO) live in a Cloudflare R2 bucket.
-  Credentials come from env vars `R2_ENDPOINT_URL`, `R2_ACCESS_KEY_ID`,
-  `R2_SECRET_ACCESS_KEY`, `R2_BUCKET` — see `.env.example`. The bucket is
+  Credentials come from env vars `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`, `AWS_BUCKET` — see `.env.example`. The bucket is
   private; the ISO is Nintendo-copyrighted and distribution is legally
   fraught even among collaborators. Hand out creds out-of-band only.
 - Public upstream artifacts (Dolphin AppImage) are fetched straight from
@@ -62,14 +62,14 @@ class Fixture:
 DEV_ARCHIVE: Final[Fixture] = Fixture(
     name="dev.7z",
     r2_key="fixtures/dev.7z",
-    sha256=_TODO_SHA,
+    sha256="6c3a1815bc78f44786b91a366195b0b506e81105f998c15b47c48946488622eb",
     size_bytes=36_818_126,
     dest=Path("dev.7z"),
 )
 DEV_MDS: Final[Fixture] = Fixture(
     name="dev-mds",
     r2_key="fixtures/dev-mds.tar.zst",
-    sha256=_TODO_SHA,
+    sha256="eb5f037bbb0fcfdafec892bfa8cc2196707170b53fcb8b79c741f5462a2f82b1",
     size_bytes=0,
     dest=Path("dev/mds"),
     extract="tar_zst",
@@ -77,14 +77,14 @@ DEV_MDS: Final[Fixture] = Fixture(
 ISO: Final[Fixture] = Fixture(
     name="ssbm.ciso",
     r2_key="fixtures/ssbm.ciso",
-    sha256=_TODO_SHA,
+    sha256="b7de482eb955c8a96b6746dfa043b69ae7bf6c7c2a09ac382b9da126faa7055c",
     size_bytes=1_449_165_376,
     dest=Path("ssbm.ciso"),
 )
 DOLPHIN_EXIAI: Final[Fixture] = Fixture(
     name="dolphin-exiai",
     url="https://github.com/vladfi1/slippi-Ishiiruka/releases/download/exi-ai-0.2.0/Slippi_Online-x86_64-ExiAI.AppImage",
-    sha256=_TODO_SHA,
+    sha256="87e9ef6d80ed03354a1647d0616016dbc91399aa9e86a69ae5a398edd0a0c2bd",
     size_bytes=0,
     dest=Path("dolphin/exiai"),
     extract="appimage",
@@ -100,14 +100,14 @@ class FixtureError(RuntimeError):
 
 def _r2_client():  # type: ignore[no-untyped-def]
     """Lazy boto3 S3 client against R2's S3-compatible endpoint."""
-    missing = [v for v in ("R2_ENDPOINT_URL", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY") if not os.environ.get(v)]
+    missing = [v for v in ("AWS_ENDPOINT_URL", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY") if not os.environ.get(v)]
     if missing:
         raise FixtureError(f"missing env vars for R2 fetch: {missing}. See .env.example.")
     return boto3.client(
         "s3",
-        endpoint_url=os.environ["R2_ENDPOINT_URL"],
-        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+        endpoint_url=os.environ["AWS_ENDPOINT_URL"],
+        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
     )
 
 
@@ -145,9 +145,9 @@ def _download(fix: Fixture, cache_path: Path) -> str:
     tmp = cache_path.with_suffix(cache_path.suffix + ".partial")
     if fix.r2_key is not None:
         client = _r2_client()
-        bucket = os.environ.get("R2_BUCKET")
+        bucket = os.environ.get("AWS_BUCKET")
         if not bucket:
-            raise FixtureError("R2_BUCKET env var not set")
+            raise FixtureError("AWS_BUCKET env var not set")
         obj = client.get_object(Bucket=bucket, Key=fix.r2_key)
         with tmp.open("wb") as f:
             digest = _stream(f, obj["Body"], obj.get("ContentLength", fix.size_bytes), fix.name)
