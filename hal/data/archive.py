@@ -1,15 +1,8 @@
 """Stream .slp members directly out of a solid .7z archive into /dev/shm.
 
-The downloaded ranked-anonymized archives are 70+ GiB compressed and don't
-fit on local disk uncompressed, so build_index/process_replays need to read
-.slp content without extracting. peppi-py only accepts a filesystem path, so
-we materialize each member to a tmpfs file just long enough for the consumer
-to parse it, then unlink.
-
-py7zr's `WriterFactory` hook lets us substitute our own per-file writer;
-`parallel=True` (its default for file paths) spawns one worker thread per
-solid block, so multi-block decompression overlaps "for free" — we don't
-have to drive concurrency ourselves at this layer.
+The ranked-anonymized raw slp archives are >100 GB and ~10x compressed.
+We use peppi for batch decoding but peppi only accepts a filesystem path,
+so we materialize each member to a tmpfs file in /dev/shm.
 
 Two non-obvious things about py7zr's WriterFactory protocol that this module
 works around:
