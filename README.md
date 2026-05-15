@@ -6,84 +6,31 @@ Blog: https://ericyuegu.com/melee-pt1.
 
 ## Setup
 
-Tested on Ubuntu 20.04+. Linux is highly recommended, macOS/Window support is dodgy.
-
-### 1. Install tooling
-
-```bash
-# uv (Python + project manager)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Rust (for peppi-py — one-time compile via maturin)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
-. "$HOME/.cargo/env"
-```
-
-**macOS only**: `libmelee` needs a system `enet`:
-
-```bash
-brew install enet
-```
-
-### 2. Clone and sync dependencies
-
 ```bash
 git clone git@github.com:ericyuegu/hal.git
 cd hal
-uv sync                # ~35s for the peppi-py compile on first sync; cached after
+uv sync                              # builds peppi-py from source — see Appendix if you don't have Rust
+cp .env.example .env && $EDITOR .env # fill in AWS_* creds — ask Eric
+source .env                          # or use direnv
+
+# download emulator & datasets
+uv run fetch                         # download ~2 GB into <repo>/fixtures/
+uv run pytest tests/                 # expect: 39 passed
 ```
 
-On macOS pass the enet paths through:
-
-```bash
-brew install enet
-CFLAGS="-I$(brew --prefix enet)/include" LDFLAGS="-L$(brew --prefix enet)/lib -lenet" uv sync
-```
-
-### 3. Set up Cloudflare R2 credentials
-
-Integration fixtures (dev replay archive, pre-built MDS bundle, Melee ISO, Dolphin build) live in a private R2 bucket. Ask Eric for credentials.
-
-```bash
-cp .env.example .env
-$EDITOR .env           # fill in AWS_ENDPOINT_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_BUCKET=hal
-```
-
-Then either use [direnv](https://direnv.net/) (`direnv allow`) or source manually each shell / add it as an alias in your ~/.bashrc:
-
-```bash
-set -a; source .env; set +a
-```
-
-### 4. Fetch fixtures
-
-One command pulls everything you need into `<repo>/fixtures/`.
-
-```bash
-uv run python -m hal.scripts.fetch
-```
-
-After it finishes, `fixtures/` looks like:
+After fetch, `fixtures/` looks like:
 
 ```
 fixtures/
   dev.7z                        # 37 MB — slp archive
   dev/mds/                      # train/, val/, test/, manifest.jsonl, stats.json
   ssbm.ciso
-  dolphin/exiai/squashfs-root/  # AppRun + game files for the headless build
+  dolphin/exiai/squashfs-root/  # headless Dolphin
 ```
 
-Re-running `fetch` is idempotent (logs `skip <name> (sha match)`). Fetch a single fixture with `--name {dev.7z | dev-mds | ssbm.ciso | dolphin-exiai}`. All paths are env-overridable (`HAL_ISO_PATH`, `HAL_EMULATOR_PATH`, `HAL_DEV_ARCHIVE`, `HAL_DEV_MDS_DIR`) if you keep fixtures elsewhere — see `hal/paths.py`.
+`fetch` is idempotent (logs `skip <name> (sha match)`). Fetch a single fixture with `fetch --name {dev.7z | dev-mds | ssbm.ciso | dolphin-exiai}`. Override path defaults via `HAL_*` env vars — see `hal/paths.py`.
 
-### 5. Verify
-
-```bash
-uv run pytest -q tests/
-```
-
-Expected: **39 passed**. If you see `9 skipped` instead, fetch hasn't run yet (or the env vars aren't sourced).
-
-A closed-loop bit-exact round-trip through Dolphin is the strongest end-to-end check:
+The strongest end-to-end check is a closed-loop bit-exact round-trip through Dolphin:
 
 ```bash
 uv run python -m hal.scripts.roundtrip --max-frames 200
@@ -125,3 +72,54 @@ uv run python -m hal.scripts.roundtrip --max-frames 200
 ```
 
 Defaults read from `fixtures/`; override via flags. Training and evaluation drivers are being rewritten on top of `hal/sim/` and the new MDS schema; nothing here ships yet.
+
+## Adding a new fixture (maintainer)
+
+The fixture registry is `hal/fixtures.py`. Two backends:
+
+**R2 (private artifacts: replays, derived bundles, ISO):**
+
+```bash
+rclone copy -P --stats-one-line <local-path> r2:hal/fixtures/<key>
+sha256sum <local-path>
+```
+
+Then add a `Fixture(...)` entry with `r2_key="fixtures/<key>"`, the sha256, and a `dest=Path(...)` under `fixtures/`. If the artifact is a directory tree, tar it with `tar --use-compress-program='zstd -19 -T0'` and set `extract="tar_zst"` (the tarball must contain its files at the root, not under a wrapper dir).
+
+**Upstream URLs (public binaries from GitHub Releases / CDNs):**
+
+```bash
+curl -sL <url> | sha256sum
+```
+
+Then add a `Fixture(..., url="<pinned-tag-url>", sha256=..., extract=...)` entry. Don't re-host upstream binaries to R2 — pin the tag and verify by sha256. If the release is ever yanked, mirror to R2 then.
+
+After editing `hal/fixtures.py`, the new fixture is included in `fetch` and selectable via `--name`. Sha mismatch is a hard error — `ensure()` fails loud.
+
+## Appendix: prerequisites
+
+Tested on Ubuntu 20.04+. Linux is highly recommended — macOS works with one extra dep; Windows is dodgy.
+
+### uv
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+### Rust toolchain
+
+`peppi-py` is pulled from a fork and compiled via `maturin` during `uv sync` (one-time, ~35s; cached after). Only required if you're going to parse `.slp` files locally — i.e. run `hal.scripts.{index,filter,materialize}`, `roundtrip`, or anything that imports `hal.data.extract`. The plain `fetch` step doesn't touch peppi-py at runtime, but `uv sync` still tries to compile it, so install Rust once if you don't have it:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+. "$HOME/.cargo/env"
+```
+
+### macOS
+
+`libmelee` needs a system `enet`:
+
+```bash
+brew install enet
+CFLAGS="-I$(brew --prefix enet)/include" LDFLAGS="-L$(brew --prefix enet)/lib -lenet" uv sync
+```
