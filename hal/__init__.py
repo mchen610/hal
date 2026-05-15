@@ -4,6 +4,9 @@ from hal.data.extract import extract_replay
 from hal.data.index import ReplayIndexEntry
 from hal.data.index import read_jsonl
 from hal.data.index import write_jsonl
+from hal.fixtures import Fixture
+from hal.fixtures import ensure
+from hal.fixtures import ensure_all
 from hal.sim.diff import DiffReport
 from hal.sim.diff import diff
 from hal.sim.inputs import ControllerInputs
@@ -26,6 +29,7 @@ __all__ = [
     "ControllerInputsValue",
     "ControllerSource",
     "DiffReport",
+    "Fixture",
     "InternalControllerSource",
     "Matchup",
     "MdsControllerSource",
@@ -38,6 +42,8 @@ __all__ = [
     "apply_inputs",
     "diff",
     "drive",
+    "ensure",
+    "ensure_all",
     "extract_replay",
     "read_jsonl",
     "session",

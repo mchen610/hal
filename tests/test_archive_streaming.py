@@ -29,7 +29,7 @@ TMPFS_ROOT: Path = Path("/dev/shm/hal_archive_streaming_test")
 
 pytestmark = pytest.mark.skipif(
     not DEV_ARCHIVE.is_file(),
-    reason=f"fixture archive not present: {DEV_ARCHIVE}",
+    reason=f"dev archive missing at {DEV_ARCHIVE}; run `python -m hal.scripts.fetch --name dev.7z`",
 )
 
 

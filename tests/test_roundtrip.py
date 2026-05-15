@@ -60,11 +60,13 @@ _RNG_HEAVY_CHARACTERS = {9, 24}
 
 def _check_prereqs() -> None:
     if not ISO_PATH.is_file():
-        pytest.skip(f"ISO not found at {ISO_PATH}")
+        pytest.skip(f"ISO missing at {ISO_PATH}; run `python -m hal.scripts.fetch --name ssbm.ciso`")
     if not DOLPHIN_PATH.is_file():
-        pytest.skip(f"Dolphin AppRun not found at {DOLPHIN_PATH}")
+        pytest.skip(
+            f"Dolphin AppRun missing at {DOLPHIN_PATH}; run `python -m hal.scripts.fetch --name dolphin-exiai`"
+        )
     if not (DEV_MDS_DIR / "manifest.jsonl").is_file():
-        pytest.skip(f"MDS not found at {DEV_MDS_DIR}; run the data pipeline first")
+        pytest.skip(f"dev MDS missing at {DEV_MDS_DIR}; run `python -m hal.scripts.fetch --name dev-mds`")
 
 
 def _pick_safe_entry():

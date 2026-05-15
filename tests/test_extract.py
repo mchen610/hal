@@ -106,7 +106,7 @@ def test_list_to_np_none_input_returns_full_mask() -> None:
 
 @pytest.mark.skipif(
     not Path(DEV_ARCHIVE_PATH).exists(),
-    reason=f"dev archive fixture not present at {DEV_ARCHIVE_PATH}",
+    reason=f"dev archive missing at {DEV_ARCHIVE_PATH}; run `python -m hal.scripts.fetch --name dev.7z`",
 )
 def test_extract_replay_produces_full_schema(tmp_path: Path) -> None:
     """Every column declared in MDS_PER_FRAME_DTYPES is present after extract,

@@ -1,130 +1,74 @@
 # HAL
 
-Training superhuman AI for *Super Smash Bros. Melee*. 
+Training superhuman AI for *Super Smash Bros. Melee*.
 
-This project is under active development and is not ready for public use. 
+This project is under active development and is not ready for public use.
 
 Blog post: https://ericyuegu.com/melee-pt1
 
-# Setup
+## Setup
 
-This project targets Python ≥ 3.14 on Ubuntu 20.04+. Dependencies are managed by [uv](https://docs.astral.sh/uv/).
-
-`peppi-py` (the slp parser used by the data pipeline) is pulled from a fork and built from source via `maturin`, so a Rust toolchain is required:
+Python ≥ 3.14 on Ubuntu 20.04+. Dependencies are managed by [uv](https://docs.astral.sh/uv/). `peppi-py` is built from source via `maturin`, so a Rust toolchain is required.
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh   # if you don't have uv
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
 . "$HOME/.cargo/env"
-uv sync
+uv sync                                            # peppi-py compile ~35s; cached after
 ```
 
-The first `uv sync` will compile `peppi-py` (~35s); subsequent syncs reuse the cached build.
+macOS additionally needs `enet`:
 
-For macOS, `libmelee` requires a system installation of enet:
 ```bash
 brew install enet
-CFLAGS="-I$(brew --prefix enet)/include" \
-LDFLAGS="-L$(brew --prefix enet)/lib -lenet" \
-uv sync
+CFLAGS="-I$(brew --prefix enet)/include" LDFLAGS="-L$(brew --prefix enet)/lib -lenet" uv sync
 ```
 
-## Dolphin emulator
+## Fetching integration fixtures
 
-Two builds of [Slippi-Ishiiruka](https://github.com/project-slippi/Ishiiruka) are supported, side by side:
-
-- **`exiai`** — the headless ExiAI fork. Forces a Null video backend, no X display required. This is the default for training/eval rollouts.
-- **`slippi`** — the upstream Slippi netplay build with the WX GUI. Use this for interactive debugging, replay playback, or watching rollouts.
-
-Place each build under `~/data/dolphin/<name>/` with the AppImage extracted once. The ISO sits next to them:
-
-```
-~/data/
-  dolphin/
-    ssbm.ciso
-    exiai/
-      Slippi_Online-x86_64-ExiAI.AppImage
-      squashfs-root/   # AppRun
-    slippi/
-      Slippi_Online-x86_64.AppImage
-      squashfs-root/   # AppRun
-```
-
-To extract an AppImage:
+The dev replay archive, pre-built MDS bundle, ISO, and Dolphin (exi-ai) build are pulled from a private Cloudflare R2 bucket plus the upstream GitHub release. Credentials are out-of-band — ask Eric.
 
 ```bash
-chmod +x ~/data/dolphin/exiai/Slippi_Online-x86_64-ExiAI.AppImage
-( cd ~/data/dolphin/exiai && ./Slippi_Online-x86_64-ExiAI.AppImage --appimage-extract )
+cp .env.example .env && $EDITOR .env               # fill in R2_* creds
+uv run python -m hal.scripts.fetch                 # one-time; ~2 GB into <repo>/fixtures/
+uv run pytest -q tests/                            # 39 tests; integration tests now run
 ```
 
-`libmelee` defaults to `~/data/dolphin/exiai/squashfs-root/AppRun`. Override via `HAL_EMULATOR_PATH` to point at the slippi build instead. To build either from source, follow the instructions [here](https://github.com/ericyuegu/slippi-Ishiiruka/tree/ubuntu-20.04).
+Re-running `fetch` no-ops when local sha256 matches. Fetch one at a time with `--name dev.7z | dev-mds | ssbm.ciso | dolphin-exiai`. All paths are env-overridable (`HAL_ISO_PATH`, `HAL_EMULATOR_PATH`, `HAL_DEV_ARCHIVE`, `HAL_DEV_MDS_DIR`) if you keep fixtures elsewhere — see `hal/paths.py`.
 
-## Downloading data
+## Data pipeline
 
-You can obtain raw `.slp` files from the [Slippi Discord](https://discord.gg/qaHgPwpr) server.
+Three stages in `hal/scripts/` turn `.slp` files (loose or `.7z`-archived) into MDS shards:
 
-# HOW-TO
+1. **`index`** — walk replays; write `index.jsonl` (one row of metadata per file).
+2. **`filter`** — query `index.jsonl`; emit `paths.txt` of replays to keep.
+3. **`materialize`** — read `paths.txt` + `index.jsonl`; write MDS shards + `manifest.jsonl` + `stats.json`.
 
-Paths to the repo, Dolphin, ISO, and data directories are resolved by `hal/paths.py` from environment variables, with defaults rooted at `~/data/` (override via `HAL_DATA_HOME`). The layout below uses `~/data/raw/` for human-source `.7z` archives + extracted `.slp` trees, `~/data/processed/` for pipeline outputs (index, MDS shards, manifests), `~/data/scratch/` for throwaway recordings, and `~/data/runs/<run_id>/` for eval rollouts. To override individual paths, copy `.env.example` to `.env` and edit, or `export` the variables in your shell profile.
-
-## Processing replays to MDS format
-
-The data pipeline lives in `hal/scripts/` and runs in three stages:
-
-1. **`index`** walks loose `.slp` files (or streams from a `.7z` archive) and writes `index.jsonl` — one row of metadata per replay.
-2. **`filter`** is a pure-function pass over `index.jsonl` that emits a `paths.txt` for the next stage based on rank / character / version / frame-count predicates.
-3. **`materialize`** consumes `paths.txt` + `index.jsonl`, parses every kept replay's frames, and writes MDS shards (`train`/`val`/`test`) plus a `manifest.jsonl` sidecar.
-
-`paths.txt` is self-describing — each line is either a filesystem path or `archive://<abs-archive>!<member>`. A single `paths.txt` may mix loose files with members from one or more archives, and the materialize stage will bucket and stream them appropriately.
+`paths.txt` lines are either filesystem paths or `archive://<abs-archive>!<member>` synthetic paths; one file may mix both, and the materialize stage streams archive members from a bounded tmpfs ring (`/dev/shm/...`) without ever extracting to disk.
 
 ```bash
-# Stage 1 — index loose .slp files on disk
+# Stage 1 — index a .7z archive (no extraction; tmpfs-backed)
 uv run python -m hal.scripts.index \
-    --root ~/data/raw/dev \
-    --output ~/data/processed/index.jsonl
+    --archive fixtures/dev.7z --output /tmp/index.jsonl
 
-# Stage 1 — index .slp members directly from a .7z (no extraction; tmpfs-backed)
-uv run python -m hal.scripts.index \
-    --archive ~/data/raw/melee_public_slp_dataset_v2.7z \
-    --output ~/data/processed/index.jsonl
-
-# Stage 1 — fold another archive into the same index
-uv run python -m hal.scripts.index \
-    --archive ~/data/raw/ranked-anonymized-2-151807.7z \
-    --output ~/data/processed/index.jsonl \
-    --incremental
-
-# Stage 2 — filter to a paths.txt (no .slp opens; runs in seconds)
+# Stage 2 — filter to a paths.txt (defaults: completed games, ≥1500 frames, six tournament stages)
 uv run python -m hal.scripts.filter \
-    --index ~/data/processed/index.jsonl \
-    --output ~/data/processed/paths.txt \
-    --min-frames 1500 \
-    --rank master diamond platinum
+    --index /tmp/index.jsonl --output /tmp/paths.txt
 
-# Stage 3 — paths.txt + index.jsonl → MDS shards + manifest.jsonl
-# (Archive entries in paths.txt are streamed automatically; no --archive flag.)
+# Stage 3 — paths.txt + index.jsonl → MDS shards
 uv run python -m hal.scripts.materialize \
-    --paths-file ~/data/processed/paths.txt \
-    --index ~/data/processed/index.jsonl \
-    --output ~/data/processed/mds
+    --paths-file /tmp/paths.txt --index /tmp/index.jsonl --output /tmp/mds
 ```
 
-In archive mode `index` and `materialize` materialize each member to a bounded tmpfs ring (default `/dev/shm/...`, ~64 files in flight) just long enough for `peppi-py` to parse it, then unlink — the archive itself is never extracted to persistent storage.
+You can fold additional archives into one `index.jsonl` with `--incremental` on Stage 1.
 
-End-to-end smoke tests live in `tests/test_archive_streaming.py` and skip automatically when the `~/data/raw/dev.7z` fixture isn't present:
+## Closed-loop round-trip
+
+The closed-loop driver in `hal/sim/` plays an MDS row back through Dolphin and diffs against the original `.slp`:
 
 ```bash
-uv run pytest tests/test_archive_streaming.py -v
+uv run python -m hal.scripts.roundtrip --max-frames 200
+# expect: PASS (bit-exact across 11 post-fields × 2 ports)
 ```
 
-## Training
-
-```bash
-uv run python hal/training/simple_trainer.py --n_gpus 1 --data.data_dir /path/to/mds --arch GPTv5Controller-512-6-8-dropout
-```
-
-## Evaluation
-
-```bash
-uv run python hal/eval/eval.py --model_dir /path/to/model_dir --n_workers 1
-```
+Defaults read from `fixtures/`; override via flags. Training and evaluation drivers are being rewritten on top of `hal/sim/` and the new MDS schema; nothing here ships yet.

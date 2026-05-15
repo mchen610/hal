@@ -8,6 +8,7 @@ The offline data pipeline (`.slp` → MDS shards) lives in `hal/data/` and is dr
 The closed-loop driver (Dolphin + libmelee) lives in `hal/sim/`: `Session` owns the emulator process, `ControllerSource` implementations produce per-port inputs, and `drive()` runs the step loop that powers round-trip validation, online eval vs CPU, self-play, and RL rollouts.
 Cross-layer wire conventions (button bits, mask sentinels, raw↔wire math, port and stage/character bridges, post-frame field naming) are the single source of truth in `hal/wire.py`.
 Project policy (included characters/stages, player port conventions) lives in `hal/policy.py`.
+Integration fixtures (dev archive, MDS bundle, ISO, Dolphin) are declared in `hal/fixtures.py` and fetched into `<repo>/fixtures/` via `python -m hal.scripts.fetch`; see `README.md`.
 
 ## Principles
 

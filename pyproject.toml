@@ -10,6 +10,7 @@ readme = "README.md"
 # The codebase uses current Python syntax and toolchain support.
 requires-python = ">=3.14"
 dependencies = [
+    "boto3",
     "click",
     "libcst",
     "loguru",
@@ -64,9 +65,6 @@ extend-exclude = [
     ".venv",
     "build",
     "venv",
-    "emulator",
-    "hal/training/models/lstm.py",
-    "hal/training/models/mlp.py",
 ]
 
 [tool.ruff.lint]
@@ -91,15 +89,7 @@ force-single-line = true
 root = ["."]
 
 [tool.ty.src]
-# Pending rewrite — see TODO_MIGRATION.md. These subtrees still reference
-# the libmelee-era schema (deleted hal.data.stats, removed PlayerState
-# fields, etc.) and will be rewritten on top of the new MDS schema.
 exclude = [
-    "hal/training/**",
-    "hal/preprocess/**",
-    "hal/eval/**",
-    "hal/emulator_helper.py",
-    "hal/gamestate_utils.py",
     "notebooks/**",
 ]
 
