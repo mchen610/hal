@@ -1,13 +1,16 @@
 """Unit tests for hal.data.replay_stats — pure-function helpers + fixture probe."""
 
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from hal.data.replay_stats import PlayerStats
 from hal.data.replay_stats import ReplayStats
 from hal.data.replay_stats import _count_input_edges
-from hal.data.replay_stats import _count_sds
+from hal.data.replay_stats import _death_percents
+from hal.data.replay_stats import _dedupe_keep_idx
 from hal.data.replay_stats import _final_stocks
 from hal.data.replay_stats import _percent_gained
 from hal.data.replay_stats import compute_replay_stats
@@ -18,13 +21,13 @@ from hal.wire import BUTTON_BITS
 class _ArrowLike:
     """Minimal stand-in for a pyarrow Array exposing __len__ and to_pylist()."""
 
-    def __init__(self, values: list[object]) -> None:
-        self._values = values
+    def __init__(self, values: Sequence[Any]) -> None:
+        self._values = list(values)
 
     def __len__(self) -> int:
         return len(self._values)
 
-    def to_pylist(self) -> list[object]:
+    def to_pylist(self) -> list[Any]:
         return list(self._values)
 
 
@@ -84,62 +87,47 @@ def test_count_input_edges_none_input() -> None:
     assert _count_input_edges(_ArrowLike([BUTTON_BITS["a"]])) == 0
 
 
-def test_count_sds_credits_recent_hit() -> None:
-    # Hit landed at idx 4 (percent 0->10), death at idx 5 (5 frames after
-    # the hit, well inside the 180-frame credit window) → opponent credited.
-    sds, early = _count_sds(
-        _ArrowLike([0.0, 0.0, 0.0, 0.0, 10.0, 0.0]),
-        _ArrowLike([4, 4, 4, 4, 4, 3]),
-        _ArrowLike([6, 6, 6, 6, 1, 1]),
-        self_port_idx=0,
-    )
-    assert (sds, early) == (0, 0)
+def test_death_percents_basic() -> None:
+    # Stocks 4 -> 4 -> 3: one death at idx 1->2; recorded percent is pct[1] = 80.
+    out = _death_percents(_ArrowLike([0.0, 80.0, 0.0]), _ArrowLike([4, 4, 3]))
+    assert out == (pytest.approx(80.0),)
 
 
-def test_count_sds_stale_hit_is_sd() -> None:
-    # Hit landed at idx 1 (0 -> 10), death at idx 250 — 249 frames later,
-    # > 180-frame credit window, so this is an SD.
-    percent = [0.0, 10.0] + [10.0] * 249
-    stock = [4] * 250 + [3]
-    lhb = [6] + [1] * 250
-    sds, early = _count_sds(_ArrowLike(percent), _ArrowLike(stock), _ArrowLike(lhb), self_port_idx=0)
-    assert sds == 1
-    assert early == 1
+def test_death_percents_multiple_stock_losses() -> None:
+    # Three deaths: at idx 1->2 (pct=50), idx 3->4 (pct=120), idx 5->6 (pct=80).
+    pct = [0.0, 50.0, 0.0, 120.0, 0.0, 80.0, 0.0]
+    stk = [4, 4, 3, 3, 2, 2, 1]
+    out = _death_percents(_ArrowLike(pct), _ArrowLike(stk))
+    assert out == (pytest.approx(50.0), pytest.approx(120.0), pytest.approx(80.0))
 
 
-def test_count_sds_self_grab_is_sd() -> None:
-    # last_hit_by == self_port_idx ⇒ always an SD, even with a recent hit.
-    sds, early = _count_sds(
-        _ArrowLike([0.0, 0.0, 10.0, 0.0]),
-        _ArrowLike([4, 4, 4, 3]),
-        _ArrowLike([6, 6, 0, 0]),  # self at idx 0
-        self_port_idx=0,
-    )
-    assert sds == 1
-    assert early == 1
+def test_death_percents_ignores_none_sentinel_transitions() -> None:
+    # Game-end trailer: stocks 4 -> 4 -> None. The 4->None decrement is NOT a death.
+    out = _death_percents(_ArrowLike([0.0, 50.0, 50.0]), _ArrowLike([4, 4, None]))
+    assert out == ()
 
 
-def test_count_sds_early_vs_late_window() -> None:
-    # No hits ever; two deaths. Death @ 100 is "early" (gap from frame 0 =
-    # 100). Death @ 1000 is "late" (gap from prev death = 900).
-    n = 1001
-    percent = [0.0] * n
-    stock = [4] * 100 + [3] * 900 + [2]
-    lhb = [6] * n
-    sds, early = _count_sds(_ArrowLike(percent), _ArrowLike(stock), _ArrowLike(lhb), self_port_idx=0)
-    assert sds == 2
-    assert early == 1
+def test_death_percents_no_deaths() -> None:
+    assert _death_percents(_ArrowLike([0.0, 10.0, 20.0]), _ArrowLike([4, 4, 4])) == ()
 
 
-def test_count_sds_no_deaths() -> None:
-    sds, early = _count_sds(_ArrowLike([0.0] * 3), _ArrowLike([4, 4, 4]), _ArrowLike([6, 6, 6]), self_port_idx=0)
-    assert (sds, early) == (0, 0)
+def test_death_percents_none_inputs() -> None:
+    assert _death_percents(None, _ArrowLike([4, 3])) == ()
+    assert _death_percents(_ArrowLike([0.0, 50.0]), None) == ()
+    assert _death_percents(_ArrowLike([]), _ArrowLike([])) == ()
 
 
-def test_count_sds_none_inputs() -> None:
-    assert _count_sds(None, _ArrowLike([4]), _ArrowLike([6]), 0) == (0, 0)
-    assert _count_sds(_ArrowLike([0.0]), None, _ArrowLike([6]), 0) == (0, 0)
-    assert _count_sds(_ArrowLike([0.0]), _ArrowLike([4]), None, 0) == (0, 0)
+def test_dedupe_keep_idx_collapses_rollback_pattern() -> None:
+    # Rollback emits each repeated frame_id with a later "correction"; keep the LAST.
+    # ids: 2065, 2066, 2065, 2066, 2067, 2066, 2067
+    # last-occurrence: 2065@2, 2066@5, 2067@6; sorted ascending -> [2, 5, 6]
+    keep = _dedupe_keep_idx([2065, 2066, 2065, 2066, 2067, 2066, 2067])
+    assert list(keep) == [2, 5, 6]
+
+
+def test_dedupe_keep_idx_already_unique() -> None:
+    keep = _dedupe_keep_idx([-123, -122, -121, -120])
+    assert list(keep) == [0, 1, 2, 3]
 
 
 def test_player_stats_roundtrip() -> None:
@@ -149,8 +137,7 @@ def test_player_stats_roundtrip() -> None:
         damage_taken=80.0,
         stocks_remaining=2,
         inputs=900,
-        sds=1,
-        early_sds=0,
+        death_percents=(45.0, 130.0),
     )
     assert PlayerStats.from_dict(p.to_dict()) == p
 
@@ -158,8 +145,15 @@ def test_player_stats_roundtrip() -> None:
 def test_replay_stats_roundtrip() -> None:
     rs = ReplayStats(
         players=(
-            PlayerStats(port=1, damage_dealt=1.0, damage_taken=2.0, stocks_remaining=3, inputs=4, sds=0, early_sds=0),
-            PlayerStats(port=2, damage_dealt=5.0, damage_taken=6.0, stocks_remaining=0, inputs=7, sds=2, early_sds=1),
+            PlayerStats(port=1, damage_dealt=1.0, damage_taken=2.0, stocks_remaining=3, inputs=4, death_percents=()),
+            PlayerStats(
+                port=2,
+                damage_dealt=5.0,
+                damage_taken=6.0,
+                stocks_remaining=0,
+                inputs=7,
+                death_percents=(60.0, 95.5, 110.0, 75.0),
+            ),
         )
     )
     assert ReplayStats.from_dict(rs.to_dict()) == rs
@@ -189,5 +183,6 @@ def test_compute_replay_stats_on_fixture(tmp_path: Path) -> None:
         assert p.damage_taken >= 0.0
         assert 0 <= p.stocks_remaining <= 4
         assert p.inputs > 0  # any non-CSS-only replay has button presses
-        assert p.sds >= 0
-        assert 0 <= p.early_sds <= p.sds
+        # Deaths == starting stocks (4) - remaining; bounded by the 4-stock cap.
+        assert len(p.death_percents) <= 4
+        assert all(dp >= 0.0 for dp in p.death_percents)

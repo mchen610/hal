@@ -1,13 +1,18 @@
-"""Per-replay aggregate stats: damage / stocks / inputs from one frame pass.
+"""Per-replay aggregate stats: damage / stocks / inputs / death percents.
 
-A small set of obvious aggregates — naive percent-delta damage (gated on
-stock-reset frames so post-death percent drops don't count), final stocks, and
-a button-edge input count — computed once per replay when ``build_index`` runs
-with ``--with-stats``. 1v1 only; returns ``None`` otherwise. Not slippi-js
-parity (no conversions / L-cancels / openings); intended as filter fodder.
+Computed once per replay when ``build_index`` runs with ``--with-stats``. 1v1
+only; returns ``None`` otherwise. Not slippi-js parity (no conversions /
+L-cancels / openings); intended as filter fodder.
+
+All frame-level computations operate on rollback-deduplicated columns —
+peppi-py emits one row per recorded state including rollback corrections, so
+the same `frame_id` can appear 2-3 times with different (or identical) values.
+Without deduping, a single death registers as multiple stock decrements; a
+single hit can be summed multiple times into damage_dealt.
 """
 
 import dataclasses
+import types
 from dataclasses import dataclass
 from dataclasses import fields
 from typing import Any
@@ -23,17 +28,6 @@ _ALL_BUTTON_BITS: int = 0
 for _bit in BUTTON_BITS.values():
     _ALL_BUTTON_BITS |= _bit
 
-# Window for crediting an opponent's hit as the killing blow. Generous on
-# purpose: knockback trajectories can run 100-200 frames with no new hits
-# (meteor + slow fall, off-stage forward-smash), so a tight window
-# false-flags those as SDs. Beyond ~3s of no new hits, the death is more
-# plausibly self-inflicted.
-_KILL_CREDIT_FRAMES: int = 180
-# An SD is "early" if it happened this many list-indices after the previous
-# death (or game start, for the first stock). 480 ≈ 8 seconds at 60fps —
-# in the middle of "5-10s after spawning".
-_EARLY_SD_FRAMES: int = 480
-
 
 @dataclass(frozen=True, slots=True)
 class PlayerStats:
@@ -42,15 +36,16 @@ class PlayerStats:
     damage_taken: float
     stocks_remaining: int
     inputs: int
-    sds: int
-    early_sds: int
+    death_percents: tuple[float, ...]  # percent at the moment of each stock loss, in order
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PlayerStats:
-        return cls(**data)
+        d = dict(data)
+        d["death_percents"] = tuple(d.get("death_percents", ()))
+        return cls(**d)
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,20 +87,6 @@ class PlayerStatsMins:
         return any(getattr(self, f.name) is not None for f in fields(self))
 
 
-@dataclass(frozen=True, slots=True)
-class PlayerStatsMaxes:
-    """Per-player maximums. None = no filter on that field. ALL players must
-    be at or below the ceiling for the replay to pass. Requires an index built
-    with `index --with-stats`.
-    """
-
-    sds: int | None = None
-    early_sds: int | None = None
-
-    def any_set(self) -> bool:
-        return any(getattr(self, f.name) is not None for f in fields(self))
-
-
 def _percent_gained(percent: Any, stock: Any) -> float:
     """Sum of positive percent deltas, dropping stock-change frames.
 
@@ -138,59 +119,26 @@ def _final_stocks(stock: Any) -> int:
     return 0
 
 
-def _count_sds(
-    percent: Any,
-    stock: Any,
-    last_hit_by: Any,
-    self_port_idx: int,
-) -> tuple[int, int]:
-    """Return (total_sds, early_sds) for one player.
+def _death_percents(percent: Any, stock: Any) -> tuple[float, ...]:
+    """Percent at the moment of each stock loss, in chronological order.
 
-    A stock loss is an SD when the killing blow can't be credited to an
-    opponent: `last_hit_by` points at us, or no positive percent delta
-    landed on us within `_KILL_CREDIT_FRAMES` of the death frame.
-    Percent-increase is used as the "got hit" signal because it's the only
-    one populated on every slp version (older replays lack `hitlag_left`,
-    and `last_attack_landed` persists across consecutive hits of the same
-    move so its diff misses repeat hits). An SD is "early" if it happens
-    within `_EARLY_SD_FRAMES` of the prior death (or frame 0 for stock 1).
+    Detects stock decrements only between valid (non-sentinel) values, so
+    game-end ``None`` transitions don't register as deaths. The recorded
+    percent is from the frame BEFORE the decrement (the decrement frame
+    itself has the post-respawn reset value).
     """
-    if percent is None or stock is None or last_hit_by is None or len(stock) < 2:
-        return 0, 0
+    if percent is None or stock is None or len(stock) < 2:
+        return ()
     pct = np.asarray(percent.to_pylist(), dtype=np.float64)
-    stk = np.fromiter((s if s is not None else -1 for s in stock.to_pylist()), dtype=np.int32, count=len(stock))
-    lhb = np.fromiter(
-        (h if h is not None else -1 for h in last_hit_by.to_pylist()),
-        dtype=np.int32,
-        count=len(last_hit_by),
-    )
-
-    death_idx = np.where(np.diff(stk) < 0)[0] + 1
+    stk_raw = stock.to_pylist()
+    stk = np.fromiter((s if s is not None else -1 for s in stk_raw), dtype=np.int32, count=len(stk_raw))
+    prev = stk[:-1]
+    nxt = stk[1:]
+    death_mask = (prev >= 0) & (nxt >= 0) & (nxt < prev)
+    death_idx = np.where(death_mask)[0]  # index of frame BEFORE the decrement
     if death_idx.size == 0:
-        return 0, 0
-
-    # Hit-on-us = positive percent delta with no stock change on that frame
-    # (mirrors the gate in _percent_gained). The hit is recorded at the "after"
-    # frame; running max gives the most recent hit frame at every index.
-    delta_pct = np.diff(pct)
-    delta_stk = np.diff(stk)
-    hit_mask = (delta_stk == 0) & np.isfinite(delta_pct) & (delta_pct > 0)
-    full_hit_frames = np.full(len(pct), -(10**9), dtype=np.int64)
-    full_hit_frames[1:][hit_mask] = np.arange(1, len(pct))[hit_mask]
-    last_hit_at = np.maximum.accumulate(full_hit_frames)
-
-    sds = 0
-    early_sds = 0
-    prev_d = 0
-    for d in death_idx:
-        d = int(d)
-        is_sd = (lhb[d] == self_port_idx) or (d - int(last_hit_at[d]) > _KILL_CREDIT_FRAMES)
-        if is_sd:
-            sds += 1
-            if (d - prev_d) < _EARLY_SD_FRAMES:
-                early_sds += 1
-        prev_d = d
-    return sds, early_sds
+        return ()
+    return tuple(float(p) for p in pct[death_idx] if np.isfinite(p))
 
 
 def _count_input_edges(buttons_physical: Any) -> int:
@@ -205,29 +153,62 @@ def _count_input_edges(buttons_physical: Any) -> int:
     return int(np.unpackbits(edges.view(np.uint8)).sum())
 
 
+class _MaskedColumn:
+    """Pyarrow-shaped view of a column with a row-index mask preapplied."""
+
+    __slots__ = ("_values",)
+
+    def __init__(self, src: Any, keep_idx: np.ndarray) -> None:
+        full = src.to_pylist()
+        self._values: list[Any] = [full[i] for i in keep_idx]
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def to_pylist(self) -> list[Any]:
+        return list(self._values)
+
+
+def _dedupe_keep_idx(frame_ids: list[int]) -> np.ndarray:
+    """Indices of the LAST row per ``frame_id`` (rollback consolidation).
+
+    peppi-py emits one row per recorded slp frame state — including rollback
+    corrections — so the same ``frame_id`` can appear 2-3 times. The final
+    corrected value is the last occurrence. Returned indices are sorted
+    ascending (preserving frame order).
+    """
+    n = len(frame_ids)
+    seen: set[int] = set()
+    keep: list[int] = []
+    for i in range(n - 1, -1, -1):
+        f = int(frame_ids[i])
+        if f in seen:
+            continue
+        seen.add(f)
+        keep.append(i)
+    keep.reverse()
+    return np.asarray(keep, dtype=np.int64)
+
+
+def _mask(src: Any, keep_idx: np.ndarray) -> Any:
+    return None if src is None else _MaskedColumn(src, keep_idx)
+
+
 @dataclass(frozen=True, slots=True)
 class _PlayerColumns:
     libmelee_port: int
-    peppi_idx: int  # 0..3, matches values found in `last_hit_by`
-    pre: Any
-    post: Any
+    pre: Any  # SimpleNamespace with buttons_physical
+    post: Any  # SimpleNamespace with percent, stock
 
 
 def _player_stats(self_cols: _PlayerColumns, opp_cols: _PlayerColumns) -> PlayerStats:
-    sds, early_sds = _count_sds(
-        self_cols.post.percent,
-        self_cols.post.stock,
-        self_cols.post.last_hit_by,
-        self_cols.peppi_idx,
-    )
     return PlayerStats(
         port=self_cols.libmelee_port,
         damage_dealt=_percent_gained(opp_cols.post.percent, opp_cols.post.stock),
         damage_taken=_percent_gained(self_cols.post.percent, self_cols.post.stock),
         stocks_remaining=_final_stocks(self_cols.post.stock),
         inputs=_count_input_edges(self_cols.pre.buttons_physical),
-        sds=sds,
-        early_sds=early_sds,
+        death_percents=_death_percents(self_cols.post.percent, self_cols.post.stock),
     )
 
 
@@ -244,21 +225,24 @@ def compute_replay_stats(g: Game) -> ReplayStats | None:
     if len(g.start.players) != 2:
         return None
 
-    by_port = sorted(
-        (
+    keep_idx = _dedupe_keep_idx(g.frames.id.to_pylist())
+
+    by_port: list[_PlayerColumns] = []
+    for i, pl in enumerate(g.start.players):
+        leader = g.frames.ports[i].leader
+        assert leader.post.percent is not None, f"peppi returned no percent column for port {pl.port}"
+        assert leader.post.stock is not None, f"peppi returned no stock column for port {pl.port}"
+        by_port.append(
             _PlayerColumns(
                 libmelee_port=peppi_port_to_libmelee(pl.port),
-                peppi_idx=int(pl.port.value),
-                pre=g.frames.ports[i].leader.pre,
-                post=g.frames.ports[i].leader.post,
+                pre=types.SimpleNamespace(buttons_physical=_mask(leader.pre.buttons_physical, keep_idx)),
+                post=types.SimpleNamespace(
+                    percent=_mask(leader.post.percent, keep_idx),
+                    stock=_mask(leader.post.stock, keep_idx),
+                ),
             )
-            for i, pl in enumerate(g.start.players)
-        ),
-        key=lambda c: c.libmelee_port,
-    )
-    for c in by_port:
-        assert c.post.percent is not None, f"peppi returned no percent column for port {c.libmelee_port}"
-        assert c.post.stock is not None, f"peppi returned no stock column for port {c.libmelee_port}"
+        )
+    by_port.sort(key=lambda c: c.libmelee_port)
 
     a, b = by_port
     return ReplayStats(players=(_player_stats(a, b), _player_stats(b, a)))

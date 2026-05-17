@@ -17,7 +17,7 @@ Stages and characters accept names (case-insensitive) from the tables below,
 OR slp-native integer ids (e.g. `--stages 31 32` or `--stages BATTLEFIELD
 FINAL_DESTINATION`).
 
-Damage / stocks / inputs / SD predicates require an index built with
+Damage / stocks / inputs predicates require an index built with
 `python -m hal.scripts.index --with-stats`. If the index has no stats,
 `filter_index` raises rather than silently producing empty output.
 """
@@ -34,7 +34,6 @@ from loguru import logger
 
 from hal.data.index import ReplayIndexEntry
 from hal.data.index import read_jsonl
-from hal.data.replay_stats import PlayerStatsMaxes
 from hal.data.replay_stats import PlayerStatsMins
 from hal.policy import INCLUDED_STAGES
 from hal.wire import CHARACTERS_BY_NAME
@@ -88,14 +87,12 @@ def build_predicates(
     characters: set[int] | None = None,
     ranks: set[str] | None = None,
     mins: PlayerStatsMins | None = None,
-    maxes: PlayerStatsMaxes | None = None,
 ) -> list[tuple[str, Predicate]]:
     """Return (label, predicate) pairs. The label is used for diagnostics.
 
     Per-player conditions (`characters`, stat mins) are satisfied if ANY
-    player matches. Stat maxes require ALL players to be at or below the
-    ceiling. Stats predicates require entries with `stats` populated —
-    `filter_index` raises on `entry.stats is None` before any stats
+    player matches. Stats predicates require entries with `stats` populated
+    — `filter_index` raises on `entry.stats is None` before any stats
     predicate is evaluated, so predicate bodies here assume
     `e.stats is not None`.
     """
@@ -132,17 +129,6 @@ def build_predicates(
                     lambda e, t=t, n=f.name: any(getattr(p, n) >= t for p in e.stats.players),
                 )
             )
-    if maxes is not None:
-        for f in fields(maxes):
-            t = getattr(maxes, f.name)
-            if t is None:
-                continue
-            preds.append(
-                (
-                    f"max_{f.name}={t}",
-                    lambda e, t=t, n=f.name: all(getattr(p, n) <= t for p in e.stats.players),
-                )
-            )
 
     return preds
 
@@ -158,7 +144,6 @@ def filter_index(
     characters: set[int] | None = None,
     ranks: set[str] | None = None,
     mins: PlayerStatsMins | None = None,
-    maxes: PlayerStatsMaxes | None = None,
     log_per_filter: bool = True,
 ) -> int:
     if not index.exists():
@@ -172,10 +157,9 @@ def filter_index(
         characters=characters,
         ranks=ranks,
         mins=mins,
-        maxes=maxes,
     )
 
-    needs_stats = (mins is not None and mins.any_set()) or (maxes is not None and maxes.any_set())
+    needs_stats = mins is not None and mins.any_set()
 
     paths: list[str] = []
     total = 0
@@ -215,8 +199,8 @@ def filter_index(
 class FilterConfig:
     """Filter `index.jsonl` to a `paths.txt` for Stage 3.
 
-    Defaults bake in completed-only, 1500-frame minimum, and the six
-    tournament-legal stages. Override or disable any of these via flags.
+    Defaults bake in completed-only, 1500-frame minimum, max_early_sds=2,
+    and the six tournament-legal stages. Override or disable any of these via flags.
     """
 
     index: Path
@@ -267,12 +251,6 @@ class FilterConfig:
     min_inputs: int | None = None
     """Keep if any player had >= this many button presses. Requires --with-stats."""
 
-    max_sds: int | None = None
-    """Drop if any player had > this many self-destructs. Requires --with-stats."""
-
-    max_early_sds: int | None = None
-    """Drop if any player had > this many SDs within ~8s of spawning. Requires --with-stats."""
-
 
 def run(cfg: FilterConfig) -> int:
     stages = _resolve_stages(cfg.stages) if cfg.stages else None
@@ -284,7 +262,6 @@ def run(cfg: FilterConfig) -> int:
         stocks_remaining=cfg.min_stocks_remaining,
         inputs=cfg.min_inputs,
     )
-    maxes = PlayerStatsMaxes(sds=cfg.max_sds, early_sds=cfg.max_early_sds)
 
     return filter_index(
         index=cfg.index,
@@ -296,7 +273,6 @@ def run(cfg: FilterConfig) -> int:
         characters=chars,
         ranks=ranks,
         mins=mins if mins.any_set() else None,
-        maxes=maxes if maxes.any_set() else None,
     )
 
 
