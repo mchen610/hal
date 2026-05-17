@@ -339,16 +339,14 @@ def extract_index_entry(
     last_frame = md.get("lastFrame")
     if last_frame is None:
         # Anonymized .slp files ship with empty metadata. When with_stats=True
-        # we already loaded frames; otherwise re-read with frames so we can
+        # `g` already has frames; otherwise re-read with frames so we can
         # recover frame count from the frame id array.
-        if with_stats:
-            g_full = g
-        else:
+        if not with_stats:
             try:
-                g_full = peppi_py.read_slippi(str(replay_path), skip_frames=False)
+                g = peppi_py.read_slippi(str(replay_path), skip_frames=False)
             except Exception:
                 return None
-        ids = g_full.frames.id
+        ids = g.frames.id
         last_frame = int(ids[-1]) if len(ids) else None
     frame_count = int(last_frame) if last_frame is not None else 0
 

@@ -9,6 +9,7 @@ parity (no conversions / L-cancels / openings); intended as filter fodder.
 
 import dataclasses
 from dataclasses import dataclass
+from dataclasses import fields
 from typing import Any
 
 import numpy as np
@@ -33,7 +34,7 @@ _KILL_CREDIT_FRAMES: int = 180
 _EARLY_SD_FRAMES: int = 480
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PlayerStats:
     port: int  # libmelee 1..4
     damage_dealt: float
@@ -51,7 +52,7 @@ class PlayerStats:
         return cls(**data)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ReplayStats:
     players: tuple[PlayerStats, ...]  # sorted by port
 
@@ -62,25 +63,41 @@ class ReplayStats:
     def from_dict(cls, data: dict[str, Any]) -> ReplayStats:
         return cls(players=tuple(PlayerStats.from_dict(p) for p in data["players"]))
 
-    def for_port(self, port: int) -> PlayerStats | None:
-        for p in self.players:
-            if p.port == port:
-                return p
-        return None
+
+@dataclass(frozen=True, slots=True)
+class PlayerStatsThresholds:
+    """Minimums for per-player stats. None = no filter on that field.
+
+    Field names mirror `PlayerStats` (minus `port`). Consumers apply
+    "any player matches" semantics. Requires an index built with
+    `index --with-stats`.
+    """
+
+    damage_dealt: float | None = None
+    damage_taken: float | None = None
+    stocks_remaining: int | None = None
+    inputs: int | None = None
+    sds: int | None = None
+    early_sds: int | None = None
+
+    def any_set(self) -> bool:
+        return any(getattr(self, f.name) is not None for f in fields(self))
 
 
-def _damage_dealt(victim_percent: Any, victim_stock: Any) -> float:
-    """Sum of victim's positive percent deltas, dropping stock-change frames.
+def _percent_gained(percent: Any, stock: Any) -> float:
+    """Sum of positive percent deltas, dropping stock-change frames.
 
     Stock-change includes the death frame (percent resets to 0) and any
-    None-bounded transition. The two arrays are pyarrow Arrays or None.
+    None-bounded transition. Used for both `damage_dealt` (passing the
+    opponent's columns) and `damage_taken` (passing self's columns).
+    The two arrays are pyarrow Arrays or None.
     """
-    if victim_percent is None or victim_stock is None or len(victim_percent) < 2:
+    if percent is None or stock is None or len(percent) < 2:
         return 0.0
     # None float -> NaN propagates through diff; None int -> -1 sentinel forces
     # delta_stk != 0 across the boundary, excluding those frames from the gate.
-    pct = np.asarray(victim_percent.to_pylist(), dtype=np.float64)
-    stk_raw = victim_stock.to_pylist()
+    pct = np.asarray(percent.to_pylist(), dtype=np.float64)
+    stk_raw = stock.to_pylist()
     stk = np.fromiter((s if s is not None else -1 for s in stk_raw), dtype=np.int32, count=len(stk_raw))
 
     delta_pct = np.diff(pct)
@@ -131,7 +148,7 @@ def _count_sds(
         return 0, 0
 
     # Hit-on-us = positive percent delta with no stock change on that frame
-    # (mirrors the gate in _damage_dealt). The hit is recorded at the "after"
+    # (mirrors the gate in _percent_gained). The hit is recorded at the "after"
     # frame; running max gives the most recent hit frame at every index.
     delta_pct = np.diff(pct)
     delta_stk = np.diff(stk)
@@ -166,7 +183,7 @@ def _count_input_edges(buttons_physical: Any) -> int:
     return int(np.unpackbits(edges.view(np.uint8)).sum())
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _PlayerColumns:
     libmelee_port: int
     peppi_idx: int  # 0..3, matches values found in `last_hit_by`
@@ -183,8 +200,8 @@ def _player_stats(self_cols: _PlayerColumns, opp_cols: _PlayerColumns) -> Player
     )
     return PlayerStats(
         port=self_cols.libmelee_port,
-        damage_dealt=_damage_dealt(opp_cols.post.percent, opp_cols.post.stock),
-        damage_taken=_damage_dealt(self_cols.post.percent, self_cols.post.stock),
+        damage_dealt=_percent_gained(opp_cols.post.percent, opp_cols.post.stock),
+        damage_taken=_percent_gained(self_cols.post.percent, self_cols.post.stock),
         stocks_remaining=_final_stocks(self_cols.post.stock),
         inputs=_count_input_edges(self_cols.pre.buttons_physical),
         sds=sds,
@@ -195,9 +212,14 @@ def _player_stats(self_cols: _PlayerColumns, opp_cols: _PlayerColumns) -> Player
 def compute_replay_stats(g: Game) -> ReplayStats | None:
     """Compute aggregates from a peppi Game with frames loaded (skip_frames=False).
 
-    Returns None for non-1v1 replays, missing frames, or missing percent/stock.
+    Returns None for non-1v1 replays or missing frames. Asserts that
+    `post.percent` / `post.stock` are present — peppi guarantees these
+    columns post-Slippi-1.0; a missing column is a peppi regression, not
+    a per-replay condition to swallow.
     """
     if g.frames is None:
+        return None
+    if len(g.start.players) != 2:
         return None
 
     by_port = sorted(
@@ -212,10 +234,9 @@ def compute_replay_stats(g: Game) -> ReplayStats | None:
         ),
         key=lambda c: c.libmelee_port,
     )
-    if len(by_port) != 2:
-        return None
-    if any(c.post.percent is None or c.post.stock is None for c in by_port):
-        return None
+    for c in by_port:
+        assert c.post.percent is not None, f"peppi returned no percent column for port {c.libmelee_port}"
+        assert c.post.stock is not None, f"peppi returned no stock column for port {c.libmelee_port}"
 
     a, b = by_port
     return ReplayStats(players=(_player_stats(a, b), _player_stats(b, a)))

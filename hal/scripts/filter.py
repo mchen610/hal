@@ -36,6 +36,7 @@ from loguru import logger
 
 from hal.data.index import ReplayIndexEntry
 from hal.data.index import read_jsonl
+from hal.data.replay_stats import PlayerStatsThresholds
 from hal.policy import INCLUDED_STAGES
 from hal.wire import CHARACTERS_BY_NAME
 from hal.wire import slp_stage_to_libmelee
@@ -44,26 +45,6 @@ Predicate = Callable[[ReplayIndexEntry], bool]
 
 # Project policy: tournament-legal stages, keyed by libmelee enum name.
 INCLUDED_STAGES_BY_NAME: dict[str, melee.Stage] = {stage.name: stage for stage in INCLUDED_STAGES}
-
-
-@dataclass(frozen=True, slots=True)
-class PlayerStatsThresholds:
-    """Minimums for per-player stats. None = no filter on that field.
-
-    Field names mirror `PlayerStats` (minus `port`). Predicates use
-    "any player matches" semantics, consistent with `characters` /
-    `codes_include`. Requires an index built with `index --with-stats`.
-    """
-
-    damage_dealt: float | None = None
-    damage_taken: float | None = None
-    stocks_remaining: int | None = None
-    inputs: int | None = None
-    sds: int | None = None
-    early_sds: int | None = None
-
-    def any_set(self) -> bool:
-        return any(getattr(self, f.name) is not None for f in fields(self))
 
 
 def _resolve_ids(values: list[str], table: dict[str, int], kind: str) -> set[int]:
