@@ -65,11 +65,9 @@ class ReplayStats:
 
 
 @dataclass(frozen=True, slots=True)
-class PlayerStatsThresholds:
-    """Minimums for per-player stats. None = no filter on that field.
-
-    Field names mirror `PlayerStats` (minus `port`). Consumers apply
-    "any player matches" semantics. Requires an index built with
+class PlayerStatsMins:
+    """Per-player minimums. None = no filter on that field. Any player meeting
+    the floor is enough to keep the replay. Requires an index built with
     `index --with-stats`.
     """
 
@@ -77,6 +75,18 @@ class PlayerStatsThresholds:
     damage_taken: float | None = None
     stocks_remaining: int | None = None
     inputs: int | None = None
+
+    def any_set(self) -> bool:
+        return any(getattr(self, f.name) is not None for f in fields(self))
+
+
+@dataclass(frozen=True, slots=True)
+class PlayerStatsMaxes:
+    """Per-player maximums. None = no filter on that field. ALL players must
+    be at or below the ceiling for the replay to pass. Requires an index built
+    with `index --with-stats`.
+    """
+
     sds: int | None = None
     early_sds: int | None = None
 
