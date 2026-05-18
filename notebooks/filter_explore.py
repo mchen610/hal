@@ -16,8 +16,10 @@
 #  - `reject_hard`   fails ≥2 predicates, or any hard one
 
 # %%
+import random
 import urllib.parse
 from collections import Counter
+from collections import defaultdict
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
@@ -38,7 +40,7 @@ from hal.scripts.filter import build_predicates
 from hal.wire import CHARACTERS_BY_NAME
 from hal.wire import slp_stage_to_libmelee
 
-INDEX = Path("~/src/hal/data/processed/ranked-anonymized-1/index.jsonl").expanduser()
+INDEX = Path("~/src/hal/data/processed/ranked-anonymized-2/index.jsonl").expanduser()
 OUT_DIR = Path(__file__).parent / ".filter_explore"
 OUT_DIR.mkdir(exist_ok=True)
 EXTRACT_CACHE = OUT_DIR / "extracted"
@@ -83,6 +85,39 @@ def materialize(entry_path: str) -> Path:
     return cached
 
 
+def _failure_key(failed: list[str]) -> str:
+    return failed[0] if len(failed) == 1 else " + ".join(sorted(failed))
+
+
+def group_rejections(
+    buckets: dict,
+) -> tuple[dict[str, list[ReplayIndexEntry]], dict[str, list[ReplayIndexEntry]]]:
+    """Group all rejects by exact failure set, and by each failed predicate.
+
+    ``by_predicate`` lists an entry once per predicate it failed (sum of group
+    sizes can exceed total rejects). ``by_exact`` lists each entry once.
+    """
+    by_exact: dict[str, list[ReplayIndexEntry]] = defaultdict(list)
+    by_predicate: dict[str, list[ReplayIndexEntry]] = defaultdict(list)
+
+    for entry, label in buckets["reject_near"]:
+        by_exact[label].append(entry)
+        by_predicate[label].append(entry)
+    for entry, failed in buckets["reject_hard"]:
+        by_exact[_failure_key(failed)].append(entry)
+        for label in failed:
+            by_predicate[label].append(entry)
+
+    return (
+        dict(sorted(by_exact.items(), key=lambda kv: -len(kv[1]))),
+        dict(sorted(by_predicate.items(), key=lambda kv: -len(kv[1]))),
+    )
+
+
+def _safe_reason_name(label: str) -> str:
+    return label.replace("/", "_").replace("=", "_").replace("@", "_at_").replace(" + ", "__")
+
+
 @dataclass
 class TuneCfg:
     min_frames: int = 1500
@@ -98,11 +133,19 @@ class TuneCfg:
     min_stocks_remaining: int | None = None
     min_inputs: int | None = None
 
+    # Reject replays where any player has >= max_cheap_deaths stocks lost at
+    # <= cheap_death_pct percent. Set max_cheap_deaths=None to disable.
+    max_cheap_deaths: int | None = 2
+    cheap_death_pct: float = 10.0
+
+    # Keep if any player has >= this many stock losses. None = disable.
+    min_death_count: int | None = 3
+
     # Slack windows defining "near" the boundary.
     frame_slack: int = 300
 
 
-cfg = TuneCfg(min_damage_dealt=100)
+cfg = TuneCfg(min_damage_dealt=100, completed_only=False)
 
 
 # %% [markdown]
@@ -139,6 +182,27 @@ def score(cfg: TuneCfg, entries: list[ReplayIndexEntry]):
         ranks=ranks,
         mins=mins if mins.any_set() else None,
     )
+
+    if cfg.max_cheap_deaths is not None:
+        max_cheap = cfg.max_cheap_deaths
+        pct = cfg.cheap_death_pct
+
+        def _no_cheap_deaths(e: ReplayIndexEntry, max_cheap: int = max_cheap, pct: float = pct) -> bool:
+            if e.stats is None:
+                return True
+            return all(sum(1 for dp in p.death_percents if dp <= pct) < max_cheap for p in e.stats.players)
+
+        preds.append((f"max_cheap_deaths<{max_cheap}@{pct}%", _no_cheap_deaths))
+
+    if cfg.min_death_count is not None:
+        floor = cfg.min_death_count
+
+        def _any_player_death_count_ok(e: ReplayIndexEntry, floor: int = floor) -> bool:
+            if e.stats is None:
+                return True
+            return any(len(p.death_percents) >= floor for p in e.stats.players)
+
+        preds.append((f"any_death_count>={floor}", _any_player_death_count_ok))
 
     # "Soft" predicates are the ones with a continuous knob — fails within a
     # slack window count as near-rejects. Everything else (completed_only,
@@ -181,13 +245,17 @@ def score(cfg: TuneCfg, entries: list[ReplayIndexEntry]):
 
 
 buckets = score(cfg, entries)
+reject_by_exact, reject_by_predicate = group_rejections(buckets)
 total = len(entries)
 for name in ("accept_clean", "accept_near", "reject_near", "reject_hard"):
     n = len(buckets[name])
     logger.info(f"  {name:14s} {n:7d}  ({100 * n / total:5.1f}%)")
-logger.info("per-predicate failures (sum > drops when an entry fails multiple):")
-for label, n in buckets["fail_counts"].most_common():
-    logger.info(f"  fail[{label}]: {n}")
+logger.info("rejections by predicate (entry may appear in multiple groups):")
+for label, items in reject_by_predicate.items():
+    logger.info(f"  reject[{label}]: {len(items)}")
+logger.info("rejections by exact failure set:")
+for label, items in reject_by_exact.items():
+    logger.info(f"  reject_exact[{label}]: {len(items)}")
 
 
 # %% [markdown]
@@ -211,6 +279,13 @@ for name in ("accept_clean", "accept_near", "reject_near", "reject_hard"):
     (OUT_DIR / f"{name}.txt").write_text("\n".join(e.path for e, _ in items) + ("\n" if items else ""))
     logger.info(f"wrote {len(items)} -> {OUT_DIR / (name + '.txt')}")
 
+reject_dir = OUT_DIR / "reject_by_predicate"
+reject_dir.mkdir(exist_ok=True)
+for label, items in reject_by_predicate.items():
+    path = reject_dir / f"{_safe_reason_name(label)}.txt"
+    path.write_text("\n".join(e.path for e in items) + ("\n" if items else ""))
+    logger.info(f"wrote {len(items)} -> {path}")
+
 
 # %% [markdown]
 # No standalone file server: slps are served by slippilab's vite dev server via
@@ -231,10 +306,13 @@ def _summary(entry: ReplayIndexEntry) -> str:
     completed = entry.outcome.completed if entry.outcome else None
     if entry.stats:
         deaths = " | ".join("[" + ",".join(f"{dp:.0f}" for dp in p.death_percents) + "]" for p in entry.stats.players)
+        death_counts = [len(p.death_percents) for p in entry.stats.players]
+        count_tag = f"deaths={death_counts} "
     else:
         deaths = "?"
+        count_tag = ""
     return (
-        f"frames={entry.frame_count:5d} {stage_name:18s} chars={chars} death_pcts={deaths} "
+        f"frames={entry.frame_count:5d} {stage_name:18s} chars={chars} death_pcts={deaths} {count_tag}"
         f"rank={entry.rank_filename} v={'.'.join(map(str, entry.slp_version))} completed={completed}"
     )
 
@@ -256,6 +334,38 @@ def show_bucket(name: str, n: int = 25, offset: int = 0) -> None:
         print(f"    {link}")
 
 
+def _print_entries(header: str, entries: list[ReplayIndexEntry]) -> None:
+    print(f"\n=== {header} ===\n")
+    for entry in entries:
+        try:
+            local = materialize(entry.path)
+        except Exception as e:
+            print(f"  [extract failed: {e!r}] {entry.path}")
+            continue
+        replay_url = f"{SLIPPILAB_URL}/{SERVE_MOUNT}/{local.name}"
+        link = f"{SLIPPILAB_URL}/?replayUrl={urllib.parse.quote(replay_url, safe=':/')}"
+        print(f"  {_summary(entry)}")
+        print(f"    {link}")
+
+
+def show_rejections(reason: str, n: int = 25, offset: int = 0) -> None:
+    """Sample from ``reject_by_predicate[reason]`` (predicate label from scoring)."""
+    items = reject_by_predicate[reason]
+    page = items[offset : offset + n]
+    _print_entries(f"reject[{reason}]  showing [{offset}:{offset + len(page)}] of {len(items)}", page)
+
+
+def show_rejections_sample(n: int = 15, *, seed: int | None = None) -> None:
+    """Random sample from each predicate rejection group."""
+    rng = random.Random(seed)
+    for reason, items in reject_by_predicate.items():
+        k = min(n, len(items))
+        if k == 0:
+            continue
+        sample = rng.sample(items, k)
+        _print_entries(f"reject[{reason}]  sample {k} of {len(items)}", sample)
+
+
 show_bucket("reject_near", n=15)
 
 # %%
@@ -267,15 +377,28 @@ show_bucket("accept_near", n=15)
 # %%
 show_bucket("reject_hard")
 
+# %%
+show_rejections_sample(15)
+
+# %%
+show_bucket("accept_clean", n=25, offset=25)
+
+# %%
+
+reject_by_predicate.keys()
+# %%
+rng = random.Random(0)
+samples = rng.sample(reject_by_predicate["max_frames=26000"], 15)
+_print_entries(f"reject['max_frames=26000']  sample 15 of {len(samples)}", samples)
 
 # %% [markdown]
 # Iterate: edit `cfg`, rerun the scoring cell. Examples:
 #
 # ```python
-cfg.min_frames = 1200
-cfg.frame_slack = 200
-buckets = score(cfg, entries)
-show_bucket("reject_near")
+# cfg.min_frames = 1200
+# cfg.frame_slack = 200
+# buckets = score(cfg, entries)
+# show_bucket("reject_near")
 # ```
 
 # %% [markdown]
