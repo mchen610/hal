@@ -31,6 +31,7 @@ Usage:
 
 import dataclasses
 import multiprocessing as mp
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -150,6 +151,10 @@ def _open_writers(output: Path, splits: Iterable[str]) -> dict[str, MDSWriter]:
 def _bucket_paths(paths: list[str]) -> tuple[list[tuple[Path, str]], dict[Path, list[str]]]:
     """Split paths.txt into (open_path, manifest_key) pairs and per-archive member lists.
 
+    Uses ``os.path.abspath`` (not ``resolve``) so symlinked-in-place fixtures
+    keep their declared path; this matches ``repo_relative`` and ensures the
+    manifest_key reconstructed downstream matches ``entry.path`` in the index.
+
     Member ordering within an archive is preserved for reproducibility, even
     though ``iter_archive_members`` currently yields in decompression order.
     """
@@ -158,14 +163,13 @@ def _bucket_paths(paths: list[str]) -> tuple[list[tuple[Path, str]], dict[Path, 
     for p in paths:
         parsed = parse_archive_member_path(p)
         if parsed is None:
-            abs_path = Path(p).resolve()
+            abs_path = Path(os.path.abspath(p))
             manifest_key = str(repo_relative(abs_path))
             fs_pairs.append((abs_path, manifest_key))
             continue
         archive, member = parsed
         if not archive.is_absolute():
             archive = Path(REPO_DIR) / archive
-        archive = archive.resolve()
         members_by_archive.setdefault(archive, []).append(member)
     return fs_pairs, members_by_archive
 
@@ -272,6 +276,10 @@ def process_replays(
                     )
                 )
     finally:
+        # Close the work iterator explicitly so `iter_archive_members`'
+        # finally-block (drain producer, release sem slots) runs deterministically
+        # rather than whenever GC happens to collect the generator.
+        work_iter.close()
         for w in writers.values():
             w.finish()
 
