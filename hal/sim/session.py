@@ -117,11 +117,19 @@ class Session:
         frozen_stadium: bool = True,
         tmp_home_directory: bool = True,
         replay_dir: str | Path | None = None,
+        blocking_input: bool = False,
     ) -> None:
         self.iso_path = str(iso_path)
         self.dolphin_path = str(dolphin_path)
         self.slippi_port = slippi_port
         self.step_timeout_seconds = step_timeout_seconds
+        # Block console.step until the controller pipe has been read.
+        # Required for closed-loop control where the input punched for frame N
+        # must land before frame N+1 is advanced; without it, model inputs can
+        # race the emulator and the policy effectively drives stale state.
+        # Replay-style consumers (round-trip diff, MDS playback) keep the
+        # default False so they don't pay the per-frame block.
+        self.blocking_input = blocking_input
         # Whether libmelee writes its custom GALE01r2.ini Gecko-code file.
         # The codes shipped are all $Optional (off by default), so this
         # generally has no behavioral effect — but exposing the toggle is
@@ -157,7 +165,7 @@ class Session:
         self._console = melee.Console(
             path=self.dolphin_path,
             slippi_port=self.slippi_port,
-            blocking_input=False,
+            blocking_input=self.blocking_input,
             polling_mode=False,
             setup_gecko_codes=self.setup_gecko_codes,
             tmp_home_directory=self.tmp_home_directory,

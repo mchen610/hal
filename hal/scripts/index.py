@@ -29,7 +29,6 @@ import multiprocessing as mp
 import signal
 from pathlib import Path
 
-import py7zr
 import tyro
 from loguru import logger
 from tqdm import tqdm
@@ -37,6 +36,7 @@ from tqdm import tqdm
 from hal.data.archive import ReplayWork
 from hal.data.archive import archive_member_path
 from hal.data.archive import iter_replay_work
+from hal.data.archive import list_archive_slps
 from hal.data.index import ReplayIndexEntry
 from hal.data.index import extract_index_entry
 from hal.data.index import read_jsonl
@@ -96,14 +96,8 @@ def _resolve_fs(root: Path, seen: set[str]) -> list[tuple[Path, str]]:
     return new
 
 
-def _list_archive_slps(archive: Path) -> list[str]:
-    """Cheap (header-only) list of .slp member names, in archive order."""
-    with py7zr.SevenZipFile(str(archive), "r") as z:
-        return [name for name in z.getnames() if name.endswith(".slp")]
-
-
 def _resolve_archive(archive: Path, seen: set[str]) -> list[str]:
-    members = _list_archive_slps(archive)
+    members = list_archive_slps(archive)
     new_members = [m for m in members if archive_member_path(archive, m) not in seen]
     logger.info(f"archive {archive.name}: {len(members)} slps, {len(new_members)} to index")
     return new_members

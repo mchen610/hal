@@ -18,10 +18,10 @@ from pathlib import Path
 
 import numpy as np
 import peppi_py
-import py7zr
 from peppi_py.frame import Post
 
 from hal.data.archive import parse_archive_member_path
+from hal.data.archive import read_archive_member_to_file
 from hal.wire import POST_FIELD_SUFFIXES
 from hal.wire import peppi_port_to_libmelee
 
@@ -65,11 +65,7 @@ class Trajectory:
         if not archive.is_file():
             raise FileNotFoundError(f"archive not found: {archive}")
         with tempfile.TemporaryDirectory(prefix="hal_traj_") as tmpdir:
-            with py7zr.SevenZipFile(str(archive), "r") as z:
-                z.extract(path=tmpdir, targets=[member])
-            extracted = Path(tmpdir) / member
-            if not extracted.is_file():
-                raise FileNotFoundError(f"member {member!r} not in {archive}")
+            extracted = read_archive_member_to_file(archive, member, Path(tmpdir))
             return cls._read_slp_file(extracted)
 
     @classmethod
