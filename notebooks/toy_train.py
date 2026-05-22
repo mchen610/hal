@@ -1,4 +1,8 @@
-# %%
+import os
+
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
 import math
 from dataclasses import dataclass
 from dataclasses import field
@@ -51,9 +55,11 @@ cfg = dict(
     lr=3e-4,
     weight_decay=0.01,
     warmup_steps=500,
-    max_steps=2_000,
-    eval_every=2000,
-    eval_max_frames=1800,
+    max_steps=15_000,
+    val_every=500,
+    val_n_batches=16,
+    eval_every=2500,
+    eval_max_frames=3600,
     num_workers=8,
     prefetch_factor=8,
     data_root=DATA_ROOT,
@@ -61,6 +67,11 @@ cfg = dict(
     # Trains the model to handle the closed-loop rolling-buffer transient where
     # _ego_inputs_hist starts as L_ctx zeros and slowly fills with model outputs.
     ego_history_dropout_prob=0.5,
+    # Latency-aware (receding-horizon) chunked prediction. K=4 frames @ 60Hz =
+    # 66ms ~ one inference period; the model conditions on K already-committed
+    # bridge actions [t, t+K) and predicts L_chunk frames starting at t+K.
+    # K=0 reproduces the original open-loop architecture.
+    latency_frames=4,
 )
 
 
@@ -256,17 +267,25 @@ def sinusoidal_time_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
 
 
 class FlowMatchingPolicy(nn.Module):
-    """Unified Transformer over [L_ctx context tokens | L_chunk noise tokens].
+    """Unified Transformer over [L_ctx ctx tokens | K bridge tokens | L_chunk noise tokens].
     Context tokens carry observed ego+opp gamestate + ego controller history.
+    Bridge tokens (when ``latency_frames`` K > 0) carry the K already-committed
+    actions about to execute while the new chunk is being computed at 60ms /
+    15 Hz cadence; they get their own type embedding and a separate projection.
     Chunk tokens carry the noised action a_t + time embedding + a learned
     chunk-type embedding. Output head reads the chunk positions and predicts
     the flow-matching velocity v̂ ∈ R^{L_chunk × A_DIM}.
+
+    K=0 reproduces the original open-loop architecture exactly (bridge_proj /
+    bridge_type_emb / extended pos_emb are not created), keeping older
+    checkpoints loadable.
     """
 
     def __init__(self, cfg: dict):
         super().__init__()
         self.L_ctx = cfg["L_ctx"]
         self.L_chunk = cfg["L_chunk"]
+        self.K = int(cfg.get("latency_frames", 0))
         d = cfg["d_model"]
         self.time_emb_dim = cfg["time_emb_dim"]
         self.ego_history_dropout_prob = float(cfg.get("ego_history_dropout_prob", 0.0))
@@ -291,7 +310,10 @@ class FlowMatchingPolicy(nn.Module):
             nn.Linear(d, d),
         )
         self.chunk_type_emb = nn.Parameter(torch.zeros(d))
-        self.pos_emb = nn.Embedding(self.L_ctx + self.L_chunk, d)
+        if self.K > 0:
+            self.bridge_proj = nn.Linear(A_DIM, d)
+            self.bridge_type_emb = nn.Parameter(torch.zeros(d))
+        self.pos_emb = nn.Embedding(self.L_ctx + self.K + self.L_chunk, d)
 
         layer = nn.TransformerEncoderLayer(
             d_model=d,
@@ -359,6 +381,7 @@ class FlowMatchingPolicy(nn.Module):
         batch_or_ctx: dict[str, torch.Tensor] | torch.Tensor,
         a_t: torch.Tensor,
         t: torch.Tensor,
+        bridge: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         batch_or_ctx — either a raw preprocessed batch dict OR a precomputed
@@ -367,6 +390,9 @@ class FlowMatchingPolicy(nn.Module):
                        fixed across all flow steps).
         a_t          — [B, L_chunk, A_DIM] noised action chunk.
         t            — [B] or any shape that flattens to [B] of times in [0, 1].
+        bridge       — [B, K, A_DIM] clean actions for frames [t, t+K) that
+                       will execute while this prediction is being computed.
+                       Required iff self.K > 0; ignored otherwise.
         Returns v_pred [B, L_chunk, A_DIM].
         """
         if isinstance(batch_or_ctx, dict):
@@ -378,11 +404,20 @@ class FlowMatchingPolicy(nn.Module):
         t_emb = sinusoidal_time_embedding(t_flat, self.time_emb_dim)
         t_proj = self.time_mlp(t_emb)
         chunk_tokens = chunk_tokens + t_proj[:, None, :] + self.chunk_type_emb[None, None, :]
-        seq = torch.cat([ctx_tokens, chunk_tokens], dim=1)
+        if self.K > 0:
+            if bridge is None:
+                raise ValueError(f"latency_frames={self.K} requires bridge tensor of shape [B, {self.K}, A_DIM]")
+            if bridge.shape[1] != self.K:
+                raise ValueError(f"bridge length {bridge.shape[1]} != K={self.K}")
+            bridge_tokens = self.bridge_proj(bridge) + self.bridge_type_emb[None, None, :]
+            seq = torch.cat([ctx_tokens, bridge_tokens, chunk_tokens], dim=1)
+        else:
+            seq = torch.cat([ctx_tokens, chunk_tokens], dim=1)
         pos_ids = torch.arange(seq.size(1), device=seq.device)
         seq = seq + self.pos_emb(pos_ids)[None, :, :]
         out = self.encoder(seq)
-        return self.head(out[:, self.L_ctx :, :])
+        chunk_start = self.L_ctx + self.K
+        return self.head(out[:, chunk_start:, :])
 
 
 # %%
@@ -412,10 +447,57 @@ def make_loader(cfg: dict, split: str) -> StreamingDataLoader:
         split=split,
         L_ctx=cfg["L_ctx"],
         L_chunk=cfg["L_chunk"],
+        K=int(cfg.get("latency_frames", 0)),
         batch_size=cfg["batch_size"],
         num_workers=int(cfg.get("num_workers", 4)),
         prefetch_factor=int(cfg.get("prefetch_factor", 4)),
     )
+
+
+@torch.no_grad()
+def build_val_cache(val_loader: StreamingDataLoader, n_batches: int, cfg: dict, device: str) -> list[tuple]:
+    """Materialize n_batches of val windows + fixed (t, z) noise on-device.
+    Caching makes val loss comparable across evaluations — same windows,
+    same noise — so a drop in val loss is a real model improvement, not
+    sampling variance. CPU generator + .to(device) to avoid cuda-rng pinning."""
+    L_ctx = cfg["L_ctx"]
+    L_chunk = cfg["L_chunk"]
+    K = int(cfg.get("latency_frames", 0))
+    cache: list[tuple] = []
+    g = torch.Generator(device="cpu").manual_seed(0)
+    for raw in val_loader:
+        batch = _to_device(preprocess_inputs(raw, stats), device)
+        actions_all = stack_ego_actions(batch)
+        bridge = actions_all[:, L_ctx : L_ctx + K, :] if K > 0 else None
+        a_target = actions_all[:, L_ctx + K :, :]
+        B = a_target.shape[0]
+        t = torch.rand(B, generator=g).to(device)
+        z = torch.randn(B, L_chunk, A_DIM, generator=g).to(device)
+        t_b = t.view(B, 1, 1)
+        a_t = (1 - t_b) * z + t_b * a_target
+        v_target = a_target - z
+        cache.append((batch, a_t, t, v_target, bridge))
+        if len(cache) >= n_batches:
+            break
+    if not cache:
+        raise RuntimeError("val loader yielded zero batches")
+    return cache
+
+
+@torch.no_grad()
+def val_loss(model: FlowMatchingPolicy, val_cache: list[tuple]) -> float:
+    """Sample-weighted MSE across cached val batches. Toggles model.eval/train."""
+    was_training = model.training
+    model.eval()
+    total = 0.0
+    count = 0
+    for batch, a_t, t, v_target, bridge in val_cache:
+        v_pred = model(batch, a_t, t, bridge=bridge)
+        total += F.mse_loss(v_pred, v_target).item() * v_target.shape[0]
+        count += v_target.shape[0]
+    if was_training:
+        model.train()
+    return total / count
 
 
 def lr_schedule(cfg: dict):
@@ -433,7 +515,14 @@ def lr_schedule(cfg: dict):
     return fn
 
 
-def train(model: FlowMatchingPolicy, loader: StreamingDataLoader, cfg: dict, device: str, comment: str = "") -> None:
+def train(
+    model: FlowMatchingPolicy,
+    loader: StreamingDataLoader,
+    cfg: dict,
+    device: str,
+    val_loader: StreamingDataLoader,
+    comment: str = "",
+) -> None:
     import time
 
     run_name = make_run_name(cfg, comment)
@@ -452,6 +541,15 @@ def train(model: FlowMatchingPolicy, loader: StreamingDataLoader, cfg: dict, dev
         torch.save({"step": step, "model": model.state_dict(), "cfg": cfg}, path)
         print(f"[ckpt] saved {path}", flush=True)
 
+    print("[val] building cached val set…", flush=True)
+    val_t0 = time.monotonic()
+    val_cache = build_val_cache(val_loader, cfg["val_n_batches"], cfg, device)
+    print(
+        f"[val] cached {len(val_cache)} batches "
+        f"({sum(b[3].shape[0] for b in val_cache)} samples) in {time.monotonic() - val_t0:.1f}s",
+        flush=True,
+    )
+
     opt = AdamW(model.parameters(), lr=cfg["lr"], betas=(0.9, 0.95), weight_decay=cfg["weight_decay"])
     sched = LambdaLR(opt, lr_schedule(cfg))
     model.train()
@@ -459,6 +557,7 @@ def train(model: FlowMatchingPolicy, loader: StreamingDataLoader, cfg: dict, dev
     it_t0 = time.monotonic()
     it = iter(loader)
     L_ctx = cfg["L_ctx"]
+    K = int(cfg.get("latency_frames", 0))
     print(f"[t+{time.monotonic() - it_t0:.1f}s] iter built; fetching first batch…", flush=True)
     fetch_t0 = time.monotonic()
     raw = next(it)
@@ -476,14 +575,16 @@ def train(model: FlowMatchingPolicy, loader: StreamingDataLoader, cfg: dict, dev
         have_first = False
         data_t0 = time.monotonic()
         batch = _to_device(preprocess_inputs(raw, stats), device)
-        a_target = stack_ego_actions(batch)[:, L_ctx:, :]
+        actions_all = stack_ego_actions(batch)
+        bridge = actions_all[:, L_ctx : L_ctx + K, :] if K > 0 else None
+        a_target = actions_all[:, L_ctx + K :, :]
         B = a_target.shape[0]
         t = torch.rand(B, device=device)
         z = torch.randn_like(a_target)
         t_b = t.view(B, 1, 1)
         a_t = (1 - t_b) * z + t_b * a_target
         v_target = a_target - z
-        v_pred = model(batch, a_t, t)
+        v_pred = model(batch, a_t, t, bridge=bridge)
         loss = F.mse_loss(v_pred, v_target)
         opt.zero_grad()
         loss.backward()
@@ -509,12 +610,22 @@ def train(model: FlowMatchingPolicy, loader: StreamingDataLoader, cfg: dict, dev
                 flush=True,
             )
         step_t0 = time.monotonic()
+        if cfg["val_every"] > 0 and step > 0 and step % cfg["val_every"] == 0:
+            vl = val_loss(model, val_cache)
+            wandb.log({"val/loss": vl}, step=step)
+            print(f"[t+{time.monotonic() - run_t0:.0f}s] step {step}: val_loss {vl:.4f}", flush=True)
         if cfg["eval_every"] > 0 and step > 0 and step % cfg["eval_every"] == 0:
             _save_ckpt(f"step_{step:06d}.pt", step)
-            model.eval()
             metrics = closed_loop_eval(model, max_frames=cfg["eval_max_frames"])
             wandb.log({f"eval/{k}": v for k, v in metrics.items()}, step=step)
-            model.train()
+            print(f"[t+{time.monotonic() - run_t0:.0f}s] step {step}: closed_loop {metrics}", flush=True)
+    # Final ckpt + val + closed-loop eval so the last entry isn't blind.
+    vl_final = val_loss(model, val_cache)
+    wandb.log({"val/loss": vl_final}, step=cfg["max_steps"])
+    print(f"[final] val_loss {vl_final:.4f}", flush=True)
+    metrics_final = closed_loop_eval(model, max_frames=cfg["eval_max_frames"])
+    wandb.log({f"eval/{k}": v for k, v in metrics_final.items()}, step=cfg["max_steps"])
+    print(f"[final] closed_loop {metrics_final}", flush=True)
     _save_ckpt("final.pt", cfg["max_steps"])
 
 
@@ -578,9 +689,15 @@ def _live_batch_from_rolling(
 
 @torch.no_grad()
 def _integrate_chunk_batched(
-    model: FlowMatchingPolicy, batch: dict[str, torch.Tensor], n_steps: int, device: str
+    model: FlowMatchingPolicy,
+    batch: dict[str, torch.Tensor],
+    n_steps: int,
+    device: str,
+    bridge: torch.Tensor | None = None,
 ) -> np.ndarray:
-    """Euler-integrate from z ~ N(0,I) for n_steps. Returns [B, L_chunk, A_DIM]."""
+    """Euler-integrate from z ~ N(0,I) for n_steps. Returns [B, L_chunk, A_DIM].
+    ``bridge`` is required iff ``model.K > 0``; it carries the K already-
+    committed actions for frames [now, now+K) that execute during inference."""
     model.eval()
     ctx = model.build_context_tokens(batch)
     B = next(iter(batch.values())).shape[0]
@@ -588,32 +705,49 @@ def _integrate_chunk_batched(
     dt = 1.0 / n_steps
     for k in range(n_steps):
         t_val = torch.full((B,), k * dt, device=device)
-        v = model(ctx, a, t_val)
+        v = model(ctx, a, t_val, bridge=bridge)
         a = a + dt * v
     return a.cpu().numpy()
 
 
 def _integrate_chunk(
-    model: FlowMatchingPolicy, batch: dict[str, torch.Tensor], n_steps: int, device: str
+    model: FlowMatchingPolicy,
+    batch: dict[str, torch.Tensor],
+    n_steps: int,
+    device: str,
+    bridge: torch.Tensor | None = None,
 ) -> np.ndarray:
     """Single-sample shim over _integrate_chunk_batched. Returns [L_chunk, A_DIM]."""
-    return _integrate_chunk_batched(model, batch, n_steps, device)[0]
+    return _integrate_chunk_batched(model, batch, n_steps, device, bridge=bridge)[0]
 
 
 @dataclass
 class ModelControllerSource:
-    """ControllerSource: rolling-history flow-matching policy."""
+    """ControllerSource: rolling-history flow-matching policy with optional
+    receding-horizon (latency-aware) chunked prediction.
+
+    K=0: open-loop — predict L_chunk frames, play them, replan after L_chunk
+    frames.
+
+    K>0: receding horizon — replan every K frames. Each chunk predicts
+    L_chunk frames starting K ahead of the replan time (modeling inference
+    latency). Between replans, play the K actions from the previous chunk's
+    first K predictions (the "bridge"); at bootstrap (first chunk after
+    warm-up), the bridge is zeros and the first K frames are played neutral.
+    """
 
     model: nn.Module
     stats: dict
     ego_prefix: str
     L_ctx: int = L_CTX
     L_chunk: int = L_CHUNK
+    K: int = 0
     n_flow_steps: int = 8
     device: str = DEVICE
     _flat_hist: list = field(default_factory=list)
     _ego_inputs_hist: list = field(default_factory=list)
     _pending: np.ndarray | None = None
+    _current_bridge: np.ndarray | None = None
     _offset: int = 0
 
     def __call__(self, frame_index: int, last_gamestate: dict | None):
@@ -632,14 +766,30 @@ class ModelControllerSource:
         # with neutral so both rolling buffers have L_ctx entries.
         if len(self._ego_inputs_hist) < self.L_ctx:
             self._ego_inputs_hist.append(_NEUTRAL_ACTION.copy())
-        # Replan once per L_chunk frames.
-        if self._pending is None or self._offset >= self.L_chunk:
+        # Replan cadence: K frames if K>0, else L_chunk (open-loop).
+        replan_period = self.K if self.K > 0 else self.L_chunk
+        if self._pending is None or self._offset >= replan_period:
             raw = _live_batch_from_rolling(self._flat_hist, self._ego_inputs_hist, self.ego_prefix)
             batch = preprocess_inputs(raw, self.stats)
             batch = {k: v.to(self.device) for k, v in batch.items()}
-            self._pending = _integrate_chunk(self.model, batch, self.n_flow_steps, self.device)
+            if self.K > 0:
+                # Bootstrap: no prev chunk → zero bridge; bridge plays neutral
+                # for the next K frames. Steady state: bridge = prev_chunk[:K].
+                if self._pending is None:
+                    new_bridge = np.zeros((self.K, A_DIM), dtype=np.float32)
+                else:
+                    new_bridge = self._pending[: self.K].astype(np.float32)
+                bridge_t = torch.from_numpy(new_bridge).unsqueeze(0).to(self.device)
+                self._pending = _integrate_chunk(self.model, batch, self.n_flow_steps, self.device, bridge=bridge_t)
+                self._current_bridge = new_bridge
+            else:
+                self._pending = _integrate_chunk(self.model, batch, self.n_flow_steps, self.device)
             self._offset = 0
-        a = self._pending[self._offset]
+        # Played action: bridge if K>0 (next K to execute), else chunk directly.
+        if self.K > 0:
+            a = self._current_bridge[self._offset]
+        else:
+            a = self._pending[self._offset]
         self._offset += 1
         self._ego_inputs_hist.append(a.astype(np.float32))
         if len(self._ego_inputs_hist) > self.L_ctx:
@@ -663,6 +813,7 @@ class SelfPlayController:
     stats: dict
     L_ctx: int = L_CTX
     L_chunk: int = L_CHUNK
+    K: int = 0
     n_flow_steps: int = 8
     device: str = DEVICE
     _ports: dict = field(
@@ -672,6 +823,7 @@ class SelfPlayController:
         }
     )
     _pending: dict = field(default_factory=lambda: {"p1": None, "p2": None})
+    _current_bridge: dict = field(default_factory=lambda: {"p1": None, "p2": None})
     _offset: int = 0
     _last_frame_done: int = -1
     _last_actions: dict = field(default_factory=lambda: {"p1": _NEUTRAL_ACTION.copy(), "p2": _NEUTRAL_ACTION.copy()})
@@ -706,17 +858,32 @@ class SelfPlayController:
             buf = self._ports[ego]
             if len(buf["ego_inputs_hist"]) < self.L_ctx:
                 buf["ego_inputs_hist"].append(_NEUTRAL_ACTION.copy())
-        # Replan once per L_chunk: one forward call, batch_dim=2.
-        if self._pending["p1"] is None or self._offset >= self.L_chunk:
+        # Replan cadence: K frames if K>0, else L_chunk (open-loop).
+        replan_period = self.K if self.K > 0 else self.L_chunk
+        if self._pending["p1"] is None or self._offset >= replan_period:
             stacked = self._build_stacked_batch()
             batch = preprocess_inputs(stacked, self.stats)
             batch = {k: v.to(self.device) for k, v in batch.items()}
-            plans = _integrate_chunk_batched(self.model, batch, self.n_flow_steps, self.device)
-            self._pending = {"p1": plans[0], "p2": plans[1]}
+            if self.K > 0:
+                if self._pending["p1"] is None:
+                    new_bridges = {ego: np.zeros((self.K, A_DIM), dtype=np.float32) for ego in ("p1", "p2")}
+                else:
+                    new_bridges = {ego: self._pending[ego][: self.K].astype(np.float32) for ego in ("p1", "p2")}
+                bridge_stack = np.stack([new_bridges["p1"], new_bridges["p2"]], axis=0)
+                bridge_t = torch.from_numpy(bridge_stack).to(self.device)
+                plans = _integrate_chunk_batched(self.model, batch, self.n_flow_steps, self.device, bridge=bridge_t)
+                self._pending = {"p1": plans[0], "p2": plans[1]}
+                self._current_bridge = new_bridges
+            else:
+                plans = _integrate_chunk_batched(self.model, batch, self.n_flow_steps, self.device)
+                self._pending = {"p1": plans[0], "p2": plans[1]}
             self._offset = 0
         actions: dict[str, np.ndarray] = {}
         for ego in ("p1", "p2"):
-            a = self._pending[ego][self._offset]
+            if self.K > 0:
+                a = self._current_bridge[ego][self._offset]
+            else:
+                a = self._pending[ego][self._offset]
             actions[ego] = a
             buf = self._ports[ego]
             buf["ego_inputs_hist"].append(a.astype(np.float32))
@@ -744,8 +911,18 @@ class _SelfPlayPortView:
         return action_vec_to_controller(a)
 
 
+def _last_finite_stock(arr: np.ndarray) -> int:
+    """Last in-game stock value. Trailing IN_GAME → menu frames have NaN per-port
+    fields, so int(arr[-1]) would either raise or silently report 0."""
+    finite = arr[np.isfinite(arr)]
+    return int(finite[-1]) if len(finite) > 0 else 0
+
+
 def closed_loop_eval(model: nn.Module, max_frames: int = 3600) -> dict:
-    """Drive one Fox-ditto vs cpu_level=9 on FD for up to `max_frames`."""
+    """Drive one Fox-ditto vs cpu_level=9 on FD for up to `max_frames`.
+    FFW + EXI input pipe via the exi-ai Dolphin build for speed; emulation_speed=0
+    uncaps framerate. drive() returns the moment a match ends naturally, so
+    max_frames is a safety cap, not a target."""
     import melee
 
     from hal.fixtures import DOLPHIN_EXIAI
@@ -758,8 +935,6 @@ def closed_loop_eval(model: nn.Module, max_frames: int = 3600) -> dict:
     from hal.sim.session import Session
     from hal.sim.sources import InternalControllerSource
 
-    # ensure() downloads + extracts the AppImage; EMULATOR_PATH is the actual
-    # AppRun binary inside squashfs-root/ that libmelee.Console needs.
     ensure(DOLPHIN_EXIAI)
     matchup = Matchup(
         stage=melee.Stage.FINAL_DESTINATION,
@@ -769,17 +944,35 @@ def closed_loop_eval(model: nn.Module, max_frames: int = 3600) -> dict:
         ),
     )
     sources = {
-        1: ModelControllerSource(model=model, stats=stats, ego_prefix="p1"),
+        1: ModelControllerSource(
+            model=model,
+            stats=stats,
+            ego_prefix="p1",
+            K=int(getattr(model, "K", 0)),
+        ),
         2: InternalControllerSource(),
     }
-    with Session(
-        iso_path=ensure(ISO),
-        dolphin_path=EMULATOR_PATH,
-        blocking_input=True,
-    ) as s:
-        traj = drive(s, matchup, sources, max_frames=max_frames)
-    p1_stock = int(traj.post[1]["stock"][-1])
-    p2_stock = int(traj.post[2]["stock"][-1])
+    was_training = model.training
+    model.eval()
+    try:
+        with Session(
+            iso_path=ensure(ISO),
+            dolphin_path=EMULATOR_PATH,
+            blocking_input=True,
+            use_exi_inputs=True,
+            enable_ffw=True,
+            emulation_speed=0.0,
+        ) as s:
+            traj = drive(s, matchup, sources, max_frames=max_frames)
+    except Exception as e:
+        print(f"[eval] closed-loop crashed: {e!r}", flush=True)
+        if was_training:
+            model.train()
+        return dict(crashed=1.0)
+    if was_training:
+        model.train()
+    p1_stock = _last_finite_stock(traj.post[1]["stock"])
+    p2_stock = _last_finite_stock(traj.post[2]["stock"])
     p1_max_pct = float(np.nanmax(traj.post[1]["percent"]))
     p2_max_pct = float(np.nanmax(traj.post[2]["percent"]))
     return dict(
@@ -793,89 +986,97 @@ def closed_loop_eval(model: nn.Module, max_frames: int = 3600) -> dict:
 
 # %%
 # Sanity 1 — preprocess a batched window from val.
-ds = StreamingDataset(local=str(Path(DATA_ROOT) / "val"), batch_size=1)
-val_loader = StreamingDataLoader(
-    WindowSampler(ds, L_CTX, L_CHUNK),
-    batch_size=2,
-    num_workers=0,
-    collate_fn=collate_windows,
-)
-raw = next(iter(val_loader))
-batch_t = preprocess_inputs(raw, stats)
-assert batch_t["ego_position_x"].shape == (2, L_CTX + L_CHUNK)
-assert batch_t["ego_action"].shape == (2, L_CTX + L_CHUNK)
-print("preprocess shapes OK")
-{k: tuple(v.shape) for k, v in list(batch_t.items())[:8]}
+K_LATENCY = int(cfg.get("latency_frames", 0))
+# Skip the heavy sanity / training cells on plain `import notebooks.toy_train`
+# (e.g. from pytest). They still run under `python notebooks/toy_train.py` and
+# in VSCode "Run Cell" (which evaluates each cell with __name__ == '__main__').
+if __name__ == "__main__":
+    ds = StreamingDataset(local=str(Path(DATA_ROOT) / "val"), batch_size=1)
+    val_loader = StreamingDataLoader(
+        WindowSampler(ds, L_CTX, L_CHUNK, K=K_LATENCY),
+        batch_size=2,
+        num_workers=0,
+        collate_fn=collate_windows,
+    )
+    raw = next(iter(val_loader))
+    batch_t = preprocess_inputs(raw, stats)
+    assert batch_t["ego_position_x"].shape == (2, L_CTX + K_LATENCY + L_CHUNK)
+    assert batch_t["ego_action"].shape == (2, L_CTX + K_LATENCY + L_CHUNK)
+    print("preprocess shapes OK")
 
 
 # %%
 # Sanity 2 — one forward + loss + backward.
-model = FlowMatchingPolicy(cfg).to(DEVICE)
-batch_d = _to_device(batch_t, DEVICE)
-a_target = stack_ego_actions(batch_d)[:, L_CTX:, :]
-B = a_target.shape[0]
-t = torch.rand(B, device=DEVICE)
-z = torch.randn_like(a_target)
-t_b = t.view(B, 1, 1)
-a_t = (1 - t_b) * z + t_b * a_target
-v_target = a_target - z
-v_pred = model(batch_d, a_t, t)
-loss = F.mse_loss(v_pred, v_target)
-loss.backward()
-print(
-    f"v_pred {tuple(v_pred.shape)} loss {loss.item():.4f}; n_params {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M"
-)
+if __name__ == "__main__":
+    model = FlowMatchingPolicy(cfg).to(DEVICE)
+    batch_d = _to_device(batch_t, DEVICE)
+    _actions_all = stack_ego_actions(batch_d)
+    bridge_d = _actions_all[:, L_CTX : L_CTX + K_LATENCY, :] if K_LATENCY > 0 else None
+    a_target = _actions_all[:, L_CTX + K_LATENCY :, :]
+    B = a_target.shape[0]
+    t = torch.rand(B, device=DEVICE)
+    z = torch.randn_like(a_target)
+    t_b = t.view(B, 1, 1)
+    a_t = (1 - t_b) * z + t_b * a_target
+    v_target = a_target - z
+    v_pred = model(batch_d, a_t, t, bridge=bridge_d)
+    loss = F.mse_loss(v_pred, v_target)
+    loss.backward()
+    print(
+        f"v_pred {tuple(v_pred.shape)} loss {loss.item():.4f}; n_params {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M"
+    )
 
 
 # %%
 # Sanity 3 — overfit a single window to ~0 loss (fixed t, z, dropout off).
 # This validates the model has the capacity to fit; FM loss with fixed noise
 # is deterministic given parameters, so it should go to ~0.
-torch.manual_seed(0)
-np.random.seed(0)
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    np.random.seed(0)
 
-overfit_cfg = {**cfg, "dropout": 0.0}
-overfit_model = FlowMatchingPolicy(overfit_cfg).to(DEVICE)
-overfit_opt = AdamW(overfit_model.parameters(), lr=3e-4, betas=(0.9, 0.95))
+    overfit_cfg = {**cfg, "dropout": 0.0}
+    overfit_model = FlowMatchingPolicy(overfit_cfg).to(DEVICE)
+    overfit_opt = AdamW(overfit_model.parameters(), lr=3e-4, betas=(0.9, 0.95))
 
-one_sample = ds[0]
-T = len(one_sample["frame"])
-assert T >= L_CTX + L_CHUNK, f"replay too short for overfit ({T} < {L_CTX + L_CHUNK})"
-window = {k: v[0 : L_CTX + L_CHUNK] for k, v in one_sample.items()}
-window = _relabel_ego(window, "p1")
-raw_single = {k: v[None, ...] for k, v in window.items()}
-single_batch = _to_device(preprocess_inputs(raw_single, stats), DEVICE)
-target_single = stack_ego_actions(single_batch)[:, L_CTX:, :]
+    one_sample = ds[0]
+    T = len(one_sample["frame"])
+    _window_len = L_CTX + K_LATENCY + L_CHUNK
+    assert _window_len <= T, f"replay too short for overfit ({T} < {_window_len})"
+    window = {k: v[0:_window_len] for k, v in one_sample.items()}
+    window = _relabel_ego(window, "p1")
+    raw_single = {k: v[None, ...] for k, v in window.items()}
+    single_batch = _to_device(preprocess_inputs(raw_single, stats), DEVICE)
+    _single_actions = stack_ego_actions(single_batch)
+    single_bridge = _single_actions[:, L_CTX : L_CTX + K_LATENCY, :] if K_LATENCY > 0 else None
+    target_single = _single_actions[:, L_CTX + K_LATENCY :, :]
 
-fixed_t = torch.full((1,), 0.5, device=DEVICE)
-fixed_z = torch.randn(1, L_CHUNK, A_DIM, device=DEVICE)
-fixed_at = 0.5 * fixed_z + 0.5 * target_single
-fixed_v = target_single - fixed_z
+    fixed_t = torch.full((1,), 0.5, device=DEVICE)
+    fixed_z = torch.randn(1, L_CHUNK, A_DIM, device=DEVICE)
+    fixed_at = 0.5 * fixed_z + 0.5 * target_single
+    fixed_v = target_single - fixed_z
 
-overfit_model.train()
-losses = []
-for step in range(800):
-    v_pred = overfit_model(single_batch, fixed_at, fixed_t)
-    loss = F.mse_loss(v_pred, fixed_v)
-    overfit_opt.zero_grad()
-    loss.backward()
-    overfit_opt.step()
-    losses.append(loss.item())
-    if step % 50 == 0:
-        print(f"overfit step {step}: loss {loss.item():.6f}")
-print(f"final overfit loss: {losses[-1]:.6f} (initial {losses[0]:.4f})")
-assert losses[-1] < 1e-3, f"single-episode overfit did not converge: {losses[-1]:.4f}"
-print("OK: single-episode overfit converged below 1e-3")
-
-
-# %%
-# Real training. Uncomment to launch.
-# train_model = FlowMatchingPolicy(cfg).to(DEVICE)
-# train_loader = make_loader(cfg, "train")
-# train(train_model, train_loader, cfg, DEVICE, comment="")
+    overfit_model.train()
+    losses = []
+    for step in range(800):
+        v_pred = overfit_model(single_batch, fixed_at, fixed_t, bridge=single_bridge)
+        loss = F.mse_loss(v_pred, fixed_v)
+        overfit_opt.zero_grad()
+        loss.backward()
+        overfit_opt.step()
+        losses.append(loss.item())
+        if step % 50 == 0:
+            print(f"overfit step {step}: loss {loss.item():.6f}")
+    print(f"final overfit loss: {losses[-1]:.6f} (initial {losses[0]:.4f})")
+    assert losses[-1] < 1e-3, f"single-episode overfit did not converge: {losses[-1]:.4f}"
+    print("OK: single-episode overfit converged below 1e-3")
 
 
 # %%
-# Closed-loop smoke test against the level-9 CPU. Uncomment after training.
-# metrics = closed_loop_eval(train_model, max_frames=600)
-# print(metrics)
+# Real training. Runs when this file is invoked as `python notebooks/toy_train.py`.
+# Sanity cells above act as a quick preflight; the run then kicks off.
+if __name__ == "__main__":
+    train_model = FlowMatchingPolicy(cfg).to(DEVICE)
+    train_loader = make_loader(cfg, "train")
+    val_loader_long = make_loader({**cfg, "num_workers": 0}, "val")
+    train(train_model, train_loader, cfg, DEVICE, val_loader_long, comment="lat4-15k")

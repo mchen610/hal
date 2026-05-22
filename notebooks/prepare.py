@@ -30,14 +30,16 @@ def relabel_ego(window: dict[str, np.ndarray], ego_prefix: str) -> dict[str, np.
 
 class WindowSampler(IterableDataset):
     """Wrap a StreamingDataset: pick a random ego port and a random
-    sub-trajectory of length L_ctx + L_chunk from each replay. Relabel
-    p1/p2 → ego/opp before yielding."""
+    sub-trajectory of length ``L_ctx + K + L_chunk`` from each replay
+    (K is the latency-bridge length). Relabel p1/p2 → ego/opp before
+    yielding."""
 
-    def __init__(self, mds: StreamingDataset, L_ctx: int, L_chunk: int):
+    def __init__(self, mds: StreamingDataset, L_ctx: int, L_chunk: int, K: int = 0):
         self._mds = mds
         self.L_ctx = L_ctx
         self.L_chunk = L_chunk
-        self._L = L_ctx + L_chunk
+        self.K = K
+        self._L = L_ctx + K + L_chunk
 
     def __iter__(self):
         rng = np.random.default_rng()
@@ -63,12 +65,13 @@ def make_loader(
     L_ctx: int,
     L_chunk: int,
     batch_size: int,
+    K: int = 0,
     num_workers: int = 4,
     prefetch_factor: int = 4,
 ) -> StreamingDataLoader:
     """Build the (StreamingDataset → WindowSampler → DataLoader) chain."""
     mds = StreamingDataset(local=str(Path(data_root) / split), batch_size=1, shuffle=(split == "train"))
-    sampler = WindowSampler(mds, L_ctx, L_chunk)
+    sampler = WindowSampler(mds, L_ctx, L_chunk, K=K)
     return StreamingDataLoader(
         sampler,
         batch_size=batch_size,
