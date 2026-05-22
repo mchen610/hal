@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
@@ -50,12 +51,16 @@ cfg = dict(
     lr=3e-4,
     weight_decay=0.01,
     warmup_steps=500,
-    max_steps=50_000,
+    max_steps=2_000,
     eval_every=2000,
     eval_max_frames=1800,
     num_workers=8,
     prefetch_factor=8,
     data_root=DATA_ROOT,
+    # P(zero ego history's [:k] for a random k ~ U{0..L_ctx}) per sample at train.
+    # Trains the model to handle the closed-loop rolling-buffer transient where
+    # _ego_inputs_hist starts as L_ctx zeros and slowly fills with model outputs.
+    ego_history_dropout_prob=0.5,
 )
 
 
@@ -264,6 +269,7 @@ class FlowMatchingPolicy(nn.Module):
         self.L_chunk = cfg["L_chunk"]
         d = cfg["d_model"]
         self.time_emb_dim = cfg["time_emb_dim"]
+        self.ego_history_dropout_prob = float(cfg.get("ego_history_dropout_prob", 0.0))
 
         self.cat_embeds = nn.ModuleDict(
             {name: nn.Embedding(vocab, dim) for name, (vocab, dim) in CAT_FEATURES.items()}
@@ -321,9 +327,26 @@ class FlowMatchingPolicy(nn.Module):
         return torch.cat(parts, dim=-1)
 
     def _ego_history_features(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        """[B, L_ctx, A_DIM] — ego's real past controller inputs."""
+        """[B, L_ctx, A_DIM] — ego's real past controller inputs.
+
+        During training, with probability ``ego_history_dropout_prob`` per
+        sample, zero a random *left* prefix ``[:k]`` (k ~ U{0..L_ctx}, inclusive
+        of L_ctx so full-history zero is reachable). Matches the closed-loop
+        rolling-buffer transient where ``_ego_inputs_hist`` starts as L_ctx
+        zeros and is gradually displaced by live predictions.
+        """
         L_ctx = self.L_ctx
-        return torch.cat([batch[f"ego_{ch}"][:, :L_ctx, None] for ch in ACTION_CHANNELS], dim=-1)
+        hist = torch.cat([batch[f"ego_{ch}"][:, :L_ctx, None] for ch in ACTION_CHANNELS], dim=-1)
+        if self.training and self.ego_history_dropout_prob > 0:
+            B = hist.size(0)
+            device = hist.device
+            apply = torch.rand(B, device=device) < self.ego_history_dropout_prob
+            ks = torch.randint(0, L_ctx + 1, (B,), device=device)
+            ks = torch.where(apply, ks, torch.zeros_like(ks))
+            positions = torch.arange(L_ctx, device=device)[None, :].expand(B, L_ctx)
+            mask = positions < ks[:, None]  # [B, L_ctx]
+            hist = hist.masked_fill(mask[..., None], 0.0)
+        return hist
 
     def build_context_tokens(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         ego = self._per_player_features(batch, "ego")
@@ -554,19 +577,27 @@ def _live_batch_from_rolling(
 
 
 @torch.no_grad()
+def _integrate_chunk_batched(
+    model: FlowMatchingPolicy, batch: dict[str, torch.Tensor], n_steps: int, device: str
+) -> np.ndarray:
+    """Euler-integrate from z ~ N(0,I) for n_steps. Returns [B, L_chunk, A_DIM]."""
+    model.eval()
+    ctx = model.build_context_tokens(batch)
+    B = next(iter(batch.values())).shape[0]
+    a = torch.randn(B, model.L_chunk, A_DIM, device=device)
+    dt = 1.0 / n_steps
+    for k in range(n_steps):
+        t_val = torch.full((B,), k * dt, device=device)
+        v = model(ctx, a, t_val)
+        a = a + dt * v
+    return a.cpu().numpy()
+
+
 def _integrate_chunk(
     model: FlowMatchingPolicy, batch: dict[str, torch.Tensor], n_steps: int, device: str
 ) -> np.ndarray:
-    """Euler-integrate from z ~ N(0,I) for n_steps. Returns [L_chunk, A_DIM]."""
-    model.eval()
-    ctx = model.build_context_tokens(batch)
-    a = torch.randn(1, model.L_chunk, A_DIM, device=device)
-    dt = 1.0 / n_steps
-    for k in range(n_steps):
-        t_val = torch.full((1,), k * dt, device=device)
-        v = model(ctx, a, t_val)
-        a = a + dt * v
-    return a[0].cpu().numpy()
+    """Single-sample shim over _integrate_chunk_batched. Returns [L_chunk, A_DIM]."""
+    return _integrate_chunk_batched(model, batch, n_steps, device)[0]
 
 
 @dataclass
@@ -613,6 +644,103 @@ class ModelControllerSource:
         self._ego_inputs_hist.append(a.astype(np.float32))
         if len(self._ego_inputs_hist) > self.L_ctx:
             self._ego_inputs_hist.pop(0)
+        return action_vec_to_controller(a)
+
+
+@dataclass
+class SelfPlayController:
+    """Drive both ports of a self-play match from one model with a single
+    batched forward pass per chunk boundary.
+
+    Two `_SelfPlayPortView` instances (one per port) hold a reference back
+    here and delegate per-frame. drive() calls each port's source in turn;
+    the first call per frame advances state for BOTH ports (and, when a
+    chunk boundary is hit, runs one batched forward of shape [2, L_ctx, ...]).
+    The second call just reads the cached action.
+    """
+
+    model: nn.Module
+    stats: dict
+    L_ctx: int = L_CTX
+    L_chunk: int = L_CHUNK
+    n_flow_steps: int = 8
+    device: str = DEVICE
+    _ports: dict = field(
+        default_factory=lambda: {
+            "p1": {"flat_hist": [], "ego_inputs_hist": []},
+            "p2": {"flat_hist": [], "ego_inputs_hist": []},
+        }
+    )
+    _pending: dict = field(default_factory=lambda: {"p1": None, "p2": None})
+    _offset: int = 0
+    _last_frame_done: int = -1
+    _last_actions: dict = field(default_factory=lambda: {"p1": _NEUTRAL_ACTION.copy(), "p2": _NEUTRAL_ACTION.copy()})
+
+    def view(self, ego_prefix: Literal["p1", "p2"]) -> _SelfPlayPortView:
+        return _SelfPlayPortView(coord=self, ego_prefix=ego_prefix)
+
+    def _tick(self, ego_prefix: Literal["p1", "p2"], frame_index: int, last_gamestate: dict | None) -> np.ndarray:
+        if frame_index != self._last_frame_done:
+            self._advance(last_gamestate)
+            self._last_frame_done = frame_index
+        return self._last_actions[ego_prefix]
+
+    def _advance(self, last_gamestate: dict | None) -> None:
+        for ego in ("p1", "p2"):
+            buf = self._ports[ego]
+            if last_gamestate is not None:
+                buf["flat_hist"].append(_flatten_canonical_frame(last_gamestate))
+                if len(buf["flat_hist"]) > self.L_ctx:
+                    buf["flat_hist"].pop(0)
+        # Warm-up: hold neutral on both ports until both buffers are full.
+        if any(len(self._ports[e]["flat_hist"]) < self.L_ctx for e in ("p1", "p2")):
+            for ego in ("p1", "p2"):
+                buf = self._ports[ego]
+                buf["ego_inputs_hist"].append(_NEUTRAL_ACTION.copy())
+                if len(buf["ego_inputs_hist"]) > self.L_ctx:
+                    buf["ego_inputs_hist"].pop(0)
+            self._last_actions = {ego: _NEUTRAL_ACTION.copy() for ego in ("p1", "p2")}
+            return
+        # Transition: pad ego_inputs_hist to L_ctx on the first inference frame.
+        for ego in ("p1", "p2"):
+            buf = self._ports[ego]
+            if len(buf["ego_inputs_hist"]) < self.L_ctx:
+                buf["ego_inputs_hist"].append(_NEUTRAL_ACTION.copy())
+        # Replan once per L_chunk: one forward call, batch_dim=2.
+        if self._pending["p1"] is None or self._offset >= self.L_chunk:
+            stacked = self._build_stacked_batch()
+            batch = preprocess_inputs(stacked, self.stats)
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+            plans = _integrate_chunk_batched(self.model, batch, self.n_flow_steps, self.device)
+            self._pending = {"p1": plans[0], "p2": plans[1]}
+            self._offset = 0
+        actions: dict[str, np.ndarray] = {}
+        for ego in ("p1", "p2"):
+            a = self._pending[ego][self._offset]
+            actions[ego] = a
+            buf = self._ports[ego]
+            buf["ego_inputs_hist"].append(a.astype(np.float32))
+            if len(buf["ego_inputs_hist"]) > self.L_ctx:
+                buf["ego_inputs_hist"].pop(0)
+        self._offset += 1
+        self._last_actions = actions
+
+    def _build_stacked_batch(self) -> dict[str, np.ndarray]:
+        """Stack p1- and p2-perspective rolling-buffer batches along batch dim."""
+        per_ego: dict[str, dict[str, np.ndarray]] = {}
+        for ego in ("p1", "p2"):
+            buf = self._ports[ego]
+            per_ego[ego] = _live_batch_from_rolling(buf["flat_hist"], buf["ego_inputs_hist"], ego_prefix=ego)
+        return {k: np.concatenate([per_ego["p1"][k], per_ego["p2"][k]], axis=0) for k in per_ego["p1"]}
+
+
+@dataclass(frozen=True)
+class _SelfPlayPortView:
+    coord: SelfPlayController
+    ego_prefix: Literal["p1", "p2"]
+
+    def __call__(self, frame_index: int, last_gamestate: dict | None):
+        a = self.coord._tick(self.ego_prefix, frame_index, last_gamestate)
         return action_vec_to_controller(a)
 
 
