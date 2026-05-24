@@ -1,4 +1,4 @@
-"""Toy flow-matching policy with latency-aware K-frame bridge.
+"""Flow-matching policy with latency-aware K-frame bridge (real-time chunking).
 
 Single-file experiment. Owns: model architecture, feature schema,
 preprocessing, ControllerSource impl (with rolling-history state machine),
@@ -19,8 +19,8 @@ Tensor-dim name convention (used in jaxtyping annotations and docstrings):
     seq         = full encoder seq length    (L_ctx + n_lat + L_chunk)
 
 Run:
-    python experiments/toy_train.py                       # train
-    python experiments/toy_train.py --eval <ckpt>         # eval a checkpoint
+    python experiments/001_flow_matching_rtc_baseline.py                   # train
+    python experiments/001_flow_matching_rtc_baseline.py --eval <ckpt>     # eval a checkpoint
 """
 
 # %%
@@ -168,7 +168,7 @@ ACTION_CHANNELS: tuple[str, ...] = (
 assert len(ACTION_CHANNELS) == A_DIM
 
 _BUTTON_ORDER = ("a", "b", "x", "y", "z", "r", "l", "start", "d_up")
-# raw_* dropped (we use logical sticks); nana_* skipped for toy; trigger_logical
+# raw_* dropped (we use logical sticks); nana_* skipped for now; trigger_logical
 # redundant with physical l/r channels already consumed.
 _DROP_PATTERNS = ("_raw_", "_nana_", "_trigger_logical")
 
@@ -587,7 +587,7 @@ class _SlotState:
 
 
 @dataclass
-class ToyBatchPolicy:
+class FlowMatchingBatchPolicy:
     """BatchPolicy for THIS experiment's flow-matching policy across N slots.
 
     Owns per-slot rolling history (gamestate + intended-ego-action) and one
@@ -684,8 +684,8 @@ class ToyBatchPolicy:
 
 
 def make_policy(model: FlowMatchingPolicy, stats: dict[str, FeatureStats], cfg: TrainConfig) -> BatchPolicy:
-    """Fresh ToyBatchPolicy for one eval wave (rolling state must not leak)."""
-    return ToyBatchPolicy(
+    """Fresh FlowMatchingBatchPolicy for one eval wave (rolling state must not leak)."""
+    return FlowMatchingBatchPolicy(
         model=model,
         stats=stats,
         L_ctx=cfg.L_ctx,
@@ -762,7 +762,7 @@ def train(cfg: TrainConfig, stats: dict[str, FeatureStats], comment: str = "") -
     wandb.init(
         project="hal",
         name=run_name,
-        tags=["toy", "flow-matching", f"d{cfg.d_model}", f"L{cfg.n_layers}"],
+        tags=["flow-matching", "rtc", f"d{cfg.d_model}", f"L{cfg.n_layers}"],
         config=asdict(cfg),
     )
     ckpt_dir = Path("runs") / run_name
