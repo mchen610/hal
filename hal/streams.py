@@ -9,9 +9,9 @@ reads them, and the cache can be evicted under pressure.
 Usage:
 
     from streaming import StreamingDataset
-    from hal.streams import RANKED_ANONYMOUS_1
+    from hal.streams import RANKED_ANONYMIZED_1
 
-    remote, local = RANKED_ANONYMOUS_1.for_split("train")
+    remote, local = RANKED_ANONYMIZED_1.for_split("train")
     ds = StreamingDataset(remote=remote, local=str(local), batch_size=...)
 
 Credentials come from the same env vars as `hal/fixtures.py`:
@@ -48,11 +48,11 @@ class StreamSource:
         return f"{self.remote}/{split}", Path(REPO_DIR) / self.local / split
 
 
-RANKED_ANONYMOUS_1: Final[StreamSource] = StreamSource(
-    name="ranked-anonymous-1",
-    remote="s3://hal/processed/ranked-anonymous-1/mds",  # TODO: move to "ranked-anonymized-1"
-    local=Path("data/processed/ranked-anonymous-1/mds"),
+RANKED_ANONYMIZED_1: Final[StreamSource] = StreamSource(
+    name="ranked-anonymized-1",
+    remote="s3://hal/processed/ranked-anonymized-1/mds",
+    local=Path("data/processed/ranked-anonymized-1/mds"),
 )
 
-ALL: Final[tuple[StreamSource, ...]] = (RANKED_ANONYMOUS_1,)
+ALL: Final[tuple[StreamSource, ...]] = (RANKED_ANONYMIZED_1,)
 BY_NAME: Final[dict[str, StreamSource]] = {s.name: s for s in ALL}
