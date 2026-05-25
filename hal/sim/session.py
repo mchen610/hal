@@ -10,11 +10,16 @@ Teardown always kills the Dolphin process, even when the caller raises mid-
 match. Use as a context manager.
 """
 
+import atexit
+import ctypes
+import signal as _signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
@@ -29,6 +34,55 @@ from hal.sim.inputs import ControllerInputs
 from hal.sim.inputs import apply_inputs
 from hal.wire import slp_character_to_libmelee
 from hal.wire import slp_stage_to_libmelee
+
+# Linux-only PR_SET_PDEATHSIG: have the kernel SIGKILL the Dolphin child if
+# this Python process dies before _teardown can run (e.g. parent SIGKILL'd,
+# OOM, segfault). Belt-and-suspenders on top of __exit__/atexit cleanup —
+# without it, an orphaned Dolphin keeps UDP 51441 bound and breaks the next
+# Session boot until reboot or manual kill (see PID-575155 incident).
+_PR_SET_PDEATHSIG = 1
+
+
+def _set_pdeathsig_sigkill() -> None:
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.prctl(_PR_SET_PDEATHSIG, _signal.SIGKILL, 0, 0, 0)
+
+
+# The patch swaps a process-global (``subprocess.Popen``), so concurrent boots
+# (drive_vec starts N Sessions on a thread pool) must not interleave their
+# patch/restore — otherwise one thread's restore clobbers another's, leaking the
+# wrapper or dropping the pdeathsig. The window guarded is just ``Console.run``'s
+# launch, which only spawns (it doesn't wait), so serializing it is cheap.
+_POPEN_PATCH_LOCK = threading.Lock()
+
+
+@contextmanager
+def _popen_with_pdeathsig() -> Iterator[None]:
+    """Monkeypatch ``subprocess.Popen`` to inject ``PR_SET_PDEATHSIG`` into any
+    child spawned inside the block. Restores on exit. Used to wrap libmelee's
+    ``Console.run`` (the actual ``Popen(...)`` call lives inside the library
+    and is otherwise out of our reach). Serialized across threads via
+    ``_POPEN_PATCH_LOCK`` since it mutates a process-global."""
+    with _POPEN_PATCH_LOCK:
+        original = subprocess.Popen
+
+        def _wrapped(*args, **kwargs):
+            user_pre = kwargs.pop("preexec_fn", None)
+
+            def _pre():
+                _set_pdeathsig_sigkill()
+                if user_pre is not None:
+                    user_pre()
+
+            kwargs["preexec_fn"] = _pre
+            return original(*args, **kwargs)
+
+        subprocess.Popen = _wrapped  # type: ignore[misc]
+        try:
+            yield
+        finally:
+            subprocess.Popen = original  # type: ignore[misc]
+
 
 # Menu states that signal "match is live, drive() can take over."
 LIVE_MENU_STATES: frozenset[melee.Menu] = frozenset({melee.Menu.IN_GAME, melee.Menu.SUDDEN_DEATH})
@@ -117,11 +171,22 @@ class Session:
         frozen_stadium: bool = True,
         tmp_home_directory: bool = True,
         replay_dir: str | Path | None = None,
+        blocking_input: bool = False,
+        emulation_speed: float = 1.0,
+        use_exi_inputs: bool = False,
+        enable_ffw: bool = False,
     ) -> None:
         self.iso_path = str(iso_path)
         self.dolphin_path = str(dolphin_path)
         self.slippi_port = slippi_port
         self.step_timeout_seconds = step_timeout_seconds
+        # Block console.step until the controller pipe has been read.
+        # Required for closed-loop control where the input punched for frame N
+        # must land before frame N+1 is advanced; without it, model inputs can
+        # race the emulator and the policy effectively drives stale state.
+        # Replay-style consumers (round-trip diff, MDS playback) keep the
+        # default False so they don't pay the per-frame block.
+        self.blocking_input = blocking_input
         # Whether libmelee writes its custom GALE01r2.ini Gecko-code file.
         # The codes shipped are all $Optional (off by default), so this
         # generally has no behavioral effect — but exposing the toggle is
@@ -140,10 +205,17 @@ class Session:
         # Where Slippi-Ishiiruka writes recorded .slp files. None falls back
         # to libmelee's default (~/Slippi or the tmp home if applicable).
         self.replay_dir = str(replay_dir) if replay_dir is not None else None
+        # Speed knob (0 = uncapped). FFW + use_exi_inputs require the exi-ai
+        # Ishiiruka build (DOLPHIN_EXIAI); pipe-input pathway ignores them.
+        self.emulation_speed = emulation_speed
+        self.use_exi_inputs = use_exi_inputs
+        self.enable_ffw = enable_ffw
         self._console: melee.Console | None = None
         self._controllers: dict[int, melee.Controller] = {}
         self._menu_helpers: dict[int, melee.MenuHelper] = {}
         self._matchup: Matchup | None = None
+        # Bound method so atexit.unregister can target it during _teardown.
+        self._atexit_kill = self._kill_dolphin_only
 
     def __enter__(self) -> Self:
         self._boot()
@@ -157,31 +229,112 @@ class Session:
         self._console = melee.Console(
             path=self.dolphin_path,
             slippi_port=self.slippi_port,
-            blocking_input=False,
+            blocking_input=self.blocking_input,
             polling_mode=False,
             setup_gecko_codes=self.setup_gecko_codes,
             tmp_home_directory=self.tmp_home_directory,
             replay_dir=self.replay_dir,
+            emulation_speed=self.emulation_speed,
+            use_exi_inputs=self.use_exi_inputs,
+            enable_ffw=self.enable_ffw,
         )
+        # libmelee writes Dolphin.ini via Python configparser, which lowercases
+        # option names ("slippireplaydir = ..."); Slippi-Ishiiruka's own parser
+        # only honors the CamelCase ``SlippiReplayDir``, so without this fixup
+        # ``replay_dir`` is silently ignored and .slps land in ~/Slippi.
+        if self.replay_dir:
+            self._fix_dolphin_ini_case()
+        # Belt-and-suspenders cleanup: if Python exits between __enter__ and
+        # __exit__ (e.g. unhandled exception in __enter__ caller, sys.exit
+        # mid-test, hard interpreter shutdown), still SIGKILL Dolphin.
+        atexit.register(self._atexit_kill)
+
+    def _fix_dolphin_ini_case(self) -> None:
+        """Replace libmelee's lowercased ``slippireplaydir = ...`` with the
+        CamelCase ``SlippiReplayDir`` that Ishiiruka actually reads. Leaving
+        both in place would also confuse libmelee's own
+        ``setup_dolphin_controller``: it re-parses the ini via configparser,
+        which treats the two cases as a duplicate option and raises."""
+        if self._console is None:
+            return
+        try:
+            ini_path = Path(self._console._get_dolphin_config_path()) / "Dolphin.ini"
+        except AttributeError:
+            return
+        if not ini_path.is_file():
+            return
+        lines = ini_path.read_text().splitlines(keepends=True)
+        target = f"SlippiReplayDir = {self.replay_dir}\n"
+        out: list[str] = []
+        replaced = False
+        for line in lines:
+            if line.lower().lstrip().startswith("slippireplaydir"):
+                if not replaced:
+                    out.append(target)
+                    replaced = True
+                # Drop any further duplicates.
+                continue
+            out.append(line)
+        if not replaced:
+            # libmelee didn't write the lowercased key (replay_dir was None at
+            # that time?), so insert ours at the top of [Core].
+            text = "".join(out)
+            if "[Core]\n" in text:
+                text = text.replace("[Core]\n", f"[Core]\n{target}", 1)
+            else:
+                text = text.rstrip() + f"\n\n[Core]\n{target}"
+            ini_path.write_text(text)
+            return
+        ini_path.write_text("".join(out))
+
+    def _kill_dolphin_only(self) -> None:
+        """Hard-kill the Dolphin subprocess. Idempotent, swallow-all. Called
+        from _teardown (graceful path) and as an atexit handler (last-ditch).
+        Does NOT touch libmelee's internal state — that's _teardown's job."""
+        if self._console is None:
+            return
+        proc = getattr(self._console, "_process", None)
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.kill()
+            proc.wait(timeout=2.0)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            logger.warning(f"Dolphin SIGKILL failed: {e}")
 
     def _teardown(self) -> None:
-        if self._console is not None:
-            # libmelee's Console.stop() SIGKILLs Dolphin immediately, which
-            # leaves Slippi's recorded .slp truncated (no GameEnd footer →
-            # peppi can't parse it). Send SIGTERM first and wait briefly so
-            # the .slp file-write thread finalizes the file.
-            proc = getattr(self._console, "_process", None)
-            if proc is not None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=3.0)
-                except (OSError, subprocess.TimeoutExpired, RuntimeError) as e:
-                    logger.warning(f"Console SIGTERM wait failed: {e}")
+        # Unhook the atexit handler first so a normal teardown doesn't fire it
+        # again at interpreter shutdown (harmless but noisy).
+        with suppress(Exception):
+            atexit.unregister(self._atexit_kill)
+        if self._console is None:
+            self._controllers.clear()
+            self._menu_helpers.clear()
+            return
+        proc = getattr(self._console, "_process", None)
+        # 1. Graceful SIGTERM so Slippi's writer thread finalizes the .slp
+        #    footer; otherwise peppi can't parse the resulting file. Empirically
+        #    Slippi-Ishiiruka needs ~5-8s to flush a multi-thousand-frame
+        #    match.
+        if proc is not None and proc.poll() is None:
             try:
-                self._console.stop()
+                proc.terminate()
+                proc.wait(timeout=10.0)
             except (OSError, subprocess.TimeoutExpired, RuntimeError) as e:
-                logger.warning(f"Console.stop() raised on teardown: {e}")
-            self._console = None
+                logger.warning(f"Console SIGTERM wait failed: {e}")
+        # 2. Hard SIGKILL ourselves before delegating to libmelee — its
+        #    Console.stop() can raise inside slippstream.shutdown() when the
+        #    worker never started, leaving its own proc.kill() unreached and
+        #    Dolphin orphaned (PID 575155 incident, 2026-05-21).
+        self._kill_dolphin_only()
+        # 3. Now let libmelee tear down its state (slippstream worker handle,
+        #    temp Dolphin home). Errors here are non-fatal since the
+        #    Dolphin process is already dead.
+        try:
+            self._console.stop()
+        except (OSError, subprocess.TimeoutExpired, RuntimeError, AssertionError) as e:
+            logger.warning(f"Console.stop() raised on teardown: {e}")
+        self._console = None
         self._controllers.clear()
         self._menu_helpers.clear()
 
@@ -206,7 +359,8 @@ class Session:
             )
             self._controllers[player.port] = controller
 
-        self._console.run(iso_path=self.iso_path)
+        with _popen_with_pdeathsig():
+            self._console.run(iso_path=self.iso_path)
         if not self._console.connect():
             raise RuntimeError("failed to connect to Dolphin Slippi server")
 
@@ -269,6 +423,23 @@ class Session:
         # both fight to move the cursor and the menu hangs forever. We pick
         # the lowest-port player as the autostart driver.
         autostart_port = min(p.port for p in self._matchup.players)
+        # In CSS, hold autostart until every CPU port has been toggled from
+        # HUMAN to CPU AND the level slider matches. Without this, port 1's
+        # coin-down races into the stage select while port 2's slot is still
+        # HUMAN, the match starts with no AI bound to port 2, and the lvl-9
+        # opponent never engages (slp records port 2 type=HUMAN,
+        # cpu_level=None). Outside CSS the per-port state has already been
+        # reset (libmelee re-creates PlayerState() on entering STAGE_SELECT),
+        # so the gate would deadlock there — the configuration is locked in
+        # by then, allow autostart unconditionally.
+        in_css = gamestate.menu_state in (melee.Menu.CHARACTER_SELECT, melee.Menu.SLIPPI_ONLINE_CSS)
+        cpu_ready = not in_css or all(
+            (s := gamestate.players.get(p.port)) is not None
+            and s.controller_status == melee.ControllerStatus.CONTROLLER_CPU
+            and s.cpu_level == p.cpu_level
+            for p in self._matchup.players
+            if p.cpu_level > 0
+        )
         for player in self._matchup.players:
             self._menu_helpers[player.port].menu_helper_simple(
                 gamestate=gamestate,
@@ -277,7 +448,7 @@ class Session:
                 stage_selected=self._matchup.stage,
                 cpu_level=player.cpu_level,
                 costume=player.costume,
-                autostart=player.port == autostart_port,
+                autostart=player.port == autostart_port and cpu_ready,
                 frozen_stadium=self.frozen_stadium,
             )
 

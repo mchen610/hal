@@ -18,11 +18,12 @@ from pathlib import Path
 
 import numpy as np
 import peppi_py
-import py7zr
 from peppi_py.frame import Post
 
 from hal.data.archive import parse_archive_member_path
+from hal.data.archive import read_archive_member_to_file
 from hal.wire import POST_FIELD_SUFFIXES
+from hal.wire import canonical_post_field
 from hal.wire import peppi_port_to_libmelee
 
 
@@ -65,11 +66,7 @@ class Trajectory:
         if not archive.is_file():
             raise FileNotFoundError(f"archive not found: {archive}")
         with tempfile.TemporaryDirectory(prefix="hal_traj_") as tmpdir:
-            with py7zr.SevenZipFile(str(archive), "r") as z:
-                z.extract(path=tmpdir, targets=[member])
-            extracted = Path(tmpdir) / member
-            if not extracted.is_file():
-                raise FileNotFoundError(f"member {member!r} not in {archive}")
+            extracted = read_archive_member_to_file(archive, member, Path(tmpdir))
             return cls._read_slp_file(extracted)
 
     @classmethod
@@ -124,8 +121,11 @@ class Trajectory:
         n = len(frames)
         frame_id = np.empty(n, dtype=np.int32)
         seed = np.empty(n, dtype=np.uint32)
+        # NaN-init so a port absent on a given frame reads as masked (matching
+        # from_slp), not as uninitialized garbage that diff/scoring would treat
+        # as a real value.
         post: dict[int, dict[str, np.ndarray]] = {
-            p: {f: np.empty(n, dtype=np.float64) for f in POST_FIELD_SUFFIXES} for p in ports
+            p: {f: np.full(n, np.nan, dtype=np.float64) for f in POST_FIELD_SUFFIXES} for p in ports
         }
 
         for i, frame in enumerate(frames):
@@ -138,18 +138,8 @@ class Trajectory:
                     continue
                 pf = pd["leader"]["post"]
                 cols = post[p]
-                pos = pf["position"]
-                cols["position_x"][i] = pos["x"]
-                cols["position_y"][i] = pos["y"]
-                cols["percent"][i] = pf["percent"]
-                cols["shield"][i] = pf["shield"]
-                cols["stock"][i] = pf["stock"]
-                cols["direction"][i] = pf["direction"]
-                cols["action"][i] = pf["action"]
-                cols["jumps_used"][i] = pf.get("jumps_used") or 0
-                cols["airborne"][i] = pf.get("airborne") or 0
-                cols["hurtbox_state"][i] = pf.get("hurtbox_state") or 0
-                cols["hitlag_left"][i] = pf.get("hitlag_left") or 0.0
+                for suffix in POST_FIELD_SUFFIXES:
+                    cols[suffix][i] = canonical_post_field(pf, suffix)
         return cls(frame_id=frame_id, post=post, random_seed=seed)
 
 

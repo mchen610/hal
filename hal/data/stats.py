@@ -27,6 +27,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import fsspec
 import numpy as np
 
 # Bump on breaking changes to the on-disk JSON schema (field add/remove/rename,
@@ -80,8 +81,12 @@ class FeatureStatsSufficient:
         )
 
 
-def _merge_sufficient(a: FeatureStatsSufficient, b: FeatureStatsSufficient) -> FeatureStatsSufficient:
-    """Parallel Welford merge; associative within float ULP."""
+def merge_sufficient(a: FeatureStatsSufficient, b: FeatureStatsSufficient) -> FeatureStatsSufficient:
+    """Parallel Welford merge of two sufficient-stat blocks. Associative within float ULP.
+
+    Public primitive — composes per-stream blocks into any grouping the caller wants
+    (e.g. mixture across datasets, consolidation across symmetric ports).
+    """
     if a.count == 0:
         return b
     if b.count == 0:
@@ -137,14 +142,14 @@ class StatsAccumulator:
         if feature_name not in self._stats:
             raise KeyError(f"feature {feature_name!r} not registered with this accumulator")
         block = _sufficient_from_array(np.asarray(values).reshape(-1))
-        self._stats[feature_name] = _merge_sufficient(self._stats[feature_name], block)
+        self._stats[feature_name] = merge_sufficient(self._stats[feature_name], block)
 
     def merge(self, other: StatsAccumulator) -> StatsAccumulator:
         if self.feature_names != other.feature_names:
             raise ValueError("cannot merge accumulators with different feature sets")
         merged = StatsAccumulator(self.feature_names)
         for name in self._stats:
-            merged._stats[name] = _merge_sufficient(self._stats[name], other._stats[name])
+            merged._stats[name] = merge_sufficient(self._stats[name], other._stats[name])
         return merged
 
     def to_sufficient(self) -> dict[str, FeatureStatsSufficient]:
@@ -195,13 +200,14 @@ def _finalized_from_json(blob: dict[str, float]) -> FeatureStats:
 
 
 def dump_sufficient_stats(
-    path: Path,
+    path: str | Path,
     blocks: dict[str, FeatureStatsSufficient],
     *,
     split: str,
     mds_schema_version: int,
 ) -> None:
-    """Write sufficient stats as ``stats.json``. Atomic (write+rename)."""
+    """Write sufficient stats as ``stats.json``. Accepts a local Path or any
+    fsspec URL (e.g. ``s3://``)."""
     payload = {
         "schema_version": STATS_SCHEMA_VERSION,
         "mds_schema_version": mds_schema_version,
@@ -209,13 +215,12 @@ def dump_sufficient_stats(
         "feature_count": len(blocks),
         "sufficient": {name: _sufficient_to_json(block) for name, block in blocks.items()},
     }
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
-    tmp.replace(path)
+    with fsspec.open(str(path), "w") as f:
+        f.write(json.dumps(payload, indent=2, sort_keys=True))
 
 
 def dump_finalized_stats(
-    path: Path,
+    path: str | Path,
     blocks: dict[str, FeatureStats],
     *,
     mds_schema_version: int,
@@ -229,9 +234,8 @@ def dump_finalized_stats(
         "feature_count": len(blocks),
         "finalized": {name: _finalized_to_json(block) for name, block in blocks.items()},
     }
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
-    tmp.replace(path)
+    with fsspec.open(str(path), "w") as f:
+        f.write(json.dumps(payload, indent=2, sort_keys=True))
 
 
 def _read_stats_file(path: Path, expected_mds_schema_version: int | None) -> dict:

@@ -1,8 +1,8 @@
 """Per-replay metadata: ``ReplayIndexEntry`` shared by all three pipeline stages.
 
-Stage 1 emits one entry per slp into ``index.jsonl`` (start/end/metadata
-blocks only, no frame iteration). Stage 3 writes the subset that landed in
-MDS into ``manifest.jsonl`` with ``Stage3Annotation`` populated.
+Stage 1 emits one entry per slp into ``index.jsonl``. Stage 3 writes the
+subset that landed in MDS into ``manifest.jsonl`` with ``Stage3Annotation``
+populated.
 
 Integer ids are slp-native (peppi-py vocabulary) — see CLAUDE.md
 (Architecture → Conventions / Footguns) for the stage/character/port translation rules.
@@ -17,37 +17,27 @@ import dataclasses
 import hashlib
 import json
 import struct
+import urllib.parse
 from collections.abc import Iterator
 from dataclasses import dataclass
-from enum import IntEnum
 from pathlib import Path
 from typing import Any
 from typing import Literal
 from typing import cast
 from typing import get_args
 
+import fsspec
 import peppi_py
+from peppi_py.game import EndMethod
 
 from hal.data.archive import parse_archive_member_path
+from hal.data.replay_stats import ReplayStats
+from hal.data.replay_stats import compute_replay_stats
 from hal.data.schema import SCHEMA_VERSION
 from hal.paths import REPO_DIR
 from hal.paths import repo_relative
+from hal.wire import VALID_LIBMELEE_PORTS
 from hal.wire import peppi_port_to_libmelee as _peppi_port_to_libmelee
-
-
-class EndMethod(IntEnum):
-    """slp end.method values per the Slippi spec.
-
-    Mirrors `peppi_py.game.EndMethod` exactly — adding new values here without
-    a peppi update would break parsing.
-    """
-
-    UNRESOLVED = 0
-    TIME = 1  # match timer expired
-    GAME = 2  # one player ran out of stocks
-    RESOLVED = 3  # sudden-death resolution
-    NO_CONTEST = 7  # someone LRAS'd or disconnected
-
 
 # slp Player.type values. EMPTY (unused port slot) is filtered out before
 # PlayerEntry is constructed, so it is not reachable here. Slip kept loose
@@ -60,7 +50,6 @@ PlayedOn = Literal["dolphin", "console", "network"]
 
 Split = Literal["train", "val", "test"]
 
-_VALID_PORTS: tuple[int, ...] = (1, 2, 3, 4)
 _RANK_KEYWORDS: tuple[str, ...] = ("platinum", "diamond", "master")
 
 
@@ -85,8 +74,8 @@ class GameOutcome:
                 f"lras_initiator={self.lras_initiator} is only valid when "
                 f"end_method=NO_CONTEST; got {self.end_method.name}"
             )
-        if self.lras_initiator not in _VALID_PORTS:
-            raise ValueError(f"lras_initiator must be in {_VALID_PORTS} or None; got {self.lras_initiator}")
+        if self.lras_initiator not in VALID_LIBMELEE_PORTS:
+            raise ValueError(f"lras_initiator must be in {VALID_LIBMELEE_PORTS} or None; got {self.lras_initiator}")
 
     @property
     def completed(self) -> bool:
@@ -149,8 +138,8 @@ class PlayerEntry:
     name: str | None  # netplay display name
 
     def __post_init__(self) -> None:
-        if self.port not in _VALID_PORTS:
-            raise ValueError(f"port must be in {_VALID_PORTS}; got {self.port}")
+        if self.port not in VALID_LIBMELEE_PORTS:
+            raise ValueError(f"port must be in {VALID_LIBMELEE_PORTS}; got {self.port}")
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -174,6 +163,7 @@ class ReplayIndexEntry:
     sha1: str | None  # sha1 hex digest of the whole file (None if compute_sha1=False)
 
     annotation: Stage3Annotation | None = None
+    stats: ReplayStats | None = None  # populated when build_index --with-stats
 
     def __post_init__(self) -> None:
         if len(self.slp_version) != 3:
@@ -198,12 +188,14 @@ class ReplayIndexEntry:
             "rank_filename": self.rank_filename,
             "sha1": self.sha1,
             "annotation": self.annotation.to_dict() if self.annotation is not None else None,
+            "stats": self.stats.to_dict() if self.stats is not None else None,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ReplayIndexEntry:
         outcome = data.get("outcome")
         annotation = data.get("annotation")
+        stats = data.get("stats")
         return cls(
             path=data["path"],
             slp_version=tuple(data["slp_version"]),
@@ -216,6 +208,7 @@ class ReplayIndexEntry:
             rank_filename=data.get("rank_filename"),
             sha1=data.get("sha1"),
             annotation=Stage3Annotation.from_dict(annotation) if annotation is not None else None,
+            stats=ReplayStats.from_dict(stats) if stats is not None else None,
         )
 
 
@@ -265,13 +258,28 @@ def _narrow_player_type(name: str) -> PlayerType:
     return cast(PlayerType, name)
 
 
-def extract_index_entry(replay_path: Path, *, compute_sha1: bool = True) -> ReplayIndexEntry | None:
-    """Parse a .slp file's start/end/metadata blocks (no frame iteration) and
-    return a `ReplayIndexEntry`. Returns None on parse failure (caller logs)."""
+def extract_index_entry(
+    replay_path: Path,
+    *,
+    compute_sha1: bool = True,
+    name_hint: str | None = None,
+    with_stats: bool = True,
+) -> ReplayIndexEntry | None:
+    """Parse a .slp file and return a `ReplayIndexEntry`.
+
+    Default (``with_stats=True``): parse with frames loaded (peppi
+    ``skip_frames=False``) and compute per-replay aggregates via
+    :func:`compute_replay_stats`. Subsumes the anonymized-slp fallback re-read.
+
+    ``with_stats=False``: parse start/end/metadata only — ~5-10x faster,
+    no ``entry.stats``.
+
+    Returns None on parse failure (caller logs).
+    """
     # Indexing walks 100k+ files; one malformed slp shouldn't kill the job, so
     # we surface failures as None rather than propagating exceptions.
     try:
-        g = peppi_py.read_slippi(str(replay_path), skip_frames=True)
+        g = peppi_py.read_slippi(str(replay_path), skip_frames=not with_stats)
     except Exception:
         return None
 
@@ -287,14 +295,17 @@ def extract_index_entry(replay_path: Path, *, compute_sha1: bool = True) -> Repl
         # metadata.players is keyed by 0-indexed port as a string
         md_entry = md_players.get(str(port - 1)) or {}
         names = md_entry.get("names") or {}
+        # Anonymized .slps have empty metadata but still carry netplay.name
+        # (e.g. "Diamond Player") and netplay.code on the start block.
+        netplay = getattr(sp, "netplay", None)
         players.append(
             PlayerEntry(
                 port=port,
                 character=int(sp.character),
                 costume=int(sp.costume),
                 player_type=_narrow_player_type(type_name),
-                code=names.get("code") or None,
-                name=names.get("netplay") or None,
+                code=names.get("code") or (getattr(netplay, "code", "") or None),
+                name=names.get("netplay") or (getattr(netplay, "name", "") or None),
             )
         )
     players.sort(key=lambda p: p.port)
@@ -313,7 +324,20 @@ def extract_index_entry(replay_path: Path, *, compute_sha1: bool = True) -> Repl
             return None
 
     last_frame = md.get("lastFrame")
+    if last_frame is None:
+        # Anonymized .slp files ship with empty metadata. When with_stats=True
+        # `g` already has frames; otherwise re-read with frames so we can
+        # recover frame count from the frame id array.
+        if not with_stats:
+            try:
+                g = peppi_py.read_slippi(str(replay_path), skip_frames=False)
+            except Exception:
+                return None
+        ids = g.frames.id
+        last_frame = int(ids[-1]) if len(ids) else None
     frame_count = int(last_frame) if last_frame is not None else 0
+
+    stats = compute_replay_stats(g) if with_stats else None
 
     return ReplayIndexEntry(
         path=str(repo_relative(replay_path)),
@@ -324,14 +348,18 @@ def extract_index_entry(replay_path: Path, *, compute_sha1: bool = True) -> Repl
         timestamp=md.get("startAt"),
         played_on=md.get("playedOn"),
         outcome=outcome,
-        rank_filename=_rank_from_filename(replay_path),
+        rank_filename=_rank_from_filename(Path(name_hint) if name_hint else replay_path),
         sha1=_sha1(replay_path) if compute_sha1 else None,
+        stats=stats,
     )
 
 
-def write_jsonl(path: Path, entries: list[ReplayIndexEntry], *, append: bool = False) -> None:
+def write_jsonl(path: str | Path, entries: list[ReplayIndexEntry], *, append: bool = False) -> None:
+    spath = str(path)
+    if append and urllib.parse.urlparse(spath).scheme not in ("", "file"):
+        raise ValueError(f"append=True is not supported for non-local paths: {spath}")
     mode = "a" if append else "w"
-    with path.open(mode) as f:
+    with fsspec.open(spath, mode) as f:
         for entry in entries:
             f.write(json.dumps(entry.to_dict()) + "\n")
 

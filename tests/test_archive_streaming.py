@@ -9,6 +9,7 @@ fresh checkouts that don't have the fixture downloaded.
 """
 
 import json
+import os
 import shutil
 import subprocess
 from collections.abc import Iterator
@@ -92,15 +93,18 @@ def test_iter_archive_members_streams_and_cleans(tmpfs: Path) -> None:
     n = 0
     total_bytes = 0
     max_inflight = 0
+    run_dir = tmpfs / str(os.getpid())
     for _, p in iter_archive_members(DEV_ARCHIVE, tmpfs_root=tmpfs, queue_size=queue_size):
-        max_inflight = max(max_inflight, len(list(tmpfs.iterdir())))
+        max_inflight = max(max_inflight, len(list(run_dir.iterdir())))
         total_bytes += p.stat().st_size
         p.unlink()
         n += 1
     assert n > 100
     # +2 slack for the brief race between producer fill and consumer yield.
     assert max_inflight <= queue_size + 2, max_inflight
-    assert not list(tmpfs.iterdir())
+    # No .slp leaked into any subdir of tmpfs. The per-run subdir itself stays
+    # until atexit (or until the next run's startup sweep) — that's by design.
+    assert not list(run_dir.iterdir())
     assert total_bytes > 100_000_000
 
 
@@ -123,8 +127,8 @@ def test_build_index_archive_matches_root(tmp_path: Path, tmpfs: Path) -> None:
 
     idx_arc = tmp_path / "idx_arc.jsonl"
     idx_disk = tmp_path / "idx_disk.jsonl"
-    _run_module("hal.scripts.index", "--archive", str(DEV_ARCHIVE), "--output", str(idx_arc), "--workers", "4")
-    _run_module("hal.scripts.index", "--root", str(extracted), "--output", str(idx_disk), "--workers", "4")
+    _run_module("hal.scripts.build_index", "--archive", str(DEV_ARCHIVE), "--output", str(idx_arc), "--workers", "4")
+    _run_module("hal.scripts.build_index", "--root", str(extracted), "--output", str(idx_disk), "--workers", "4")
 
     arc = _by_basename(idx_arc)
     disk = _by_basename(idx_disk)
@@ -156,8 +160,8 @@ def test_process_replays_archive_byte_equal(tmp_path: Path, tmpfs: Path) -> None
 
     idx_arc = tmp_path / "idx_arc.jsonl"
     idx_disk = tmp_path / "idx_disk.jsonl"
-    _run_module("hal.scripts.index", "--archive", str(DEV_ARCHIVE), "--output", str(idx_arc), "--workers", "4")
-    _run_module("hal.scripts.index", "--root", str(extracted), "--output", str(idx_disk), "--workers", "4")
+    _run_module("hal.scripts.build_index", "--archive", str(DEV_ARCHIVE), "--output", str(idx_arc), "--workers", "4")
+    _run_module("hal.scripts.build_index", "--root", str(extracted), "--output", str(idx_disk), "--workers", "4")
 
     paths_arc = tmp_path / "paths_arc.txt"
     paths_disk = tmp_path / "paths_disk.txt"

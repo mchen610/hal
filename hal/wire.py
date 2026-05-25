@@ -9,6 +9,7 @@ See CLAUDE.md (Architecture) for terminology (raw / wire / logical / physical)
 and the data-flow diagram (peppi → MDS → controller view → libmelee → Dolphin).
 """
 
+from collections.abc import Sequence
 from typing import Final
 
 import melee
@@ -22,6 +23,9 @@ from numpy.typing import DTypeLike
 
 # MDS column prefixes for the two players we track per replay (1v1 only).
 PLAYER_PREFIXES: Final[tuple[str, str]] = ("p1", "p2")
+
+# All libmelee ports. slp/peppi use 0..3; libmelee uses 1..4.
+VALID_LIBMELEE_PORTS: Final[tuple[int, int, int, int]] = (1, 2, 3, 4)
 
 
 def peppi_port_to_libmelee(peppi_port: peppi_py.game.Port | int) -> int:
@@ -41,6 +45,26 @@ def libmelee_port_to_peppi(port: int) -> int:
 # Slippi-standard "first in-game frame" id (post-2-second countdown). This is
 # a frame_id (peppi's signed counter), not an array index.
 GAME_START_FRAME: Final[int] = -123
+
+
+def dedupe_keep_idx(frame_ids: Sequence[int]) -> np.ndarray:
+    """Indices keeping the LAST row per ``frame_id`` — rollback consolidation.
+
+    peppi-py emits one row per recorded slp state including rollback
+    corrections, so the same ``frame_id`` can repeat 2-3 times. The final
+    occurrence is the engine's committed value. Returned indices are
+    ascending so frame order is preserved.
+    """
+    seen: set[int] = set()
+    keep: list[int] = []
+    for i in range(len(frame_ids) - 1, -1, -1):
+        f = int(frame_ids[i])
+        if f in seen:
+            continue
+        seen.add(f)
+        keep.append(i)
+    keep.reverse()
+    return np.asarray(keep, dtype=np.int64)
 
 
 # ---------------------------------------------------------------------------
@@ -148,40 +172,10 @@ def slp_character_to_libmelee(slp_character_id: int) -> melee.Character:
     return melee.Character(slp_character_id)
 
 
-# Standard cast — slp-native ids. Values coincide with libmelee.Character.
-CHARACTERS_BY_NAME: Final[dict[str, int]] = {
-    "MARIO": 0,
-    "FOX": 1,
-    "CPTFALCON": 2,
-    "DK": 3,
-    "KIRBY": 4,
-    "BOWSER": 5,
-    "LINK": 6,
-    "SHEIK": 7,
-    "NESS": 8,
-    "PEACH": 9,
-    "POPO": 10,
-    "NANA": 11,
-    "PIKACHU": 12,
-    "SAMUS": 13,
-    "YOSHI": 14,
-    "JIGGLYPUFF": 15,
-    "MEWTWO": 16,
-    "LUIGI": 17,
-    "MARTH": 18,
-    "ZELDA": 19,
-    "YLINK": 20,
-    "DOC": 21,
-    "FALCO": 22,
-    "PICHU": 23,
-    "GAMEANDWATCH": 24,
-    "GANONDORF": 25,
-    "ROY": 26,
-}
-
-# Peppi/slp-native character id for Nana (the follower, Ice Climbers). Alias
-# kept for readability at the extract site.
-NANA_CHARACTER_ID: Final[int] = CHARACTERS_BY_NAME["NANA"]
+# Standard cast — slp-native ids 0..26 are the playable characters; higher ids
+# (WIRE_FRAME, MASTER_HAND, ...) are non-selectable. Derived rather than
+# enumerated so any libmelee enum update flows through.
+CHARACTERS_BY_NAME: Final[dict[str, int]] = {c.name: int(c.value) for c in melee.Character if 0 <= int(c.value) <= 26}
 
 
 # ---------------------------------------------------------------------------
@@ -192,11 +186,9 @@ NANA_CHARACTER_ID: Final[int] = CHARACTERS_BY_NAME["NANA"]
 # (renamed) ``Post`` dataclass and libmelee's canonical ``Post`` 1:1, so a
 # single suffix is all that's needed to address both.
 #
-# Special cases that consumers handle at call sites (not encoded in this list):
+# Special case that consumers handle at call sites (not encoded in this list):
 #   - ``position_x`` / ``position_y``: peppi nests them under
 #     ``post.position.{x,y}``.
-#   - ``action``: materialized once and reused to derive ``action_frame``
-#     (a 1-indexed run-length on ``action``).
 POST_FIELD_SUFFIXES: Final[tuple[str, ...]] = (
     "position_x",
     "position_y",
@@ -210,3 +202,20 @@ POST_FIELD_SUFFIXES: Final[tuple[str, ...]] = (
     "airborne",
     "hurtbox_state",
 )
+
+
+def canonical_post_field(post: dict, suffix: str) -> float:
+    """Read one ``POST_FIELD_SUFFIXES`` value from a libmelee canonical post dict
+    (the shape ``Session.step`` yields). ``position_{x,y}`` are nested under
+    ``post['position']``; a field absent on this slp/build comes back as
+    ``MASK_FLOAT`` (NaN), the same mask convention ``Trajectory.from_slp`` uses.
+
+    Shared by ``sim.trajectory.from_capture`` and
+    ``training.canonical.flatten_canonical_frame`` so the two never drift.
+    """
+    if suffix == "position_x":
+        return float(post["position"]["x"])
+    if suffix == "position_y":
+        return float(post["position"]["y"])
+    value = post.get(suffix)
+    return float(value) if value is not None else MASK_FLOAT

@@ -1,39 +1,134 @@
-"""Stream .slp members directly out of a solid .7z archive into /dev/shm.
+"""Stream .slp members directly out of a public-dump replay archive into /dev/shm.
 
-The ranked-anonymized raw slp archives are >100 GB and ~10x compressed.
-We use peppi for batch decoding but peppi only accepts a filesystem path,
-so we materialize each member to a tmpfs file in /dev/shm.
+The dump ships in two mutually-incompatible on-disk layouts and both must work:
 
-Two non-obvious things about py7zr's WriterFactory protocol that this module
-works around:
+1. **Solid 7z of raw ``.slp``** — ``dev.7z`` and ranked-anonymized chunks 1-2.
+   ~10x compressed (LZMA2), >100 GB per chunk. Decompression is folder-parallel
+   under py7zr; we drive it via a custom ``WriterFactory`` so members stream
+   to per-file tmpfs writers, with two non-obvious py7zr workarounds:
 
-1. py7zr never calls a ``close()`` method on the writer it receives from
-   ``factory.create()`` — its internal ``MemIO`` wrapper has a no-op
-   ``__exit__``. The signal "writer N is done" is implicit: it arrives when
-   ``factory.create()`` is called for the *next* file in the same thread
-   (folders extract files sequentially within a thread). We finalize the
-   previous per-thread writer at that point, plus a sweep after extract
-   returns to flush the last writer per thread.
+   a. py7zr never calls ``close()`` on the writer it receives from
+      ``factory.create()`` — its internal ``MemIO`` wrapper has a no-op
+      ``__exit__``. The signal "writer N is done" is implicit: it arrives
+      when ``factory.create()`` is called for the *next* file in the same
+      thread (folders extract files sequentially within a thread). We
+      finalize the previous per-thread writer at that point, plus a sweep
+      after extract returns to flush the last writer per thread.
 
-2. Backpressure has to happen *before* a tmpfs file is opened, not after,
-   or a slow consumer lets the producer fill /dev/shm. The factory acquires
-   a bounded semaphore *before* constructing each per-file writer, and the
-   consumer releases the slot after it's done with the path.
+   b. Backpressure has to happen *before* a tmpfs file is opened, not after,
+      or a slow consumer lets the producer fill /dev/shm. The factory
+      acquires a bounded semaphore *before* constructing each per-file
+      writer, and the consumer releases the slot after it's done with the
+      path.
+
+2. **ZIP-of-``.slp.gz``** — ranked-anonymized chunks 3+ (despite the ``.7z``
+   extension upstream chose). Per-file gzip inside a zip aggregator container;
+   ~25% less dense than solid 7z but trivially random-access. We stream one
+   member at a time via stdlib ``zipfile`` + ``gzip``, no producer thread —
+   the consumer's hold on the generator is sufficient backpressure.
+
+``iter_archive_members`` sniffs by magic bytes (extension is unreliable) and
+dispatches. Both paths yield ``(synthetic_path, tmpfs_path)`` with the same
+ownership contract; the materialized tmpfs file is always raw ``.slp``
+regardless of source — the ``.gz`` layer is stripped on the zip path.
 """
 
+import atexit
+import concurrent.futures
+import contextlib
+import gzip
 import os
 import queue
+import shutil
 import threading
+import types
+import zipfile
+from collections import Counter
+from collections.abc import Generator
+from collections.abc import Iterable
 from collections.abc import Iterator
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import py7zr
 from loguru import logger
+from py7zr.exceptions import InternalError
 from py7zr.io import NullIO
 from py7zr.io import Py7zIO
 from py7zr.io import WriterFactory
 
 from hal.paths import repo_relative
+
+_ZIP_MAGIC: bytes = b"PK\x03\x04"
+_7Z_MAGIC: bytes = b"7z\xbc\xaf\x27\x1c"
+
+
+def _sniff_archive_format(archive: Path) -> str:
+    """Return ``"7z"`` or ``"zip"`` based on magic bytes; raise on anything else.
+
+    Cannot trust the extension: the upstream Slippi public dump labels its
+    ZIP chunks as ``.7z`` (see chunks 3+ of ``ranked-anonymized-*``).
+    """
+    with archive.open("rb") as f:
+        head = f.read(6)
+    if head.startswith(_7Z_MAGIC):
+        return "7z"
+    if head.startswith(_ZIP_MAGIC):
+        return "zip"
+    raise ValueError(f"unrecognized archive magic for {archive}: {head!r}")
+
+
+def list_archive_slps(archive: Path) -> list[str]:
+    """Cheap (header-only) list of slp member names, exactly as stored.
+
+    Names end in ``.slp`` for solid-7z chunks and ``.slp.gz`` for
+    zip-of-gzipped chunks. The name is what ``iter_archive_members`` and
+    ``read_archive_member_to_file`` expect as the archive-internal member key.
+    """
+    fmt = _sniff_archive_format(archive)
+    if fmt == "7z":
+        with py7zr.SevenZipFile(str(archive), "r") as z:
+            return [n for n in z.getnames() if n.endswith(".slp")]
+    with zipfile.ZipFile(archive) as z:
+        return [n for n in z.namelist() if n.endswith(".slp") or n.endswith(".slp.gz")]
+
+
+def _extract_zip_member_to(z: zipfile.ZipFile, member: str, out_path: Path) -> None:
+    """Stream one zip member into ``out_path``, decompressing the .gz wrapper if present."""
+    with z.open(member) as raw:
+        src = gzip.GzipFile(fileobj=raw, mode="rb") if member.endswith(".gz") else raw
+        try:
+            with out_path.open("wb") as out:
+                shutil.copyfileobj(src, out, length=1 << 20)
+        finally:
+            if src is not raw:
+                src.close()
+
+
+def read_archive_member_to_file(archive: Path, member: str, dest_dir: Path) -> Path:
+    """Materialize one archive member to ``dest_dir`` and return the written path.
+
+    Strips the ``.gz`` suffix from zip-of-gzipped members so the consumer
+    always sees a raw ``.slp`` file regardless of source format.
+    """
+    fmt = _sniff_archive_format(archive)
+    if fmt == "7z":
+        with py7zr.SevenZipFile(str(archive), "r") as z:
+            z.extract(path=str(dest_dir), targets=[member])
+        extracted = dest_dir / member
+        if not extracted.is_file():
+            raise FileNotFoundError(f"member {member!r} not in {archive}")
+        return extracted
+    out_path = dest_dir / Path(member).name.removesuffix(".gz")
+    with zipfile.ZipFile(archive) as z:
+        try:
+            _extract_zip_member_to(z, member, out_path)
+        except KeyError as e:
+            raise FileNotFoundError(f"member {member!r} not in {archive}") from e
+    return out_path
+
 
 _SENTINEL: object = object()
 
@@ -55,6 +150,47 @@ def parse_archive_member_path(path: str) -> tuple[Path, str] | None:
     if not member:
         raise ValueError(f"malformed archive path (missing '!member'): {path!r}")
     return Path(archive_str), member
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayWork:
+    """One unit of replay-processing work shared across stage 1 and stage 3.
+
+    Workers must unlink ``open_path`` in a finally-block when ``unlink_after``
+    is True (the file is a tmpfs copy streamed from a .7z archive).
+    """
+
+    open_path: Path
+    manifest_key: str
+    unlink_after: bool
+
+
+def iter_replay_work(
+    *,
+    fs_paths: Iterable[tuple[Path, str]] = (),
+    archive_members: Mapping[Path, Iterable[str]] | None = None,
+    tmpfs_root: Path,
+    queue_size: int = 64,
+) -> Generator[ReplayWork]:
+    """Emit ``ReplayWork`` for every fs path then every archive member.
+
+    ``fs_paths`` is a list of ``(open_path, manifest_key)`` pairs; they yield
+    ``unlink_after=False``. ``archive_members`` maps each archive Path to the
+    set of member names to extract; those stream through ``iter_archive_members``
+    one archive at a time and yield ``unlink_after=True``.
+    """
+    for open_path, manifest_key in fs_paths:
+        yield ReplayWork(open_path=open_path, manifest_key=manifest_key, unlink_after=False)
+    if archive_members is None:
+        return
+    for archive, members in archive_members.items():
+        for synthetic, tmpfs_path in iter_archive_members(
+            archive,
+            tmpfs_root=tmpfs_root,
+            filter_paths=set(members),
+            queue_size=queue_size,
+        ):
+            yield ReplayWork(open_path=tmpfs_path, manifest_key=synthetic, unlink_after=True)
 
 
 class _TmpfsWriter(Py7zIO):
@@ -169,6 +305,214 @@ class _StreamFactory(WriterFactory):
                 w.finalize()
 
 
+def _bounded_pool_extract(
+    self: Any,
+    fp: Any,
+    path: Any,
+    parallel: bool,  # noqa: ARG001 (kept for signature compatibility)
+    skip_notarget: bool = True,
+    q: queue.Queue | None = None,
+) -> None:
+    """Drop-in replacement for py7zr.Worker.extract with bounded concurrency.
+
+    The shipped implementation (py7zr 1.1.0, py7zr.py:1316-1342) spawns one
+    Thread per folder simultaneously, each calling open(filename, "rb").
+    For an archive with tens of thousands of folders this leaks fds linearly
+    (the per-thread fp is never closed) and exhausts RLIMIT_NOFILE.
+
+    Here we cap concurrency via a ThreadPoolExecutor and reuse one archive
+    fd per worker thread — total extra fds = max_workers, constant in member
+    count.
+    """
+    if not (hasattr(self.header, "main_streams") and self.header.main_streams is not None):
+        empty = [f for f in self.files if f.emptystream]
+        self.extract_single(fp, empty, path, 0, 0, q)
+        return
+
+    src_end = self.src_start + self.header.main_streams.packinfo.packpositions[-1]
+    numfolders = self.header.main_streams.unpackinfo.numfolders
+    if numfolders == 1:
+        self.extract_single(fp, self.files, path, self.src_start, src_end, q, skip_notarget=skip_notarget)
+        return
+
+    folders = self.header.main_streams.unpackinfo.folders
+    positions = self.header.main_streams.packinfo.packpositions
+    empty = [f for f in self.files if f.emptystream]
+    self.extract_single(fp, empty, path, 0, 0, q)
+
+    targeted = [
+        i
+        for i in range(numfolders)
+        if not skip_notarget or any(self.target_filepath.get(f.id, None) for f in folders[i].files)
+    ]
+    if not targeted:
+        return
+
+    filename = getattr(fp, "name", None)
+    if filename is None:
+        raise InternalError("bounded extract requires fp with a .name (path)")
+
+    max_workers = min(len(targeted), _BOUNDED_EXTRACT_THREADS)
+    if max_workers <= 1:
+        for i in targeted:
+            try:
+                self.extract_single(
+                    fp,
+                    folders[i].files,
+                    path,
+                    self.src_start + positions[i],
+                    self.src_start + positions[i + 1],
+                    q,
+                    skip_notarget=skip_notarget,
+                )
+            finally:
+                folders[i].decompressor = None
+        return
+
+    local = threading.local()
+    open_fps: list = []
+    open_fps_lock = threading.Lock()
+
+    def _worker_fp() -> Any:
+        wfp = getattr(local, "fp", None)
+        if wfp is None:
+            wfp = open(filename, "rb")  # noqa: SIM115 — fp is per-thread and reused across folders; closed in finally
+            local.fp = wfp
+            with open_fps_lock:
+                open_fps.append(wfp)
+        return wfp
+
+    def _do_folder(i: int) -> None:
+        # py7zr caches each folder's LZMA decompressor on the Folder object
+        # (archiveinfo.Folder.get_decompressor) and never frees it. Across
+        # 10k+ folders that's tens of GB of dict buffers — RSS climbs until
+        # the process swaps and throughput collapses. Drop the reference
+        # here so the decompressor is collectable as soon as the folder
+        # finishes.
+        try:
+            self.extract_single(
+                _worker_fp(),
+                folders[i].files,
+                path,
+                self.src_start + positions[i],
+                self.src_start + positions[i + 1],
+                q,
+                skip_notarget=skip_notarget,
+            )
+        finally:
+            folders[i].decompressor = None
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_do_folder, i) for i in targeted]
+            for f in concurrent.futures.as_completed(futures):
+                f.result()
+    finally:
+        with open_fps_lock:
+            for wfp in open_fps:
+                with contextlib.suppress(OSError):
+                    wfp.close()
+
+
+_BOUNDED_EXTRACT_THREADS: int = max(2, min(8, (os.cpu_count() or 4)))
+
+
+def _maybe_start_fd_watcher() -> tuple[threading.Event | None, threading.Thread | None]:
+    """Start a per-2s fd-count logger when HAL_PROFILE_FDS=1, else no-op.
+
+    Diagnostic for fd leaks in archive extraction; left in tree because
+    py7zr's threading model is fragile and any future regression here
+    would otherwise be opaque.
+    """
+    if os.environ.get("HAL_PROFILE_FDS") != "1":
+        return None, None
+
+    stop = threading.Event()
+    fd_dir = Path(f"/proc/{os.getpid()}/fd")
+
+    def _run() -> None:
+        while not stop.wait(2.0):
+            try:
+                entries = list(fd_dir.iterdir())
+            except OSError as e:
+                logger.warning(f"fd watcher: cannot list {fd_dir}: {e!r}")
+                continue
+            buckets: Counter[str] = Counter()
+            for e in entries:
+                try:
+                    target = os.readlink(e)
+                except OSError:
+                    target = "<gone>"
+                if target.startswith("/dev/shm"):
+                    bucket = "/dev/shm/*"
+                elif target.startswith("/proc"):
+                    bucket = "/proc/*"
+                elif "pipe:" in target:
+                    bucket = "pipe:*"
+                elif "socket:" in target:
+                    bucket = "socket:*"
+                elif "anon_inode:" in target:
+                    bucket = f"anon_inode:{target.split(':', 1)[1].split('[')[0]}"
+                elif target.endswith(".7z"):
+                    bucket = "*.7z"
+                else:
+                    bucket = target
+                buckets[bucket] += 1
+            logger.debug(f"fd watcher pid={os.getpid()}: total={len(entries)} top={buckets.most_common(8)}")
+
+    t = threading.Thread(target=_run, name="fd-watcher", daemon=True)
+    t.start()
+    return stop, t
+
+
+def _is_dead_pid(pid: int) -> bool:
+    """True iff the kernel has no process with this pid. EPERM (live, foreign user) is treated as alive."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _run_tmpfs_dir(tmpfs_root: Path) -> Path:
+    """Create and return ``tmpfs_root/<my-pid>/``, reaping dead-PID siblings first.
+
+    Three layers of defense against leaked tmpfs materializations:
+    workers ``unlink()`` files as peppi finishes with them; an ``atexit`` hook
+    removes our run_dir on normal shutdown (catches files held by SIGKILL'd
+    workers in the caller's Pool); and this startup sweep removes sibling
+    subdirs whose owning PID is gone (catches leaks from prior parent
+    SIGKILL/OOM — the only path that bypasses atexit).
+    """
+    tmpfs_root.mkdir(parents=True, exist_ok=True)
+    reaped = 0
+    reclaimed = 0
+    for entry in tmpfs_root.iterdir():
+        if not entry.is_dir():
+            continue
+        try:
+            owner_pid = int(entry.name)
+        except ValueError:
+            continue
+        if not _is_dead_pid(owner_pid):
+            continue
+        for f in entry.iterdir():
+            try:
+                reclaimed += f.stat().st_size
+            except OSError:
+                continue
+        shutil.rmtree(entry, ignore_errors=True)
+        reaped += 1
+    if reaped:
+        logger.info(f"swept {reaped} stranded tmpfs dir(s) under {tmpfs_root}, reclaimed {reclaimed / 1e9:.2f} GB")
+    run_dir = tmpfs_root / str(os.getpid())
+    run_dir.mkdir(exist_ok=True)
+    atexit.register(shutil.rmtree, run_dir, ignore_errors=True)
+    return run_dir
+
+
 def iter_archive_members(
     archive: Path,
     *,
@@ -176,39 +520,67 @@ def iter_archive_members(
     filter_paths: set[str] | None = None,
     queue_size: int = 64,
 ) -> Iterator[tuple[str, Path]]:
-    """Yield ``(synthetic_path, tmpfs_path)`` for each archive member.
+    """Yield ``(synthetic_path, tmpfs_path)`` for each slp member of ``archive``.
+
+    Dispatches by magic bytes: solid 7z chunks go through the threaded
+    py7zr producer (``_iter_7z_members``), zip-of-gzipped chunks through
+    the stdlib serial reader (``_iter_zip_members``). The materialized
+    tmpfs file is always raw ``.slp`` regardless of source — the ``.gz``
+    layer is stripped on the zip path. Synthetic paths preserve the
+    archive-internal member name (so zip members appear as ``.slp.gz`` in
+    the synthetic path, matching ``list_archive_slps``).
 
     The tmpfs file is owned by the consumer once yielded: the consumer MUST
-    unlink it (success or failure) to release a slot in the bounded queue.
-    Slots refill via ``sem.release()`` after the consumer's iteration body
-    runs, so slow consumers backpressure the producer instead of filling
-    /dev/shm.
+    unlink it (success or failure) so the producer can proceed.
 
-    ``filter_paths`` is a set of *member* names (e.g. "dev/Game_X.slp"), not
-    synthetic paths — it's matched against py7zr's filename, which is the
-    raw archive member. Excluded files are still decompressed (unavoidable
-    in a solid block) but discarded into a NullIO instead of materializing.
+    ``filter_paths`` is a set of *member* names — for 7z that's the
+    ``.slp`` name as stored; for zip-of-gz that's the ``.slp.gz`` name.
 
-    Iteration order is "as files complete decompression"; for a solid archive
-    that's roughly archive order interleaved across blocks. Do not rely on
-    a strict order.
+    Iteration order: for 7z, "as files complete decompression" (roughly
+    archive order interleaved across solid blocks — do not rely on strict
+    order). For zip, archive order, member-by-member.
 
     Early consumer abort (``break``, ``GeneratorExit``, exception) drains
-    the producer cleanly: the factory stops materializing new files, the
-    queue is flushed, and any already-yielded tmpfs files are unlinked.
+    the producer cleanly on both paths.
     """
     if not archive.exists():
         raise FileNotFoundError(f"archive not found: {archive}")
-    tmpfs_root.mkdir(parents=True, exist_ok=True)
+    fmt = _sniff_archive_format(archive)
+    if fmt == "7z":
+        yield from _iter_7z_members(archive, tmpfs_root=tmpfs_root, filter_paths=filter_paths, queue_size=queue_size)
+    else:
+        yield from _iter_zip_members(archive, tmpfs_root=tmpfs_root, filter_paths=filter_paths)
+
+
+def _iter_7z_members(
+    archive: Path,
+    *,
+    tmpfs_root: Path,
+    filter_paths: set[str] | None,
+    queue_size: int,
+) -> Iterator[tuple[str, Path]]:
+    """Threaded py7zr producer for solid-7z archives. See ``iter_archive_members``.
+
+    Slots in the bounded semaphore refill via ``sem.release()`` after the
+    consumer's iteration body runs, so slow consumers backpressure the
+    producer instead of filling /dev/shm. Excluded files (not in
+    ``filter_paths``) are still decompressed (unavoidable in a solid block)
+    but discarded into a ``NullIO`` instead of materializing.
+    """
+    run_dir = _run_tmpfs_dir(tmpfs_root)
 
     out_q: queue.Queue = queue.Queue()
     sem = threading.Semaphore(queue_size)
-    factory = _StreamFactory(tmpfs_root, out_q, sem, filter_paths)
+    factory = _StreamFactory(run_dir, out_q, sem, filter_paths)
     producer_exc: list[BaseException] = []
 
     def _producer() -> None:
         try:
             with py7zr.SevenZipFile(str(archive), "r") as z:
+                # Replace py7zr's broken parallel extract (one Thread per
+                # folder, each opening a fresh fd that is never closed) with
+                # a bounded thread pool that reuses fds. See _bounded_pool_extract.
+                z.worker.extract = types.MethodType(_bounded_pool_extract, z.worker)
                 z.extract(factory=factory)
         except BaseException as e:
             logger.error(f"archive producer crashed on {archive}: {e!r}")
@@ -219,6 +591,8 @@ def iter_archive_members(
 
     producer = threading.Thread(target=_producer, name=f"py7zr-producer-{archive.name}", daemon=True)
     producer.start()
+
+    fd_watcher_stop, watcher = _maybe_start_fd_watcher()
 
     seen_members: set[str] = set()
     drained = False
@@ -252,6 +626,10 @@ def iter_archive_members(
                 Path(leftover).unlink(missing_ok=True)
                 sem.release()
         producer.join()
+        if watcher is not None:
+            assert fd_watcher_stop is not None
+            fd_watcher_stop.set()
+            watcher.join(timeout=3.0)
 
     if producer_exc:
         raise producer_exc[0]
@@ -261,6 +639,41 @@ def iter_archive_members(
     # silent absence (caller asked for {A, B}, got just {A}, never knew).
     if drained and filter_paths is not None:
         missing = filter_paths - seen_members
+        if missing:
+            preview = sorted(missing)[:5]
+            logger.warning(
+                f"{archive.name}: {len(missing)}/{len(filter_paths)} requested members not in archive "
+                f"(first few: {preview})"
+            )
+
+
+def _iter_zip_members(
+    archive: Path,
+    *,
+    tmpfs_root: Path,
+    filter_paths: set[str] | None,
+) -> Iterator[tuple[str, Path]]:
+    """Serial stdlib reader for zip-of-(`.slp` or `.slp.gz`) archives.
+
+    No producer thread: per-member compression makes random-access cheap and
+    the consumer's hold on the generator keeps at most one materialized
+    file in tmpfs at a time, so no semaphore is needed. The ``.gz`` layer
+    is decompressed inline; output tmpfs files are always raw ``.slp``.
+    """
+    run_dir = _run_tmpfs_dir(tmpfs_root)
+    with zipfile.ZipFile(archive) as z:
+        members = [n for n in z.namelist() if n.endswith(".slp") or n.endswith(".slp.gz")]
+        if filter_paths is not None:
+            wanted = set(filter_paths)
+            members = [m for m in members if m in wanted]
+        seen: set[str] = set()
+        for seq, member in enumerate(members):
+            tmpfs_path = run_dir / f"{os.getpid()}_zip_{seq}.slp"
+            _extract_zip_member_to(z, member, tmpfs_path)
+            seen.add(member)
+            yield archive_member_path(archive, member), tmpfs_path
+    if filter_paths is not None:
+        missing = set(filter_paths) - seen
         if missing:
             preview = sorted(missing)[:5]
             logger.warning(
