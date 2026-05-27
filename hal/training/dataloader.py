@@ -31,9 +31,18 @@ def relabel_ego(window: dict[str, np.ndarray], ego_prefix: str) -> dict[str, np.
 
 
 class WindowSampler(IterableDataset):
-    """Wrap a StreamingDataset: pick a random ego port and a random
-    sub-trajectory of length ``L_ctx + n_lat + L_chunk`` from each replay.
-    Relabel p1/p2 → ego/opp before yielding."""
+    """Wrap a StreamingDataset: pick a random ego port and a length
+    ``L_ctx + n_lat + L_chunk`` window from each replay, laid out as
+    ``[ctx | bridge | chunk]``. Relabel p1/p2 → ego/opp before yielding.
+
+    The window is anchored by its *chunk* position, drawn uniformly over the
+    whole episode — including the opening frames. When the chunk sits near the
+    start, the context runs off the front of the episode; those missing frames
+    are zero-padded on the left and reported as ``ctx_pad`` so the model masks
+    them from attention. This makes the episode's first frames real prediction
+    targets (no skipping), matching the closed-loop cold start where the rolling
+    buffer fills from empty. Each emitted window carries an int ``ctx_pad``.
+    """
 
     def __init__(self, mds: StreamingDataset, L_ctx: int, L_chunk: int, *, seed: int, n_lat: int = 0) -> None:
         self._mds = mds
@@ -55,12 +64,36 @@ class WindowSampler(IterableDataset):
         self._epoch += 1
         for sample in self._mds:
             T = len(sample["frame"])
-            if T < self._L:
+            # chunk[0] targets episode frame ``cs``; context is the L_ctx frames
+            # before the bridge. cs_min keeps >=1 real context frame (the cold-
+            # start floor: inference always has the just-observed frame); cs_max
+            # keeps the L_chunk-long chunk inside the episode.
+            cs_min = self.n_lat + 1
+            cs_max = T - self.L_chunk
+            if cs_max < cs_min:
                 continue
-            start = int(rng.integers(0, T - self._L + 1))
-            window = {k: v[start : start + self._L] for k, v in sample.items()}
+            cs = int(rng.integers(cs_min, cs_max + 1))
+            start = cs - self._L + self.L_chunk  # virtual window start; < 0 ⇒ left-pad
+            pad = max(0, -start)
+            window = self._padded_window(sample, start, pad)
+            window["ctx_pad"] = np.int64(min(pad, self.L_ctx))
             ego_prefix = "p1" if rng.random() < 0.5 else "p2"
             yield relabel_ego(window, ego_prefix)
+
+    def _padded_window(self, sample: dict[str, np.ndarray], start: int, pad: int) -> dict[str, np.ndarray]:
+        """Length-``_L`` window beginning at virtual frame ``start`` (may be <0).
+        Real frames ``[max(0,start), start+_L)`` come from ``sample``; the ``pad``
+        missing front frames are zero-filled (hidden via ``ctx_pad`` downstream)."""
+        stop = start + self._L
+        out: dict[str, np.ndarray] = {}
+        for k, v in sample.items():
+            real = v[max(0, start) : stop]
+            if pad > 0:
+                front = np.zeros((pad, *v.shape[1:]), dtype=v.dtype)
+                out[k] = np.concatenate([front, real], axis=0)
+            else:
+                out[k] = real
+        return out
 
 
 def collate_windows(batch: list[dict]) -> dict[str, np.ndarray]:

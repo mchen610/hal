@@ -46,6 +46,7 @@ import torch.nn.functional as F
 import tyro
 from beartype import beartype
 from jaxtyping import Float
+from jaxtyping import Int
 from jaxtyping import jaxtyped
 from torch import Tensor
 from torch.optim import AdamW
@@ -100,10 +101,6 @@ class TrainConfig:
     L_ctx: int = 256
     L_chunk: int = 16
     latency_frames: int = 4
-    # P(zero ego history's [:k] for a random k ~ U{0..L_ctx}) per sample at train.
-    # Trains the model to handle the closed-loop rolling-buffer transient where
-    # ego_inputs_hist starts as L_ctx zeros and slowly fills with model outputs.
-    ego_history_dropout_prob: float = 0.5
     # inference
     n_flow_steps: int = 8
     # optimization
@@ -219,10 +216,14 @@ def _is_masked(arr: np.ndarray) -> np.ndarray:
 
 
 def _normalize(arr: np.ndarray, s: FeatureStats) -> np.ndarray:
+    if s.max == s.min:
+        return np.zeros_like(arr, dtype=np.float32)
     return (2.0 * (arr - s.min) / (s.max - s.min) - 1.0).astype(np.float32)
 
 
 def _standardize(arr: np.ndarray, s: FeatureStats) -> np.ndarray:
+    if s.std == 0:
+        return np.zeros_like(arr, dtype=np.float32)
     return ((arr - s.mean) / s.std).astype(np.float32)
 
 
@@ -309,10 +310,9 @@ class FlowMatchingPolicy(nn.Module):
         super().__init__()
         self.L_ctx = cfg.L_ctx
         self.L_chunk = cfg.L_chunk
-        self.n_lat = cfg.latency_frames
+        self.n_latency = cfg.latency_frames
         d = cfg.d_model
         self.time_emb_dim = cfg.time_emb_dim
-        self.ego_history_dropout_prob = float(cfg.ego_history_dropout_prob)
 
         self.cat_embeds = nn.ModuleDict(
             {name: nn.Embedding(vocab, dim) for name, (vocab, dim) in CAT_FEATURES.items()}
@@ -333,10 +333,10 @@ class FlowMatchingPolicy(nn.Module):
             nn.Linear(d, d),
         )
         self.chunk_type_emb = nn.Parameter(torch.zeros(d))
-        if self.n_lat > 0:
+        if self.n_latency > 0:
             self.bridge_proj = nn.Linear(A_DIM, d)
             self.bridge_type_emb = nn.Parameter(torch.zeros(d))
-        self.pos_emb = nn.Embedding(self.L_ctx + self.n_lat + self.L_chunk, d)
+        self.pos_emb = nn.Embedding(self.L_ctx + self.n_latency + self.L_chunk, d)
 
         layer = nn.TransformerEncoderLayer(
             d_model=d,
@@ -377,26 +377,18 @@ class FlowMatchingPolicy(nn.Module):
         return torch.cat(parts, dim=-1)
 
     def _ego_history_features(self, batch: dict[str, Tensor]) -> Float[Tensor, "B L_ctx d_action"]:
-        """Ego's real past controller inputs.
-
-        During training, with probability ``ego_history_dropout_prob`` per
-        sample, zero a random *left* prefix ``[:k]`` (k ~ U{0..L_ctx}, inclusive
-        of L_ctx so full-history zero is reachable). Matches the closed-loop
-        rolling-buffer transient where ``ego_inputs_hist`` starts as L_ctx
-        zeros and is gradually displaced by live predictions.
-        """
+        """Ego's real past controller inputs, one row per context frame. The
+        not-yet-filled rolling-buffer prefix is handled by attention masking
+        (``ctx_pad`` in ``forward``), not by zeroing features here."""
         L_ctx = self.L_ctx
-        hist = torch.cat([batch[f"ego_{ch}"][:, :L_ctx, None] for ch in ACTION_CHANNELS], dim=-1)
-        if self.training and self.ego_history_dropout_prob > 0:
-            B = hist.size(0)
-            device = hist.device
-            apply = torch.rand(B, device=device) < self.ego_history_dropout_prob
-            ks = torch.randint(0, L_ctx + 1, (B,), device=device)
-            ks = torch.where(apply, ks, torch.zeros_like(ks))
-            positions = torch.arange(L_ctx, device=device)[None, :].expand(B, L_ctx)
-            mask = positions < ks[:, None]
-            hist = hist.masked_fill(mask[..., None], 0.0)
-        return hist
+        return torch.cat([batch[f"ego_{ch}"][:, :L_ctx, None] for ch in ACTION_CHANNELS], dim=-1)
+
+    def _key_padding_mask(self, ctx_pad: Int[Tensor, " B"], seq_len: int) -> Tensor:
+        """[B, seq_len] bool, True = ignore. Hides each sample's leftmost
+        ``ctx_pad`` context positions; bridge + chunk tokens (index >= L_ctx)
+        are never masked, so no row is fully masked (softmax stays finite)."""
+        positions = torch.arange(seq_len, device=ctx_pad.device)[None, :]
+        return positions < ctx_pad[:, None]
 
     def build_context_tokens(self, batch: dict[str, Tensor]) -> Float[Tensor, "B L_ctx d_model"]:
         ego = self._per_player_features(batch, "ego")
@@ -411,12 +403,18 @@ class FlowMatchingPolicy(nn.Module):
         a_t: Float[Tensor, "B L_chunk d_action"],
         t: Float[Tensor, " B"],
         bridge: Float[Tensor, "B n_lat d_action"] | None = None,
+        ctx_pad: Int[Tensor, " B"] | None = None,
     ) -> Float[Tensor, "B L_chunk d_action"]:
         """
         batch_or_ctx — either a preprocessed batch dict OR a precomputed
                        context-token tensor (useful when integrating the flow
                        at inference, where context is fixed across all steps).
         bridge — required iff self.n_lat > 0; ignored otherwise.
+        ctx_pad — per-sample count of leftmost context positions to hide from
+                  attention (the not-yet-filled rolling-buffer prefix). Training
+                  windows carry it (the prefix that runs before the episode
+                  start); inference passes the live ``L_ctx - len(history)``.
+                  None ⇒ full context (no masking).
         """
         if isinstance(batch_or_ctx, dict):
             ctx_tokens = self.build_context_tokens(batch_or_ctx)
@@ -426,10 +424,10 @@ class FlowMatchingPolicy(nn.Module):
         t_emb = sinusoidal_time_embedding(t, self.time_emb_dim)
         t_proj = self.time_mlp(t_emb)
         chunk_tokens = chunk_tokens + t_proj[:, None, :] + self.chunk_type_emb[None, None, :]
-        if self.n_lat > 0:
+        if self.n_latency > 0:
             if bridge is None:
                 raise ValueError(
-                    f"latency_frames={self.n_lat} requires bridge tensor of shape [B, {self.n_lat}, A_DIM]"
+                    f"latency_frames={self.n_latency} requires bridge tensor of shape [B, {self.n_latency}, A_DIM]"
                 )
             bridge_tokens = self.bridge_proj(bridge) + self.bridge_type_emb[None, None, :]
             seq = torch.cat([ctx_tokens, bridge_tokens, chunk_tokens], dim=1)
@@ -437,8 +435,9 @@ class FlowMatchingPolicy(nn.Module):
             seq = torch.cat([ctx_tokens, chunk_tokens], dim=1)
         pos_ids = torch.arange(seq.size(1), device=seq.device)
         seq = seq + self.pos_emb(pos_ids)[None, :, :]
-        out = self.encoder(seq)
-        chunk_start = self.L_ctx + self.n_lat
+        key_padding_mask = self._key_padding_mask(ctx_pad, seq.size(1)) if ctx_pad is not None else None
+        out = self.encoder(seq, src_key_padding_mask=key_padding_mask)
+        chunk_start = self.L_ctx + self.n_latency
         return self.head(out[:, chunk_start:, :])
 
 
@@ -475,6 +474,7 @@ def build_val_cache(
     g = torch.Generator(device="cpu").manual_seed(0)
     for raw in val_loader:
         batch = _to_device(preprocess_inputs(raw, stats), device)
+        ctx_pad = torch.from_numpy(np.asarray(raw["ctx_pad"])).long().to(device)
         actions_all = stack_ego_actions(batch)
         bridge = actions_all[:, L_ctx : L_ctx + n_lat, :] if n_lat > 0 else None
         a_target = actions_all[:, L_ctx + n_lat :, :]
@@ -484,7 +484,7 @@ def build_val_cache(
         t_b = t.view(B, 1, 1)
         a_t = (1 - t_b) * z + t_b * a_target
         v_target = a_target - z
-        cache.append((batch, a_t, t, v_target, bridge))
+        cache.append((batch, a_t, t, v_target, bridge, ctx_pad))
         if len(cache) >= n_batches:
             break
     if not cache:
@@ -499,8 +499,8 @@ def val_loss(model: FlowMatchingPolicy, val_cache: list[tuple]) -> float:
     model.eval()
     total = 0.0
     count = 0
-    for batch, a_t, t, v_target, bridge in val_cache:
-        v_pred = model(batch, a_t, t, bridge=bridge)
+    for batch, a_t, t, v_target, bridge, ctx_pad in val_cache:
+        v_pred = model(batch, a_t, t, bridge=bridge, ctx_pad=ctx_pad)
         total += F.mse_loss(v_pred, v_target).item() * v_target.shape[0]
         count += v_target.shape[0]
     if was_training:
@@ -534,9 +534,12 @@ def integrate_chunk_batched(
     n_steps: int,
     device: str,
     bridge: Float[Tensor, "B n_lat d_action"] | None = None,
+    ctx_pad: Int[Tensor, " B"] | None = None,
 ) -> Float[np.ndarray, "B L_chunk d_action"]:
     """Euler-integrate from z ~ N(0,I) for n_steps. Returns numpy for
-    downstream rolling-buffer plumbing (lives in numpy land)."""
+    downstream rolling-buffer plumbing (lives in numpy land). ``ctx_pad`` is
+    fixed across steps (context doesn't change mid-integration), so it's built
+    once by the caller and reused for every velocity eval."""
     model.eval()
     ctx = model.build_context_tokens(batch)
     B = next(iter(batch.values())).shape[0]
@@ -544,7 +547,7 @@ def integrate_chunk_batched(
     dt = 1.0 / n_steps
     for k in range(n_steps):
         t_val = torch.full((B,), k * dt, device=device)
-        v = model(ctx, a, t_val, bridge=bridge)
+        v = model(ctx, a, t_val, bridge=bridge, ctx_pad=ctx_pad)
         a = a + dt * v
     return a.cpu().numpy()
 
@@ -554,17 +557,39 @@ def _live_batch_from_rolling(
     flat_history: list[dict],
     ego_inputs_hist: list[np.ndarray],
     ego_prefix: str,
+    L_ctx: int,
 ) -> dict[str, np.ndarray]:
-    """[1, L_ctx] batch the model expects, built from rolling buffers."""
+    """[1, L_ctx] batch the model expects, built from rolling buffers.
+
+    Before the buffers fill to L_ctx (the first L_ctx closed-loop frames) we
+    LEFT-PAD with zeros. The padded prefix is hidden from attention via
+    ``ctx_pad`` (= ``L_ctx - len(flat_history)``, computed by the policy), so
+    its contents never reach the prediction — zero is just a finite filler. The
+    policy acts from frame 0 and the buffer fills with REAL gameplay.
+
+    At replan time ego_inputs_hist is one short of flat_history (the current
+    frame's action hasn't been chosen yet) until both hit the L_ctx cap, after
+    which they're equal. Front-padding ego by ``len(flat) - len(ego)`` neutrals
+    aligns ego[i] with the gamestate it produced in both regimes — this is the
+    real (post_i, pre_i) alignment, NOT padding, and must stay even though the
+    leftmost ``pad_g`` positions are masked out.
+    """
+    pad_g = L_ctx - len(flat_history)
     out: dict[str, np.ndarray] = {}
     keys = flat_history[0].keys()
     for k in keys:
         sample = flat_history[0][k]
         dtype = np.int32 if isinstance(sample, int) else np.float32
-        out[k] = np.array([h[k] for h in flat_history], dtype=dtype)
+        vals = [h[k] for h in flat_history]
+        if pad_g > 0:
+            vals = [0] * pad_g + vals
+        out[k] = np.array(vals, dtype=dtype)
     # Ego controller history (intended actions, not whatever libmelee reads back).
     # Buttons stored as int 0/1 so the classifier routes via "button".
-    hist_arr = np.stack(ego_inputs_hist)
+    ego_aligned = [_NEUTRAL_ACTION] * (len(flat_history) - len(ego_inputs_hist)) + list(ego_inputs_hist)
+    if pad_g > 0:
+        ego_aligned = [_NEUTRAL_ACTION] * pad_g + ego_aligned
+    hist_arr = np.stack(ego_aligned)
     for i, ch in enumerate(ACTION_CHANNELS):
         col = hist_arr[:, i]
         if ch.startswith("button_"):
@@ -623,21 +648,10 @@ class FlowMatchingBatchPolicy:
             st.flat_hist.append(flatten_canonical_frame(obs[slot]))
             if len(st.flat_hist) > self.L_ctx:
                 st.flat_hist.pop(0)
-        # Warm-up: slots warm up in lockstep, so hold neutral for all until full.
-        if any(len(self._slots[s].flat_hist) < self.L_ctx for s in live):
-            for s in live:
-                self._push_ego(s, _NEUTRAL_ACTION)
-            return {s: action_vec_to_controller(_NEUTRAL_ACTION) for s in live}
-        # Transition: ego_inputs_hist is one short on the first inference call
-        # (warm-up pushes one fewer action than there are gamestates). The
-        # missing entry is the OLDEST — the pre-policy input that produced the
-        # first observed frame, which is unknown — so pad at the FRONT. Padding
-        # at the back would misalign every (gamestate[i], ego_input[i]) pair the
-        # model was trained on for one full context window.
-        for s in live:
-            st = self._slots[s]
-            if len(st.ego_inputs_hist) < self.L_ctx:
-                st.ego_inputs_hist.insert(0, _NEUTRAL_ACTION.copy())
+        # No neutral-hold warm-up: the policy acts from frame 0. The still-empty
+        # buffer prefix is hidden from attention via ctx_pad (see _replan), so the
+        # model sees only real frames and the buffer fills with REAL gameplay
+        # rather than frames produced by an idling model.
         replan_period = self.n_lat if self.n_lat > 0 else self.L_chunk
         if not self._bootstrapped or self._offset >= replan_period:
             self._replan(live)
@@ -664,6 +678,13 @@ class FlowMatchingBatchPolicy:
         stacked = self._build_stacked_batch(live)
         batch = preprocess_inputs(stacked, self.stats)
         batch = {k: v.to(self.device) for k, v in batch.items()}
+        # Hide each slot's still-empty buffer prefix from attention (frames
+        # 0..L_ctx fill from empty); 0 once a slot's history reaches L_ctx.
+        ctx_pad = torch.tensor(
+            [max(0, self.L_ctx - len(self._slots[s].flat_hist)) for s in live],
+            dtype=torch.long,
+            device=self.device,
+        )
         if self.n_lat > 0:
             # Bootstrap: no prev chunk → zero bridges (neutral for n_lat frames).
             # Steady state: each slot's bridge = its prev chunk's first n_lat.
@@ -672,19 +693,24 @@ class FlowMatchingBatchPolicy:
             else:
                 bridges = [self._slots[s].pending[: self.n_lat].astype(np.float32) for s in live]
             bridge_t = torch.from_numpy(np.stack(bridges, axis=0)).to(self.device)
-            plans = integrate_chunk_batched(self.model, batch, self.n_flow_steps, self.device, bridge=bridge_t)
+            plans = integrate_chunk_batched(
+                self.model, batch, self.n_flow_steps, self.device, bridge=bridge_t, ctx_pad=ctx_pad
+            )
             for i, s in enumerate(live):
                 self._slots[s].pending = plans[i]
                 self._slots[s].current_bridge = bridges[i]
         else:
-            plans = integrate_chunk_batched(self.model, batch, self.n_flow_steps, self.device)
+            plans = integrate_chunk_batched(self.model, batch, self.n_flow_steps, self.device, ctx_pad=ctx_pad)
             for i, s in enumerate(live):
                 self._slots[s].pending = plans[i]
 
     def _build_stacked_batch(self, live: list[Slot]) -> dict[str, np.ndarray]:
         per_slot = [
             _live_batch_from_rolling(
-                self._slots[s].flat_hist, self._slots[s].ego_inputs_hist, ego_prefix=_PORT_TO_PREFIX[s.port]
+                self._slots[s].flat_hist,
+                self._slots[s].ego_inputs_hist,
+                ego_prefix=_PORT_TO_PREFIX[s.port],
+                L_ctx=self.L_ctx,
             )
             for s in live
         ]
@@ -872,6 +898,7 @@ def train(
         have_first = False
         data_t0 = time.monotonic()
         batch = _to_device(preprocess_inputs(raw, stats), DEVICE)
+        ctx_pad = torch.from_numpy(np.asarray(raw["ctx_pad"])).long().to(DEVICE)
         actions_all = stack_ego_actions(batch)
         bridge = actions_all[:, L_ctx : L_ctx + n_lat, :] if n_lat > 0 else None
         a_target = actions_all[:, L_ctx + n_lat :, :]
@@ -881,7 +908,7 @@ def train(
         t_b = t.view(B, 1, 1)
         a_t = (1 - t_b) * z + t_b * a_target
         v_target = a_target - z
-        v_pred = model(batch, a_t, t, bridge=bridge)
+        v_pred = model(batch, a_t, t, bridge=bridge, ctx_pad=ctx_pad)
         loss = F.mse_loss(v_pred, v_target)
         opt.zero_grad()
         loss.backward()
