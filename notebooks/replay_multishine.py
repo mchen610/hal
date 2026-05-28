@@ -52,7 +52,7 @@ RECORDING_DIR = SCRATCH / "recording"
 MDS_DIR = SCRATCH / "mds"
 INDEX_PATH = SCRATCH / "index.jsonl"
 PATHS_PATH = SCRATCH / "paths.txt"
-EXP001 = REPO / "experiments" / "001_flow_matching_rtc_baseline.py"
+EXP001 = REPO / "experiments" / "001_flow_matching_baseline.py"
 
 # ~30s @ 60Hz of clean multishine training data, then both Fox walk off-stage
 # until a player loses all 4 stocks. Slippi only writes the .slp footer on an
@@ -296,7 +296,7 @@ def _trim_train_mds(n_frames: int) -> None:
 
 
 # %%
-# ---- 3. overfit experiment 001 (open-loop n_lat=0) --------------------------
+# ---- 3. overfit experiment 001 (open-loop baseline) -------------------------
 def overfit(
     *,
     max_steps: int = 3000,
@@ -317,8 +317,6 @@ def overfit(
         str(MDS_DIR),
         "--cfg.val-split",
         "train",
-        "--cfg.latency-frames",
-        "0",
         "--cfg.max-steps",
         str(max_steps),
         "--cfg.batch-size",

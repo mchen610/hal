@@ -53,3 +53,19 @@ def test_windows_vary_across_epochs() -> None:
     epoch0 = _fingerprint(s)
     epoch1 = _fingerprint(s)
     assert epoch0 != epoch1
+
+
+def test_window_length_and_ctx_pad() -> None:
+    """Every emitted window is exactly L_ctx + L_chunk frames and carries an int
+    ctx_pad — the neutral [ctx | chunk] contract, no bridge frames."""
+    for w in WindowSampler(_fake_mds(), L_CTX, L_CHUNK, seed=0):
+        assert len(w["frame"]) == _L
+        assert "ctx_pad" in w
+
+
+def test_cold_start_floor_skips_too_short() -> None:
+    """cs_min=1 needs >=1 real context frame and the L_chunk chunk in-episode, so
+    a replay of exactly L_chunk frames (cs_max=0 < 1) yields nothing."""
+    assert list(WindowSampler(_fake_mds(n_samples=2, length=L_CHUNK), L_CTX, L_CHUNK, seed=0)) == []
+    # one extra frame is enough for a single anchor (cs=1, fully left-padded ctx).
+    assert list(WindowSampler(_fake_mds(n_samples=2, length=L_CHUNK + 1), L_CTX, L_CHUNK, seed=0))

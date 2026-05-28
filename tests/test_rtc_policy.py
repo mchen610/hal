@@ -19,11 +19,11 @@ import torch
 from hal.data.stats import FeatureStats
 from hal.sim.vec import Slot
 
-_EXP_PATH = Path(__file__).resolve().parent.parent / "experiments" / "001_flow_matching_rtc_baseline.py"
+_EXP_PATH = Path(__file__).resolve().parent.parent / "experiments" / "002_flow_matching_rtc.py"
 
 
 def _load_experiment():
-    spec = importlib.util.spec_from_file_location("exp001", _EXP_PATH)
+    spec = importlib.util.spec_from_file_location("exp002", _EXP_PATH)
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(mod)
@@ -69,7 +69,7 @@ def _obs(call_idx: int, ego_port: int) -> dict:
     }
 
 
-def _build_policy():
+def _build_policy(*, inference_delay: int = 0, execution_horizon: int = 4):
     cfg = exp.TrainConfig(
         d_model=16,
         n_layers=1,
@@ -79,7 +79,8 @@ def _build_policy():
         dropout=0.0,
         L_ctx=4,
         L_chunk=4,
-        latency_frames=0,
+        inference_delay=inference_delay,
+        execution_horizon=execution_horizon,
         n_flow_steps=1,
     )
     torch.manual_seed(0)
@@ -130,3 +131,41 @@ def test_context_pairs_each_gamestate_with_the_action_that_produced_it():
     assert int(frames[0]) - 1 >= 0
     for i, f in enumerate(frames):
         assert ego_main_x[i] == pytest.approx(returned[f - 1][0]), f"position {i} (frame {f}) misaligned"
+
+
+def test_rtc_commits_previous_chunks_prefix():
+    """With d>0 the new chunk is conditioned on the previous chunk's [s : s+d]
+    actions, and the integrator pins those d positions to that committed prefix —
+    this is what makes the real-time-chunking handoff continuous."""
+    d, s = 2, 2
+    cfg, policy = _build_policy(inference_delay=d, execution_horizon=s)
+    slot = Slot(0, 1)
+
+    committed_seen: list[np.ndarray | None] = []
+    pendings: list[np.ndarray] = []
+    real_predict = policy.predict_chunk
+    real_replan = policy._replan
+
+    def spy_predict(ctx, committed):
+        committed_seen.append(None if committed is None else committed.copy())
+        return real_predict(ctx, committed)
+
+    def spy_replan(live):
+        real_replan(live)
+        pendings.append(policy._slots[slot].pending.copy())
+
+    policy.predict_chunk = spy_predict
+    policy._replan = spy_replan
+
+    for t in range(4 * s):  # bootstrap + several steady-state replans
+        policy(t, {slot: _obs(t, 1)})
+
+    assert committed_seen[0] is None, "bootstrap has no committed prefix"
+    assert len(pendings) >= 3
+    for i in range(1, len(pendings)):
+        prefix = committed_seen[i]
+        assert prefix is not None and prefix.shape == (1, d, exp.A_DIM)
+        # conditioned on the previous chunk's [s : s+d]
+        np.testing.assert_allclose(prefix[0], pendings[i - 1][s : s + d], rtol=1e-5, atol=1e-6)
+        # and the integrator pinned the new chunk's first d positions to it
+        np.testing.assert_allclose(pendings[i][:d], prefix[0], rtol=1e-5, atol=1e-6)

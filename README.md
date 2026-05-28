@@ -91,14 +91,14 @@ picks up with `--resume <run_name>`.
 # build + a tiny end-to-end run on the dev dataset (./data is a local fixture cache)
 docker compose -f docker/compose.yaml build
 docker compose -f docker/compose.yaml run --rm hal \
-    uv run python experiments/001_flow_matching_rtc_baseline.py \
+    uv run python experiments/001_flow_matching_baseline.py \
     --cfg.data-root data/processed/dev/mds --cfg.max-steps 20 --cfg.batch-size 8 \
     --cfg.val-every 10 --cfg.val-n-batches 2 --cfg.eval-every 0 \
     --cfg.ckpt-every 10 --cfg.num-workers 2 --cfg.eval-max-frames 600
 
 # resume that run from its latest R2 checkpoint (cfg is restored from the ckpt)
 docker compose -f docker/compose.yaml run --rm hal \
-    uv run python experiments/001_flow_matching_rtc_baseline.py --resume <run_name>
+    uv run python experiments/001_flow_matching_baseline.py --resume <run_name>
 ```
 
 `compose.yaml` reserves the GPU, bumps `--shm-size` (StreamingDataset uses

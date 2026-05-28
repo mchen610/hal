@@ -14,8 +14,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from streaming import StreamingDataLoader
 from streaming import StreamingDataset
+from torch.utils.data import DataLoader
 from torch.utils.data import IterableDataset
 from torch.utils.data import get_worker_info
 
@@ -42,8 +42,8 @@ def relabel_ego(window: dict[str, np.ndarray], ego_prefix: str) -> dict[str, np.
 
 class WindowSampler(IterableDataset):
     """Wrap a StreamingDataset: pick a random ego port and a length
-    ``L_ctx + n_lat + L_chunk`` window from each replay, laid out as
-    ``[ctx | bridge | chunk]``. Relabel p1/p2 → ego/opp before yielding.
+    ``L_ctx + L_chunk`` window from each replay, laid out as ``[ctx | chunk]``.
+    Relabel p1/p2 → ego/opp before yielding.
 
     The window is anchored by its *chunk* position, drawn uniformly over the
     whole episode — including the opening frames. When the chunk sits near the
@@ -52,14 +52,17 @@ class WindowSampler(IterableDataset):
     them from attention. This makes the episode's first frames real prediction
     targets (no skipping), matching the closed-loop cold start where the rolling
     buffer fills from empty. Each emitted window carries an int ``ctx_pad``.
+
+    This is a neutral obs→action-chunk window: it knows nothing about latency or
+    real-time chunking. An RTC experiment that conditions on already-committed
+    actions slices that prefix out of the chunk itself (its first frames).
     """
 
-    def __init__(self, mds: StreamingDataset, L_ctx: int, L_chunk: int, *, seed: int, n_lat: int = 0) -> None:
+    def __init__(self, mds: StreamingDataset, L_ctx: int, L_chunk: int, *, seed: int) -> None:
         self._mds = mds
         self.L_ctx = L_ctx
         self.L_chunk = L_chunk
-        self.n_lat = n_lat
-        self._L = L_ctx + n_lat + L_chunk
+        self._L = L_ctx + L_chunk
         self._seed = seed
         self._epoch = 0
 
@@ -75,15 +78,15 @@ class WindowSampler(IterableDataset):
         for sample in self._mds:
             T = len(sample["frame"])
             # chunk[0] targets episode frame ``cs``; context is the L_ctx frames
-            # before the bridge. cs_min keeps >=1 real context frame (the cold-
-            # start floor: inference always has the just-observed frame); cs_max
-            # keeps the L_chunk-long chunk inside the episode.
-            cs_min = self.n_lat + 1
+            # before it. cs_min keeps >=1 real context frame (the cold-start
+            # floor: inference always has the just-observed frame); cs_max keeps
+            # the L_chunk-long chunk inside the episode.
+            cs_min = 1
             cs_max = T - self.L_chunk
             if cs_max < cs_min:
                 continue
             cs = int(rng.integers(cs_min, cs_max + 1))
-            start = cs - self._L + self.L_chunk  # virtual window start; < 0 ⇒ left-pad
+            start = cs - self.L_ctx  # virtual window start; < 0 ⇒ left-pad
             pad = max(0, -start)
             window = self._padded_window(sample, start, pad)
             window["ctx_pad"] = np.int64(min(pad, self.L_ctx))
@@ -112,24 +115,22 @@ def collate_windows(batch: list[dict]) -> dict[str, np.ndarray]:
     return {k: np.stack([s[k] for s in batch]) for k in keys}
 
 
-def collate_train_batch(batch: list[dict], *, stats: dict[str, FeatureStats], L_ctx: int, n_lat: int) -> TrainBatch:
-    """Worker-side collate: stack → ``preprocess`` → split ``[ctx | bridge | chunk]``.
+def collate_train_batch(batch: list[dict], *, stats: dict[str, FeatureStats], L_ctx: int) -> TrainBatch:
+    """Worker-side collate: stack → ``preprocess`` → split ``[ctx | chunk]``.
 
-    The window the sampler yields is laid out ``[ctx | bridge | chunk]`` over
-    ``seq = L_ctx + n_lat + L_chunk`` frames. Context features are the first
-    ``L_ctx`` frames; the bridge and target action chunks are sliced off the
-    stacked ego-action channels at ``[L_ctx : L_ctx+n_lat]`` and ``[L_ctx+n_lat :]``.
-    Returns a fully-tensorized ``TrainBatch`` so the training loop does no
-    reshaping — just ``.to(device)``.
+    The window the sampler yields is laid out ``[ctx | chunk]`` over
+    ``seq = L_ctx + L_chunk`` frames. Context features are the first ``L_ctx``
+    frames; the target action chunk is the remaining frames sliced off the
+    stacked ego-action channels at ``[L_ctx :]``. Returns a fully-tensorized
+    ``TrainBatch`` so the training loop does no reshaping — just ``.to(device)``.
     """
     stacked = collate_windows(batch)
     ctx_pad = torch.from_numpy(stacked["ctx_pad"].astype(np.int64))
     feats = preprocess(stacked, stats)
     actions = stack_actions(feats)
     context_features = {k: v[:, :L_ctx] for k, v in feats.items()}
-    bridge = actions[:, L_ctx : L_ctx + n_lat] if n_lat > 0 else None
-    target = actions[:, L_ctx + n_lat :]
-    return TrainBatch(Context(features=context_features, bridge=bridge, ctx_pad=ctx_pad), target=target)
+    target = actions[:, L_ctx:]
+    return TrainBatch(Context(features=context_features, ctx_pad=ctx_pad), target=target)
 
 
 def make_loader(
@@ -141,16 +142,22 @@ def make_loader(
     L_chunk: int,
     batch_size: int,
     seed: int,
-    n_lat: int = 0,
     num_workers: int = 4,
     prefetch_factor: int = 4,
-) -> StreamingDataLoader:
+) -> DataLoader:
     """Build the (StreamingDataset → WindowSampler → DataLoader) chain. The
-    DataLoader yields ``TrainBatch`` (preprocessing runs in the workers)."""
+    DataLoader yields ``TrainBatch`` (preprocessing runs in the workers).
+
+    A plain ``DataLoader`` rather than ``StreamingDataLoader``: the latter's
+    mid-epoch resumption only engages when its dataset *is* a StreamingDataset,
+    but here that dataset is wrapped by ``WindowSampler``, so the wrapper's only
+    live behavior would be a per-batch ``len(batch[0])`` sample count — which a
+    ``TrainBatch`` (not dict/Tensor) can't satisfy. StreamingDataset still owns
+    sharding/shuffle; it's iterated inside the sampler."""
     mds = StreamingDataset(local=str(Path(data_root) / split), batch_size=1, shuffle=(split == "train"))
-    sampler = WindowSampler(mds, L_ctx, L_chunk, seed=seed, n_lat=n_lat)
-    collate = functools.partial(collate_train_batch, stats=stats, L_ctx=L_ctx, n_lat=n_lat)
-    return StreamingDataLoader(
+    sampler = WindowSampler(mds, L_ctx, L_chunk, seed=seed)
+    collate = functools.partial(collate_train_batch, stats=stats, L_ctx=L_ctx)
+    return DataLoader(
         sampler,
         batch_size=batch_size,
         num_workers=num_workers,

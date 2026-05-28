@@ -1,4 +1,4 @@
-"""Flow-matching policy with latency-aware K-frame bridge (real-time chunking).
+"""Flow-matching action-chunk policy (open-loop baseline).
 
 Single-file experiment. Owns ONLY the variant pieces: the model architecture,
 the flow-matching objective (``flow_loss``), the inference integrator
@@ -7,10 +7,15 @@ codec + dataloader, the closed-loop rolling-buffer driver, run naming /
 profiling, checkpointing, and the sim eval harness — is imported from
 ``hal.training`` / ``hal.eval``.
 
+Plain conditional flow-matching: predict the whole ``L_chunk`` action chunk from
+the context, all positions noised at one timestep, MSE on the full velocity. The
+closed-loop driver runs open-loop (replan every ``L_chunk``, no committed prefix).
+The real-time-chunking variant — clean prefix conditioning + per-token timesteps —
+lives in ``002_flow_matching_rtc.py``.
+
 Lego-piece contract:
     * new architecture  → copy this file, rewrite ``FlowMatchingPolicy``.
-    * new integrator     → edit ``predict_chunk`` (e.g. condition on step size
-                           for adjustable test-time compute).
+    * new integrator     → edit ``predict_chunk`` (e.g. step-size conditioning).
     * new objective      → edit ``flow_loss``.
 The data, eval, and val windows stay fixed, so runs remain comparable.
 
@@ -18,15 +23,14 @@ Tensor-dim names (jaxtyping annotations + docstrings):
     B           = batch
     L_ctx       = context length             (cfg.L_ctx)
     L_chunk     = predicted chunk length     (cfg.L_chunk)
-    n_lat       = latency / bridge frames    (cfg.latency_frames)
-    P           = prefix length              (L_ctx + n_lat)
+    P           = context prefix length       (= L_ctx)
     d_model     = hidden dim                 (cfg.d_model)
     d_action    = action vec dim (15)        (A_DIM)
     d_time      = time-embedding dim         (cfg.time_emb_dim)
 
 Run:
-    python experiments/001_flow_matching_rtc_baseline.py                   # train
-    python experiments/001_flow_matching_rtc_baseline.py --eval <ckpt>     # eval a checkpoint
+    python experiments/001_flow_matching_baseline.py                   # train
+    python experiments/001_flow_matching_baseline.py --eval <ckpt>     # eval a checkpoint
 """
 
 # %%
@@ -99,7 +103,6 @@ class TrainConfig:
     # window / chunking
     L_ctx: int = 256
     L_chunk: int = 16
-    latency_frames: int = 4
     # inference
     n_flow_steps: int = 8
     # optimization
@@ -142,29 +145,22 @@ def sinusoidal_time_embedding(t: Float[Tensor, " B"], dim: int) -> Float[Tensor,
 
 
 class FlowMatchingPolicy(nn.Module):
-    """Unified Transformer over [L_ctx ctx tokens | n_lat bridge tokens | L_chunk noise tokens].
+    """Unified Transformer over [L_ctx ctx tokens | L_chunk noise tokens].
 
     Context tokens carry observed ego+opp gamestate + ego controller history.
-    Bridge tokens (when ``latency_frames`` n_lat > 0) carry the n_lat already-
-    committed actions about to execute while the new chunk is computed at one
-    inference period; they get their own type embedding and a separate
-    projection. Chunk tokens carry the noised action a_t + time embedding + a
-    learned chunk-type embedding. The head reads the chunk positions and
-    predicts the flow-matching velocity v̂ ∈ R^{L_chunk × d_action}.
+    Chunk tokens carry the noised action a_t + time embedding + a learned
+    chunk-type embedding. The head reads the chunk positions and predicts the
+    flow-matching velocity v̂ ∈ R^{L_chunk × d_action}.
 
-    Split into ``encode_context`` (the [ctx | bridge] prefix, fixed across an
-    integration) + ``velocity`` (chunk-dependent) so the inference integrator
-    encodes the context once and only re-runs the chunk path per Euler step.
-
-    n_lat=0 reproduces the open-loop architecture exactly (bridge_proj /
-    bridge_type_emb are not constructed), keeping older checkpoints loadable.
+    Split into ``encode_context`` (the L_ctx prefix, fixed across an integration)
+    + ``velocity`` (chunk-dependent) so the inference integrator encodes the
+    context once and only re-runs the chunk path per Euler step.
     """
 
     def __init__(self, cfg: TrainConfig):
         super().__init__()
         self.L_ctx = cfg.L_ctx
         self.L_chunk = cfg.L_chunk
-        self.n_latency = cfg.latency_frames
         d = cfg.d_model
         self.time_emb_dim = cfg.time_emb_dim
 
@@ -186,10 +182,7 @@ class FlowMatchingPolicy(nn.Module):
             nn.Linear(d, d),
         )
         self.chunk_type_emb = nn.Parameter(torch.zeros(d))
-        if self.n_latency > 0:
-            self.bridge_proj = nn.Linear(A_DIM, d)
-            self.bridge_type_emb = nn.Parameter(torch.zeros(d))
-        self.pos_emb = nn.Embedding(self.L_ctx + self.n_latency + self.L_chunk, d)
+        self.pos_emb = nn.Embedding(self.L_ctx + self.L_chunk, d)
 
         layer = nn.TransformerEncoderLayer(
             d_model=d,
@@ -238,23 +231,16 @@ class FlowMatchingPolicy(nn.Module):
 
     def _key_padding_mask(self, ctx_pad: Int[Tensor, " B"], seq_len: int) -> Tensor:
         """[B, seq_len] bool, True = ignore. Hides each sample's leftmost
-        ``ctx_pad`` context positions; bridge + chunk tokens (index >= L_ctx)
-        are never masked, so no row is fully masked (softmax stays finite)."""
+        ``ctx_pad`` context positions; chunk tokens (index >= L_ctx) are never
+        masked, so no row is fully masked (softmax stays finite)."""
         positions = torch.arange(seq_len, device=ctx_pad.device)[None, :]
         return positions < ctx_pad[:, None]
 
     def encode_context(self, ctx: Context) -> tuple[Tensor, Tensor | None]:
-        """Build the [ctx | bridge] prefix tokens (with positional + type
-        embeddings) and the key-padding mask. Fixed across an integration, so
-        the inference integrator calls this once per replan."""
-        tokens = self._context_tokens(ctx.features)
-        if self.n_latency > 0:
-            if ctx.bridge is None:
-                raise ValueError(f"latency_frames={self.n_latency} requires a bridge tensor [B, n_lat, {A_DIM}]")
-            bridge_tokens = self.bridge_proj(ctx.bridge) + self.bridge_type_emb[None, None, :]
-            prefix = torch.cat([tokens, bridge_tokens], dim=1)
-        else:
-            prefix = tokens
+        """Build the L_ctx context prefix tokens (with positional embeddings) and
+        the key-padding mask. Fixed across an integration, so the inference
+        integrator calls this once per replan."""
+        prefix = self._context_tokens(ctx.features)
         n_prefix = prefix.size(1)
         prefix = prefix + self.pos_emb(torch.arange(n_prefix, device=prefix.device))[None, :, :]
         seq_len = n_prefix + self.L_chunk
@@ -288,7 +274,7 @@ class FlowMatchingPolicy(nn.Module):
 
 # %%
 def flow_loss(model: FlowMatchingPolicy, batch: TrainBatch, *, gen: torch.Generator | None = None) -> Tensor:
-    """Conditional flow-matching MSE on the velocity."""
+    """Conditional flow-matching MSE on the velocity over the whole chunk."""
     target = batch.target
     B = target.shape[0]
     t = torch.rand(B, device=target.device, generator=gen)
@@ -305,12 +291,13 @@ def make_policy(
     """Fresh closed-loop policy for one eval wave (rolling state must not leak).
 
     ``predict_chunk`` is the inference integrator — Euler from z ~ N(0, I) for
-    ``n_flow_steps`` steps. The context is encoded once per replan; only the
-    chunk path re-runs each step. This is the seam to swap for adjustable
-    test-time compute (e.g. step-size-conditioned integration)."""
+    ``n_flow_steps`` steps. Open-loop (no committed prefix): the driver replans
+    every ``L_chunk``. The context is encoded once per replan; only the chunk path
+    re-runs each step. This is the seam to swap for adjustable test-time compute."""
 
     @torch.no_grad()
-    def predict_chunk(ctx: Context) -> np.ndarray:
+    def predict_chunk(ctx: Context, committed: np.ndarray | None) -> np.ndarray:
+        assert committed is None, "open-loop baseline does not condition on a committed prefix"
         prefix, key_padding_mask = model.encode_context(ctx)
         a = torch.randn(ctx.batch, cfg.L_chunk, A_DIM, device=device)
         dt = 1.0 / cfg.n_flow_steps
@@ -324,7 +311,8 @@ def make_policy(
         stats=stats,
         L_ctx=cfg.L_ctx,
         L_chunk=cfg.L_chunk,
-        n_lat=cfg.latency_frames,
+        s=cfg.L_chunk,
+        d=0,
         device=device,
     )
 
@@ -405,7 +393,7 @@ def train(
         name=run_name,
         id=resume_state["wandb_id"] if resume_state else None,
         resume="allow" if resume_state else None,
-        tags=["flow-matching", "rtc", f"d{cfg.d_model}", f"L{cfg.n_layers}"],
+        tags=["flow-matching", "baseline", f"d{cfg.d_model}", f"L{cfg.n_layers}"],
         config=asdict(cfg),
     )
     ckpt_dir, replay_dir = setup_run_dir(run_name)
@@ -417,7 +405,6 @@ def train(
         stats=stats,
         L_ctx=cfg.L_ctx,
         L_chunk=cfg.L_chunk,
-        n_lat=cfg.latency_frames,
         batch_size=cfg.batch_size,
         seed=cfg.seed,
     )
@@ -606,7 +593,7 @@ def main(args: Args) -> None:
         return
     cfg = args.cfg
     stats = load_consolidated_stats(Path(cfg.data_root) / "stats.json")
-    auto_comment = f"lat{cfg.latency_frames}-{cfg.max_steps // 1000}k-b{cfg.batch_size}"
+    auto_comment = f"baseline-{cfg.max_steps // 1000}k-b{cfg.batch_size}"
     train(cfg, stats, comment=args.comment or auto_comment)
 
 

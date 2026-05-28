@@ -18,7 +18,6 @@ Tensor-dim names (docstrings):
     L           = sequence length carried by the batch (window at train, L_ctx at inference)
     L_ctx       = context length
     L_chunk     = predicted chunk length
-    n_lat       = latency / bridge frames
     d_action    = action vector dim (A_DIM)
 """
 
@@ -100,18 +99,21 @@ _STICK_TRIGGER_SUFFIXES = (
 # %%
 @dataclass(frozen=True, slots=True)
 class Context:
-    """Everything the model conditions on. Built identically by the train
-    dataloader and the closed-loop driver, so the model never branches on which.
+    """The observed gamestate the model conditions on. Built identically by the
+    train dataloader and the closed-loop driver, so the model never branches on
+    which.
 
     ``features`` carries per-feature columns at length ``L_ctx`` (normalized
     floats + their mask sidecars + int64 categorical ids + raw stick/trigger/
-    button channels). ``bridge`` is the n_lat already-committed actions
-    (``None`` when latency is disabled). ``ctx_pad`` hides each sample's
-    not-yet-filled leftmost context positions from attention.
+    button channels, including the ego's own controller history). ``ctx_pad``
+    hides each sample's not-yet-filled leftmost context positions from attention.
+
+    Deliberately neutral: any already-committed action prefix an RTC experiment
+    conditions on is part of the predicted chunk (at train) or supplied to the
+    inference integrator (at eval), not carried here.
     """
 
     features: dict[str, Tensor]
-    bridge: Tensor | None  # [B, n_lat, d_action]
     ctx_pad: Tensor  # [B] int64
 
     @property
@@ -121,7 +123,6 @@ class Context:
     def to(self, device: str | torch.device) -> Context:
         return Context(
             features={k: v.to(device, non_blocking=True) for k, v in self.features.items()},
-            bridge=None if self.bridge is None else self.bridge.to(device, non_blocking=True),
             ctx_pad=self.ctx_pad.to(device, non_blocking=True),
         )
 
