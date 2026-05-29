@@ -62,10 +62,12 @@ trap 'log "boot failed (line $LINENO)"; teardown stop "boot failure"; exit 1' ER
 # `|| true`: grep exits 1 on no match, which must not trip `set -e`.
 env | grep -E '^(AWS_|WANDB_|GITHUB_TOKEN)=' >> /etc/environment || true
 
-# Code at the exact SHA. The image bakes no repo, so this is a clean clone into the
-# empty /opt/hal; uv sync then installs the pure-Python hal into the prebuilt venv
-# (fast, no compiler — a uv.lock mismatch would fail loud here and trip the trap).
+# Code at the exact SHA. Clone into a fresh /opt/hal (rm first so it's robust whether
+# the image baked a repo there or not — the venv lives at /opt/venv, untouched). uv
+# sync then installs the pure-Python hal into the prebuilt venv (fast, no compiler —
+# a uv.lock mismatch would fail loud here and trip the trap).
 log "cloning hal @ ${HAL_GIT_SHA}"
+rm -rf /opt/hal
 # Public repo clones anonymously; the ${GITHUB_TOKEN:+…@} prefix injects auth only
 # if a token was set (private repo/image). Safe under `set -u`.
 git clone --quiet "https://${GITHUB_TOKEN:+${GITHUB_TOKEN}@}github.com/ericyuegu/hal.git" /opt/hal
