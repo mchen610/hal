@@ -6,9 +6,9 @@ credentials + the (base64'd) training command. The box then clones that SHA,
 trains, and tears *itself* down — destroy on success (checkpoints are already in
 R2, logs in W&B), stop on failure (for inspection). See docker/on-start.sh.
 
-    python docker/launch_vast.py                         # search-only: print offers, rent nothing
-    python docker/launch_vast.py --dry-run -- uv run experiments/001_flow_matching_baseline.py
-    python docker/launch_vast.py --max-price 0.80 -- uv run experiments/001_flow_matching_baseline.py --cfg.max-steps 100000
+    python scripts/launch_vast.py                         # search-only: print offers, rent nothing
+    python scripts/launch_vast.py --dry-run -- uv run experiments/001_flow_matching_baseline.py
+    python scripts/launch_vast.py --max-price 0.80 -- uv run experiments/001_flow_matching_baseline.py --cfg.max-steps 100000
 
 Requires host env: AWS_* (+ AWS_BUCKET=hal) and WANDB_API_KEY. GITHUB_TOKEN is
 optional — only needed if the ghcr image is private (read:packages to pull it);
