@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# vast.ai cloud lifecycle for a single training run. Set as the instance's
-# On-start command (scripts/launch_vast.py wires onstart_cmd=/usr/local/bin/on-start.sh).
-# The image ships only the environment (deps in /opt/venv), so this script lays
-# the code in at the exact git SHA, runs one training command, and tears the box
-# down — there is no persistent state on the instance: datasets are fetched from
-# R2, checkpoints stream back to R2, and logs go to W&B during the run.
+# vast.ai cloud lifecycle for a single training run. scripts/launch_vast.py reads
+# this file and passes its contents inline as the instance's onstart command (NOT
+# baked into the image — it runs before the repo is cloned, so baking would strand
+# the box on a stale copy). The image ships only the environment (deps in
+# /opt/venv), so this script lays the code in at the exact git SHA, runs one
+# training command, and tears the box down — there is no persistent state on the
+# instance: datasets are fetched from R2, checkpoints stream back to R2, and logs
+# go to W&B during the run.
 #
 # Driven entirely by env injected at create time:
 #   HAL_GIT_SHA          commit to check out

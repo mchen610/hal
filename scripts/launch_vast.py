@@ -24,12 +24,19 @@ import subprocess
 import time
 from dataclasses import dataclass
 from dataclasses import field
+from pathlib import Path
 
 import tyro
 from loguru import logger
 from vastai import VastAI
 
 GHCR_USER = "ericyuegu"
+# on-start.sh runs *before* the box clones the repo, so it can't ship via the git
+# SHA like the rest of the code. Rather than bake it into the image (which strands
+# the box on a stale copy until the next rebuild), we read it from the working tree
+# and pass its contents inline as the onstart command — so editing it takes effect
+# on the next launch, no rebuild.
+ONSTART_PATH = Path(__file__).resolve().parents[1] / "docker" / "on-start.sh"
 
 # Hardware bar. Field names are vast's query vocabulary (see `help(VastAI.search_offers)`),
 # not the result-dict keys, which sometimes differ (dlperf_usd -> dlperf_per_dphtotal).
@@ -149,6 +156,12 @@ def _instance_env(*, sha: str, train_cmd: str) -> dict[str, str]:
     }
 
 
+def onstart_cmd() -> str:
+    """Current on-start.sh contents, run under bash regardless of the shell vast
+    invokes onstart with. Passed inline (not baked) so edits ship without a rebuild."""
+    return f"bash -c {shlex.quote(ONSTART_PATH.read_text())}"
+
+
 def launch(
     vast: VastAI,
     offer: dict,
@@ -166,7 +179,7 @@ def launch(
         image=image,
         disk=disk,
         env=env,
-        onstart_cmd="bash /usr/local/bin/on-start.sh",
+        onstart_cmd=onstart_cmd(),
         runtype="ssh_proxy",  # proxy SSH; avoids needing direct_port_count in the bar
         **login,
     )
@@ -231,7 +244,7 @@ def main(args: Args) -> None:
         login = f"'-u {GHCR_USER} -p *** ghcr.io'" if token else "none (public image)"
         logger.info(f"[dry-run] image={args.image} disk={args.disk}GB runtype=ssh_proxy login={login}")
         logger.info(f"[dry-run] env (non-secret; secrets come from vast account env-vars)={env}")
-        logger.info("[dry-run] onstart='bash /usr/local/bin/on-start.sh'")
+        logger.info(f"[dry-run] onstart=<inline {ONSTART_PATH.name}, {len(ONSTART_PATH.read_text())} bytes>")
         logger.info(f"[dry-run] HAL_GIT_SHA={sha}")
         logger.info(f"[dry-run] train cmd: {train_cmd}")
         return

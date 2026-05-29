@@ -75,12 +75,11 @@ WORKDIR /opt/hal
 COPY --from=builder /.uv/python_install /.uv/python_install
 COPY --from=builder /opt/venv /opt/venv
 
-# Both launch scripts live outside /opt/hal so the runtime clone into /opt/hal
-# can't clobber the running script. entrypoint.sh backs local `docker run`/compose;
-# on-start.sh is the vast cloud lifecycle (clone SHA -> train -> self-teardown).
+# entrypoint.sh backs local `docker run`/compose (Xvfb shim). The vast cloud
+# lifecycle (docker/on-start.sh) is NOT baked — launch_vast.py passes it inline so
+# it ships from the working tree, no rebuild needed when it changes.
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY docker/on-start.sh /usr/local/bin/on-start.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/on-start.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["bash"]
