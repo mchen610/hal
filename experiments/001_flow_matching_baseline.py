@@ -105,25 +105,25 @@ class TrainConfig:
     L_ctx: int = 256
     L_chunk: int = 16
     # inference
-    n_flow_steps: int = 40
+    n_flow_steps: int = 8
     # optimization
     batch_size: int = 32  # micro-batch run on the GPU per forward
     grad_accum_steps: int = 1  # optimizer step sees batch_size * grad_accum_steps samples
     lr: float = 3e-4
     weight_decay: float = 0.01
     warmup_steps: int = 500
-    max_steps: int = 15_000
+    max_steps: int = 2**15
     # eval cadence
-    val_every: int = 500
+    val_every: int = 1024
     val_n_batches: int = 16
-    eval_every: int = 2500
-    eval_max_frames: int = 3600
+    eval_every: int = 2048
+    eval_max_frames: int = 7200
     # closed-loop eval parallelism: replicas per stage, run concurrently in
     # waves of eval_max_parallel emulators (one batched forward across all live).
-    eval_replicas: int = 1
-    eval_max_parallel: int = 4
+    eval_replicas: int = 2
+    eval_max_parallel: int = 8
     # checkpointing: write + background-upload latest.pt every N steps (preemption resilience)
-    ckpt_every: int = 1000
+    ckpt_every: int = 2048
     # push checkpoints to R2 as we train (needs AWS_*); --resume pulls them back
     push_to_r2: bool = True
     # data

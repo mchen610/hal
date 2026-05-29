@@ -48,7 +48,7 @@ FILTERS = (
     "num_gpus=1",
     "total_flops>=28",  # >= 28 TFLOPS
     "dlperf>20",
-    "dlperf_usd>90",  # DLPerf per $/hr
+    "dlperf_usd>70",  # DLPerf per $/hr
     "reliability>0.96",  # > 96%
     "inet_down>300",  # > 300 Mbps down
     "inet_down_cost<=0.01",  # <= $10/TB down
