@@ -114,7 +114,8 @@ class TrainConfig:
     # inference
     n_flow_steps: int = 8
     # optimization
-    batch_size: int = 32
+    batch_size: int = 32  # micro-batch run on the GPU per forward
+    grad_accum_steps: int = 1  # optimizer step sees batch_size * grad_accum_steps samples
     lr: float = 3e-4
     weight_decay: float = 0.01
     warmup_steps: int = 500
@@ -483,20 +484,23 @@ def train(
     run_t0 = time.monotonic()
     for step in range(start_step, cfg.max_steps):
         with profile("step") as sw:
-            try:
-                batch = next(it).to(DEVICE)
-            except StopIteration:
-                it = iter(train_loader)
-                batch = next(it).to(DEVICE)
-            loss = flow_loss(model, batch)
             opt.zero_grad()
-            loss.backward()
+            loss_val = 0.0  # mean loss over the effective (accumulated) batch
+            for _ in range(cfg.grad_accum_steps):
+                try:
+                    batch = next(it).to(DEVICE)
+                except StopIteration:
+                    it = iter(train_loader)
+                    batch = next(it).to(DEVICE)
+                loss = flow_loss(model, batch) / cfg.grad_accum_steps
+                loss.backward()
+                loss_val += loss.item()
             opt.step()
             sched.step()
-        sps = cfg.batch_size / sw.elapsed
+        sps = cfg.batch_size * cfg.grad_accum_steps / sw.elapsed
         wandb.log(
             {
-                "train/loss": loss.item(),
+                "train/loss": loss_val,
                 "train/lr": opt.param_groups[0]["lr"],
                 "throughput/step_s": sw.elapsed,
                 "throughput/samples_per_s": sps,
@@ -505,7 +509,7 @@ def train(
         )
         if step < 20 or step % 50 == 0:
             print(
-                f"[t+{time.monotonic() - run_t0:.0f}s] step {step}: loss {loss.item():.4f} "
+                f"[t+{time.monotonic() - run_t0:.0f}s] step {step}: loss {loss_val:.4f} "
                 f"step_dt={sw.elapsed * 1000:.0f}ms ({sps:.1f} samples/s)",
                 flush=True,
             )
