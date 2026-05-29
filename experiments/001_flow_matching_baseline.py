@@ -505,6 +505,16 @@ def train(
     def _wandb_id() -> str | None:
         return wandb.run.id if wandb.run is not None else None
 
+    def _eval_and_upload(step_tag: str) -> dict[str, float]:
+        # Per-step replay subdir so successive evals don't overwrite each other's
+        # .slp, then ship the recordings to R2 (keyed under runs/<run>/replays/...).
+        sub = replay_dir / step_tag
+        metrics = eval_vs_cpu(model, stats, cfg, max_frames=cfg.eval_max_frames, replay_dir=sub)
+        if uploader is not None:
+            n = uploader.upload_tree(sub, base=ckpt_dir, pattern="*.slp")
+            print(f"[eval] queued {n} .slp for R2 ({step_tag})", flush=True)
+        return metrics
+
     model.train()
     it = iter(train_loader)
     run_t0 = time.monotonic()
@@ -570,7 +580,7 @@ def train(
                 wandb_id=_wandb_id(),
                 uploader=uploader,
             )
-            metrics = eval_vs_cpu(model, stats, cfg, max_frames=cfg.eval_max_frames, replay_dir=replay_dir)
+            metrics = _eval_and_upload(f"step_{step:06d}")
             wandb.log({f"eval/{k}": v for k, v in metrics.items()}, step=step)
             print(f"[t+{time.monotonic() - run_t0:.0f}s] step {step}: closed_loop {metrics}", flush=True)
 
@@ -578,7 +588,7 @@ def train(
     rm_final = recon_metrics(model, val_cache, n_steps=cfg.n_flow_steps)
     wandb.log({"val/loss": vl_final, **{f"val/{k}": v for k, v in rm_final.items()}}, step=cfg.max_steps)
     print(f"[final] val_loss {vl_final:.4f} recon {rm_final}", flush=True)
-    metrics_final = eval_vs_cpu(model, stats, cfg, max_frames=cfg.eval_max_frames, replay_dir=replay_dir)
+    metrics_final = _eval_and_upload("final")
     wandb.log({f"eval/{k}": v for k, v in metrics_final.items()}, step=cfg.max_steps)
     print(f"[final] closed_loop {metrics_final}", flush=True)
     save_checkpoint(

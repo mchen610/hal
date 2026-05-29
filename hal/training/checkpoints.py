@@ -51,20 +51,33 @@ class BackgroundUploader:
             try:
                 if item is _SENTINEL:
                     return
-                local = Path(item)
-                key = f"{self._prefix}/{self._run_name}/{local.name}"
+                local_str, rel_key = item
+                local = Path(local_str)
+                key = f"{self._prefix}/{self._run_name}/{rel_key or local.name}"
                 try:
                     self._client.upload_file(str(local), self._bucket, key)
-                    logger.info(f"[ckpt] uploaded {local.name} -> r2://{self._bucket}/{key}")
+                    logger.info(f"[ckpt] uploaded {rel_key or local.name} -> r2://{self._bucket}/{key}")
                 except (OSError, BotoCoreError, ClientError) as e:
                     self._failures += 1
                     logger.error(f"[ckpt] upload failed for {local.name}: {e}")
             finally:
                 self._queue.task_done()
 
-    def upload(self, path: Path) -> None:
-        """Enqueue ``path`` for upload. Returns immediately (non-blocking)."""
-        self._queue.put(str(path))
+    def upload(self, path: Path, *, key: str | None = None) -> None:
+        """Enqueue ``path`` for upload. Returns immediately (non-blocking). ``key`` is
+        the object path under ``<prefix>/<run>/`` — defaults to the basename; pass a
+        relative path (e.g. ``replays/step_000050/match_000/g.slp``) to mirror a tree
+        instead of flattening to basenames that could collide."""
+        self._queue.put((str(path), key))
+
+    def upload_tree(self, root: Path, *, base: Path, pattern: str = "*") -> int:
+        """Enqueue every file under ``root`` matching ``pattern``, keyed by its path
+        relative to ``base`` (mirroring the tree under ``<prefix>/<run>/``). Returns
+        the count enqueued. Used to ship eval ``.slp`` recordings to R2."""
+        files = [p for p in sorted(root.rglob(pattern)) if p.is_file()]
+        for p in files:
+            self.upload(p, key=str(p.relative_to(base)))
+        return len(files)
 
     def close(self) -> None:
         """Drain the queue and join the worker. Warns if any upload failed."""
