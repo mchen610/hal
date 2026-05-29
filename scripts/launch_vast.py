@@ -171,8 +171,12 @@ def launch(
     env: dict[str, str],
     token: str | None,
     timeout_s: int,
+    keep_alive: bool,
 ) -> int:
-    """Rent the offer, poll to `running`, destroy on any failure-to-launch."""
+    """Rent the offer and poll to `running`. On failure-to-launch (stuck/dead before
+    `running`), destroy to avoid a leaked billing instance — unless ``keep_alive``,
+    in which case leave it (booting or for inspection) and return its id. The ~9 GB
+    image can take a while to pull+extract on a slow box, hence a generous timeout."""
     login = {"login": f"-u {GHCR_USER} -p {token} ghcr.io"} if token else {}  # ghcr auth only if image is private
     inst = vast.create_instance(
         id=offer["id"],
@@ -185,21 +189,27 @@ def launch(
     )
     iid = inst["new_contract"]
     logger.info(f"created instance {iid} on offer {offer['id']} ({offer['gpu_name']}); polling to running")
-    deadline = time.time() + timeout_s
-    try:
-        while True:
-            status = vast.show_instance(id=iid).get("actual_status")
-            if status == "running":
-                return iid
-            if status in {"exited", "offline", "unknown"}:
-                raise RuntimeError(f"instance {iid} died before running: {status}")
-            if time.time() > deadline:
-                raise TimeoutError(f"instance {iid} stuck in {status!r} after {timeout_s}s")
-            time.sleep(10)
-    except BaseException:
-        logger.error(f"tearing down instance {iid} after launch failure")
+
+    def give_up(why: str) -> int:
+        if keep_alive:
+            logger.warning(
+                f"{why}; left up (--keep-alive). Monitor: vastai logs {iid} ; destroy: vastai destroy instance {iid}"
+            )
+            return iid
+        logger.error(f"{why}; tearing down instance {iid}")
         vast.destroy_instance(id=iid)
-        raise
+        raise SystemExit(f"launch failed: {why}")
+
+    deadline = time.time() + timeout_s
+    while True:
+        status = vast.show_instance(id=iid).get("actual_status")
+        if status == "running":
+            return iid
+        if status in {"exited", "offline", "unknown"}:
+            return give_up(f"instance {iid} died before running ({status})")
+        if time.time() > deadline:
+            return give_up(f"instance {iid} stuck in {status!r} after {timeout_s}s")
+        time.sleep(10)
 
 
 @dataclass(frozen=True)
@@ -209,15 +219,15 @@ class Args:
     max_price: float = 1.10
     """Hard $/hr ceiling — the impatience knob. Lower waits longer for a cheaper box."""
     image: str = "ghcr.io/ericyuegu/hal:cuda13"
-    """Image vast pulls (private ghcr; authed via GITHUB_TOKEN)."""
-    disk: int = 100
-    """Container disk in GB (fixed at create; dies with the instance)."""
+    """Image vast pulls (public ghcr; GITHUB_TOKEN only if you make it private)."""
+    disk: int = 60
+    """Container disk in GB (fixed at create; dies with the instance). ~18 GB image + ISO + cache."""
     limit: int = 10
     """How many offers to fetch/print."""
     poll_interval_s: int = 30
     """Seconds between market polls while queueing."""
-    timeout_s: int = 900
-    """How long to wait for the instance to reach `running`."""
+    timeout_s: int = 1800
+    """How long to wait for `running` — the ~9 GB image can pull slowly on a cheap box."""
     dry_run: bool = False
     """Run preflight + one search and print exactly what would be sent, without renting."""
     keep_alive: bool = False
@@ -252,13 +262,26 @@ def main(args: Args) -> None:
     offers = queue(vast, max_price=args.max_price, limit=args.limit, poll_interval_s=args.poll_interval_s)
     print_offers(offers)
     offer = offers[0]
-    iid = launch(vast, offer, image=args.image, disk=args.disk, env=env, token=token, timeout_s=args.timeout_s)
+    iid = launch(
+        vast,
+        offer,
+        image=args.image,
+        disk=args.disk,
+        env=env,
+        token=token,
+        timeout_s=args.timeout_s,
+        keep_alive=args.keep_alive,
+    )
 
-    logger.success(f"instance {iid} running ({offer['gpu_name']}, ${offer['dph_total']:.3f}/hr) on SHA {sha[:10]}")
-    ssh = vast.ssh_url(id=iid)
-    logger.info("booting: clone -> uv sync -> fetch -> train. Watch W&B for progress.")
-    logger.info(f"peek:  {ssh or f'vastai ssh-url {iid}'}  (tail /opt/hal/train.log)")
-    logger.info("the box self-destructs on success / self-stops on failure; no teardown needed from here.")
+    logger.success(f"instance {iid} ({offer['gpu_name']}, ${offer['dph_total']:.3f}/hr) on SHA {sha[:10]}")
+    logger.info(f"booting: clone -> uv sync -> fetch -> train. Watch W&B + `vastai logs {iid}` for progress.")
+    logger.info(f"peek:  {vast.ssh_url(id=iid) or f'vastai ssh-url {iid}'}  (tail /opt/hal/train.log)")
+    teardown = (
+        "kept up regardless (--keep-alive); destroy manually"
+        if args.keep_alive
+        else "self-destructs on success / self-stops on failure"
+    )
+    logger.info(f"teardown: box {teardown}.")
 
 
 if __name__ == "__main__":
