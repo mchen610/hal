@@ -1,18 +1,20 @@
 """Queue for a vast.ai GPU under a price ceiling and run a training command on it.
 
 The instance is fire-and-forget: this launcher pushes the current git SHA, waits
-for an offer that clears the hardware bar, rents it, and injects the SHA +
-credentials + the (base64'd) training command. The box then clones that SHA,
-trains, and tears *itself* down — destroy on success (checkpoints are already in
-R2, logs in W&B), stop on failure (for inspection). See docker/on-start.sh.
+for an offer that clears the hardware bar, rents it, and injects the SHA + the
+(base64'd) training command. The box then clones that SHA, trains, and tears
+*itself* down — destroy on success (checkpoints are already in R2, logs in W&B),
+stop on failure (for inspection). See docker/on-start.sh.
 
     python scripts/launch_vast.py                         # search-only: print offers, rent nothing
     python scripts/launch_vast.py --dry-run -- uv run experiments/001_flow_matching_baseline.py
     python scripts/launch_vast.py --max-price 0.80 -- uv run experiments/001_flow_matching_baseline.py --cfg.max-steps 100000
 
-Requires host env: AWS_* (+ AWS_BUCKET=hal) and WANDB_API_KEY. GITHUB_TOKEN is
-optional — only needed if the ghcr image is private (read:packages to pull it);
-the repo is public, so the box clones it anonymously.
+Secrets (R2 + W&B) are NOT passed by this launcher — they live as vast *account*
+env-vars (Console → Account → Environment Vars) and inject into the box out-of-band,
+so they never land in the instance's extra_env. The launcher only verifies they're
+present. The host needs no secrets, just a vast API key (~/.config/vastai). An
+optional GITHUB_TOKEN is used solely to pull a private ghcr image (the repo is public).
 """
 
 import base64
@@ -47,9 +49,17 @@ FILTERS = (
 )
 ORDER = "dlperf_usd-"  # sort by DLPerf/$/hr, descending
 
-# R2 + W&B creds forwarded to the box. The optional GITHUB_TOKEN (ghcr login) and
-# the per-run vars (SHA, command) are added at create time.
-CRED_VARS = ("AWS_ENDPOINT_URL", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_BUCKET", "WANDB_API_KEY")
+# R2 + W&B secrets are NOT passed via `-e` (that lands them in the instance's
+# extra_env, visible in `show instance` and to the host). They live as vast *account*
+# env-vars (Console → Account → Environment Vars), injected out-of-band; the launcher
+# only verifies they exist. The box recovers them in docker/on-start.sh.
+REQUIRED_ACCOUNT_VARS = (
+    "AWS_ENDPOINT_URL",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_BUCKET",
+    "WANDB_API_KEY",
+)
 
 
 def build_query(max_price: float) -> str:
@@ -80,12 +90,26 @@ def _git(*args: str) -> str:
     return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
-def preflight() -> tuple[str, str | None, dict[str, str]]:
+def _account_env_keys(vast: VastAI) -> set[str]:
+    """Names of the env-vars configured on the vast account (values not needed)."""
+    d = vast.show_env_vars()
+    if isinstance(d, dict):
+        rows = d.get("results") or d.get("env_vars")
+        if rows is not None:
+            return {r.get("key") or r.get("name") for r in rows if isinstance(r, dict)}
+        return set(d.keys())  # flat {name: value}
+    if isinstance(d, list):
+        return {r.get("key") or r.get("name") for r in d if isinstance(r, dict)}
+    return set()
+
+
+def preflight(vast: VastAI) -> tuple[str, str | None]:
     """Ensure the run is reproducible and credentialed before spending money.
 
-    Returns (sha, github_token_or_none, cred_env). Exits with a clear message on a
-    dirty tree, an unpushed SHA we can't push, or a missing R2/W&B credential. The
-    GitHub token is optional (only used to pull a private ghcr image).
+    Returns (sha, github_token_or_none). Exits with a clear message on a dirty tree,
+    an unpushed SHA we can't push, or missing account secrets. Secrets come from vast
+    account env-vars (not the host, not `-e`); the GitHub token is optional (only used
+    to pull a private ghcr image).
     """
     if _git("status", "--porcelain"):
         raise SystemExit("working tree is dirty — commit before launching (the box runs the pushed SHA).")
@@ -95,11 +119,15 @@ def preflight() -> tuple[str, str | None, dict[str, str]]:
         logger.info(f"{sha[:10]} not on origin; pushing {branch}")
         subprocess.run(["git", "push", "origin", branch], check=True)
 
-    missing = [v for v in CRED_VARS if not os.environ.get(v)]
+    missing = [v for v in REQUIRED_ACCOUNT_VARS if v not in _account_env_keys(vast)]
     if missing:
-        raise SystemExit(f"missing required host env vars: {missing}")
+        raise SystemExit(
+            f"vast account env-vars missing {missing}. Add them (Console → Account → Environment "
+            "Vars, or `vastai create env-var <name> <value>`) so they inject into the box without "
+            "leaking into extra_env."
+        )
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    return sha, token, {v: os.environ[v] for v in CRED_VARS}
+    return sha, token
 
 
 def queue(vast: VastAI, *, max_price: float, limit: int, poll_interval_s: int) -> list[dict]:
@@ -112,15 +140,13 @@ def queue(vast: VastAI, *, max_price: float, limit: int, poll_interval_s: int) -
         time.sleep(poll_interval_s)
 
 
-def _instance_env(creds: dict[str, str], *, token: str | None, sha: str, train_cmd: str) -> dict[str, str]:
-    env = {
-        **creds,
+def _instance_env(*, sha: str, train_cmd: str) -> dict[str, str]:
+    # Only non-secret per-run vars go through `-e` (these are visible in extra_env).
+    # Secrets come from the vast account env-vars; see REQUIRED_ACCOUNT_VARS.
+    return {
         "HAL_GIT_SHA": sha,
         "HAL_TRAIN_CMD_B64": base64.b64encode(train_cmd.encode()).decode(),
     }
-    if token:  # only for a private ghcr image / private repo; public repo clones anonymously
-        env["GITHUB_TOKEN"] = token
-    return env
 
 
 def launch(
@@ -181,6 +207,8 @@ class Args:
     """How long to wait for the instance to reach `running`."""
     dry_run: bool = False
     """Run preflight + one search and print exactly what would be sent, without renting."""
+    keep_alive: bool = False
+    """Debug: leave the box up on crash/finish (no self stop/destroy) so you can SSH in."""
 
 
 def main(args: Args) -> None:
@@ -191,19 +219,18 @@ def main(args: Args) -> None:
         logger.info("search-only (pass a training command after `--` to launch). Nothing rented.")
         return
 
-    sha, token, creds = preflight()
+    sha, token = preflight(vast)
     train_cmd = shlex.join(args.cmd)
-    env = _instance_env(creds, token=token, sha=sha, train_cmd=train_cmd)
+    env = _instance_env(sha=sha, train_cmd=train_cmd)
+    if args.keep_alive:
+        env["HAL_KEEP_ALIVE"] = "1"
 
     if args.dry_run:
         offers = search(vast, max_price=args.max_price, limit=args.limit)
         print_offers(offers)
-        safe_env = {
-            k: (v if k in {"HAL_GIT_SHA", "AWS_BUCKET", "AWS_ENDPOINT_URL"} else "***") for k, v in env.items()
-        }
         login = f"'-u {GHCR_USER} -p *** ghcr.io'" if token else "none (public image)"
         logger.info(f"[dry-run] image={args.image} disk={args.disk}GB runtype=ssh_proxy login={login}")
-        logger.info(f"[dry-run] env={safe_env}")
+        logger.info(f"[dry-run] env (non-secret; secrets come from vast account env-vars)={env}")
         logger.info("[dry-run] onstart='bash /usr/local/bin/on-start.sh'")
         logger.info(f"[dry-run] HAL_GIT_SHA={sha}")
         logger.info(f"[dry-run] train cmd: {train_cmd}")

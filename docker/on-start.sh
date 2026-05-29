@@ -11,20 +11,54 @@
 #   HAL_TRAIN_CMD_B64    base64 of the training command (base64 survives the env string)
 #   AWS_*, WANDB_API_KEY  R2 + W&B credentials
 #   GITHUB_TOKEN         optional; only set when the repo/image is private
+#   HAL_KEEP_ALIVE       optional; "1" disables all self-teardown (debug: leave box up)
 # vast injects CONTAINER_ID + CONTAINER_API_KEY (a per-instance key) so the box
 # can stop/destroy itself.
 set -euo pipefail
 
 log() { echo "[on-start] $*"; }
 
-# Any failure before training starts (clone, sync, fetch) stops the box for
-# inspection rather than leaving it idle-billing.
-trap 'log "boot failed (line $LINENO); stopping instance for inspection"; \
-      VAST_API_KEY="$CONTAINER_API_KEY" vastai stop instance "$CONTAINER_ID" || true' ERR
+# vast does NOT inject env into this on-start shell, so recover it from two sources:
+#   - account env-vars (R2 + W&B secrets, set in the vast console) — written to
+#     /etc/environment, deliberately kept out of the per-instance config so they
+#     don't leak into `show instance`/extra_env.
+#   - the per-run `-e` vars (HAL_GIT_SHA, HAL_TRAIN_CMD_B64, HAL_KEEP_ALIVE) — these
+#     live in the container's PID 1 environ (NUL-separated).
+# Export both so this script and the training child inherit them.
+set -a
+[ -r /etc/environment ] && . /etc/environment 2>/dev/null || true
+set +a
+if [ -r /proc/1/environ ]; then
+  while IFS= read -r -d '' kv; do
+    case "$kv" in AWS_*=* | WANDB_*=* | GITHUB_TOKEN=* | HAL_*=*) export "$kv" ;; esac
+  done < /proc/1/environ
+fi
+log "env check: AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL:+set} WANDB_API_KEY=${WANDB_API_KEY:+set} HAL_GIT_SHA=${HAL_GIT_SHA:+set} HAL_TRAIN_CMD_B64=${HAL_TRAIN_CMD_B64:+set}"
 
-# vast hides the -e env vars from interactive SSH sessions; persist the creds so a
-# manual `ssh` peek (e.g. to --resume) sees them too.
-env | grep -E '^(AWS_|WANDB_|GITHUB_TOKEN)=' >> /etc/environment
+# Teardown, gated on HAL_KEEP_ALIVE so a debug run leaves the box SSH-able. $1 is the
+# vast verb (stop|destroy), $2 a human reason for the log.
+teardown() {
+  if [ "${HAL_KEEP_ALIVE:-0}" = "1" ]; then
+    log "HAL_KEEP_ALIVE=1 — leaving instance up ($2); destroy manually when done"
+    return
+  fi
+  log "$2 — ${1}ing instance"
+  VAST_API_KEY="$CONTAINER_API_KEY" vastai "$1" instance "$CONTAINER_ID" || true
+}
+
+# Any failure during boot (clone, sync, fetch) stops the box (or keeps it under
+# HAL_KEEP_ALIVE) rather than leaving it idle-billing.
+trap 'log "boot failed (line $LINENO)"; teardown stop "boot failure"; exit 1' ERR
+
+# Fail loud + early if the injected inputs are missing (e.g. env recovery found
+# nothing) instead of dying obscurely mid-clone.
+: "${HAL_GIT_SHA:?missing — vast -e env not recovered from /proc/1/environ}"
+: "${HAL_TRAIN_CMD_B64:?missing — vast -e env not recovered from /proc/1/environ}"
+: "${AWS_ENDPOINT_URL:?missing — R2 creds not recovered from /proc/1/environ}"
+
+# Persist creds so an interactive `ssh` peek (e.g. to --resume) sees them too.
+# `|| true`: grep exits 1 on no match, which must not trip `set -e`.
+env | grep -E '^(AWS_|WANDB_|GITHUB_TOKEN)=' >> /etc/environment || true
 
 # Code at the exact SHA. The image bakes no repo, so this is a clean clone into the
 # empty /opt/hal; uv sync then installs the pure-Python hal into the prebuilt venv
@@ -49,18 +83,16 @@ export DISPLAY=:99
 
 cmd="$(printf '%s' "$HAL_TRAIN_CMD_B64" | base64 -d)"
 log "training: ${cmd}"
-# Run the training command itself outside `set -e`/the trap so we can branch on its
-# exit code: success destroys the box (checkpoints are already in R2), any non-zero
-# exit stops it (keeps /opt/hal/train.log + the box for inspection / --resume).
+# Run training outside the trap so we can branch on its exit code: success destroys
+# the box (checkpoints already in R2), non-zero stops it (keeps /opt/hal/train.log
+# for inspection / --resume) — both subject to HAL_KEEP_ALIVE.
 set +e
-bash -lc "$cmd" 2>&1 | tee /opt/hal/train.log
+bash -c "$cmd" 2>&1 | tee /opt/hal/train.log
 code=${PIPESTATUS[0]}
 set -e
 
 if [ "$code" -eq 0 ]; then
-  log "training succeeded; destroying instance (checkpoints in R2, logs in W&B)"
-  VAST_API_KEY="$CONTAINER_API_KEY" vastai destroy instance "$CONTAINER_ID"
+  teardown destroy "training succeeded (checkpoints in R2, logs in W&B)"
 else
-  log "training exited ${code}; stopping instance for inspection"
-  VAST_API_KEY="$CONTAINER_API_KEY" vastai stop instance "$CONTAINER_ID"
+  teardown stop "training exited ${code}"
 fi
