@@ -107,6 +107,37 @@ def run_match(
         return None
 
 
+def _drive_wave(
+    session_cfg: SessionConfig,
+    indices: Sequence[int],
+    matches: Sequence[VecMatch],
+    policy_factory: Callable[[], BatchPolicy],
+    *,
+    max_frames: int,
+    base_replay: Path | None,
+    slippi_port_base: int,
+) -> dict[int, Trajectory | None]:
+    """Build fresh Sessions for the given global match ``indices`` and drive them
+    once through ``drive_vec``. Returns ``{global_index: Trajectory | None}``.
+
+    A wave-wide failure (Session build or the shared batched-policy call, e.g. CUDA
+    OOM) can't be attributed to one match, so every index is left ``None`` and
+    logged — the log-and-continue contract shared with ``run_match``."""
+    try:
+        sessions: list[Session] = []
+        for offset, gi in enumerate(indices):
+            replay_dir = None
+            if base_replay is not None:
+                replay_dir = base_replay / f"match_{gi:03d}"
+                replay_dir.mkdir(parents=True, exist_ok=True)
+            sessions.append(_build_session(session_cfg, slippi_port=slippi_port_base + offset, replay_dir=replay_dir))
+        trajs = drive_vec(sessions, [matches[gi] for gi in indices], policy_factory(), max_frames=max_frames)
+    except Exception as e:
+        logger.warning(f"run_matches_vec: wave {list(indices)} failed: {e!r}; its matches stay None")
+        return {gi: None for gi in indices}
+    return dict(zip(indices, trajs, strict=True))
+
+
 def run_matches_vec(
     session_cfg: SessionConfig,
     matches: Sequence[VecMatch],
@@ -115,6 +146,7 @@ def run_matches_vec(
     max_frames: int,
     max_parallel: int,
     base_slippi_port: int = 51441,
+    start_retries: int = 2,
 ) -> list[Trajectory | None]:
     """Run ``matches`` concurrently in waves of up to ``max_parallel`` Sessions,
     each frame batched through a single ``BatchPolicy`` call (see ``drive_vec``).
@@ -124,33 +156,43 @@ def run_matches_vec(
     their .slps don't collide. ``policy_factory`` builds a fresh policy per wave —
     per-slot rolling state must not leak across waves, and ``Slot.match`` indices
     restart at 0 each wave. Returns one entry per match, aligned to ``matches``;
-    ``None`` where that Session failed.
+    ``None`` where that Session failed after all retries.
 
-    Per-match Session crashes are isolated inside ``drive_vec``. A failure in the
-    shared batched policy call (e.g. CUDA OOM across the wave's slots) can't be
-    attributed to one match, so the whole wave is logged and left ``None`` rather
-    than aborting the sweep — the same log-and-continue contract as ``run_match``.
+    libmelee's stage-select cursor navigation flakily fails to settle under
+    concurrent FFW load (frame-delivery jitter starves its bang-bang controller),
+    so a match intermittently never reaches IN_GAME and ``start_match`` trips its
+    wall-clock cap. ``start_retries`` re-drives the still-``None`` matches of a
+    wave on fresh Sessions (new Dolphin + slippi_port) to absorb that ~per-match
+    flake; a wholly-dead match still ends up ``None`` and is logged.
     """
     if max_parallel < 1:
         raise ValueError(f"max_parallel must be >= 1, got {max_parallel}")
     base_replay = Path(session_cfg.replay_dir) if session_cfg.replay_dir is not None else None
     out: list[Trajectory | None] = [None] * len(matches)
     for wave_start in range(0, len(matches), max_parallel):
-        wave = list(range(wave_start, min(wave_start + max_parallel, len(matches))))
-        try:
-            sessions: list[Session] = []
-            for offset, gi in enumerate(wave):
-                replay_dir = None
-                if base_replay is not None:
-                    replay_dir = base_replay / f"match_{gi:03d}"
-                    replay_dir.mkdir(parents=True, exist_ok=True)
-                sessions.append(
-                    _build_session(session_cfg, slippi_port=base_slippi_port + offset, replay_dir=replay_dir)
+        pending = list(range(wave_start, min(wave_start + max_parallel, len(matches))))
+        for attempt in range(start_retries + 1):
+            # Fresh ports per attempt so a stuck-but-not-yet-reaped Dolphin from the
+            # previous try can't collide with the retry's slippstream server.
+            slippi_port_base = base_slippi_port + (attempt % 8) * max_parallel
+            results = _drive_wave(
+                session_cfg,
+                pending,
+                matches,
+                policy_factory,
+                max_frames=max_frames,
+                base_replay=base_replay,
+                slippi_port_base=slippi_port_base,
+            )
+            for gi, traj in results.items():
+                if traj is not None:
+                    out[gi] = traj
+            pending = [gi for gi in pending if out[gi] is None]
+            if not pending:
+                break
+            if attempt < start_retries:
+                logger.warning(
+                    f"run_matches_vec: {len(pending)} match(es) failed to reach IN_GAME; "
+                    f"retrying on fresh Sessions (attempt {attempt + 2}/{start_retries + 1})"
                 )
-            trajs = drive_vec(sessions, [matches[gi] for gi in wave], policy_factory(), max_frames=max_frames)
-        except Exception as e:
-            logger.warning(f"run_matches_vec: wave {wave[0]}..{wave[-1]} failed: {e!r}; its matches stay None")
-            continue
-        for gi, traj in zip(wave, trajs, strict=True):
-            out[gi] = traj
     return out
