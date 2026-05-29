@@ -44,6 +44,7 @@ dependencies = [
 
 [project.scripts]
 fetch = "hal.scripts.fetch:main"
+slp-link = "hal.scripts.slp_link:main"
 
 [dependency-groups]
 dev = [

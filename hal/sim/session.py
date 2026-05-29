@@ -30,6 +30,7 @@ import melee
 from loguru import logger
 
 from hal.data.index import ReplayIndexEntry
+from hal.data.slp_finalize import finalize_replay_dir
 from hal.sim.inputs import ControllerInputs
 from hal.sim.inputs import apply_inputs
 from hal.wire import slp_character_to_libmelee
@@ -327,10 +328,11 @@ class Session:
             self._menu_helpers.clear()
             return
         proc = getattr(self._console, "_process", None)
-        # 1. Graceful SIGTERM so Slippi's writer thread finalizes the .slp
-        #    footer; otherwise peppi can't parse the resulting file. Empirically
-        #    Slippi-Ishiiruka needs ~5-8s to flush a multi-thousand-frame
-        #    match.
+        # 1. Graceful SIGTERM so Slippi can finish flushing its current frame and
+        #    cleanly close a match that reached GAME_END (which finalizes the
+        #    .slp with full metadata). A match abandoned mid-game — stopped at
+        #    max_frames while still IN_GAME — never gets GAME_END, so SIGTERM
+        #    can't finalize it; step 4 repairs those.
         if proc is not None and proc.poll() is None:
             try:
                 proc.terminate()
@@ -349,6 +351,14 @@ class Session:
             self._console.stop()
         except (OSError, subprocess.TimeoutExpired, RuntimeError, AssertionError) as e:
             logger.warning(f"Console.stop() raised on teardown: {e}")
+        # 4. Finalize any .slp Slippi left unclosed (rawLength == 0): a match
+        #    that hit max_frames mid-game is otherwise unparseable by peppi /
+        #    slippilab even though the frame data is intact. No-op for matches
+        #    that ended cleanly (already finalized by Dolphin at GAME_END).
+        if self.replay_dir is not None:
+            repaired = finalize_replay_dir(self.replay_dir)
+            if repaired:
+                logger.info(f"finalized {len(repaired)} unclosed .slp in {self.replay_dir}")
         self._console = None
         self._controllers.clear()
         self._menu_helpers.clear()
