@@ -39,6 +39,7 @@ import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
+import contextlib
 import itertools
 import math
 import time
@@ -113,6 +114,12 @@ class TrainConfig:
     weight_decay: float = 0.01
     warmup_steps: int = 500
     max_steps: int = 2**15
+    # precision. The step is GPU-bound; in pure FP32 the Ampere tensor cores sit idle
+    # (an A6000 ran 100% SM at only ~105/275 W). bf16 autocast ~2.3x's the step and
+    # needs no GradScaler (bf16 keeps FP32's exponent range); TF32 speeds the residual
+    # FP32 matmuls. Set amp_dtype="float32" to fall back to the old behavior.
+    amp_dtype: str = "bfloat16"  # "bfloat16" | "float32"
+    allow_tf32: bool = True
     # eval cadence
     val_every: int = 1024
     val_n_batches: int = 16
@@ -475,6 +482,14 @@ def train(
     ckpt_dir, replay_dir = setup_run_dir(run_name)
 
     torch.manual_seed(cfg.seed)
+    torch.set_float32_matmul_precision("high" if cfg.allow_tf32 else "highest")
+    if cfg.amp_dtype not in ("bfloat16", "float32"):
+        raise ValueError(f"amp_dtype must be 'bfloat16' or 'float32', got {cfg.amp_dtype!r}")
+    autocast = (
+        torch.autocast(DEVICE, dtype=torch.bfloat16)
+        if cfg.amp_dtype == "bfloat16" and DEVICE == "cuda"
+        else contextlib.nullcontext()
+    )
     model = FlowMatchingPolicy(cfg).to(DEVICE)
     loader_kwargs = dict(
         data_root=cfg.data_root,
@@ -539,7 +554,8 @@ def train(
                 except StopIteration:
                     it = iter(train_loader)
                     batch = next(it).to(DEVICE)
-                loss = flow_loss(model, batch) / cfg.grad_accum_steps
+                with autocast:
+                    loss = flow_loss(model, batch) / cfg.grad_accum_steps
                 loss.backward()
                 loss_val += loss.item()
             opt.step()
