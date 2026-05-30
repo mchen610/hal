@@ -228,7 +228,7 @@ class Args:
     """How many offers to fetch/print."""
     poll_interval_s: int = 30
     """Seconds between market polls while queueing."""
-    timeout_s: int = 600
+    timeout_s: int = 1200
     """How long to wait for `running` — the ~9 GB image can pull slowly on a cheap box."""
     dry_run: bool = False
     """Run preflight + one search and print exactly what would be sent, without renting."""
