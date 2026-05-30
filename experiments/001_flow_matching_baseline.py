@@ -560,6 +560,11 @@ def train(
                 loss_val += loss.item()
             opt.step()
             sched.step()
+            if DEVICE == "cuda":
+                # CUDA kernels are async: without a sync, sw.elapsed times the launch,
+                # not the work, and step_s/samples_per_s read ~10-30x too fast (a real
+                # past footgun). Sync inside the timed block so throughput is honest.
+                torch.cuda.synchronize()
         sps = cfg.batch_size * cfg.grad_accum_steps / sw.elapsed
         wandb.log(
             {
