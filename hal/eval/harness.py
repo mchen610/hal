@@ -45,7 +45,12 @@ class SessionConfig:
     blocking_input: bool = True
     replay_dir: str | Path | None = None
     step_timeout_seconds: float = 30.0
-    start_timeout_seconds: float = 120.0
+    # Wall-clock cap on driving menus to the first in-game frame. Legit navigation
+    # settles in a few seconds even under concurrent load; a stage-select flake
+    # (libmelee's cursor limit-cycling) spins to the cap, so keep it tight — the
+    # rarer flake then costs ~30s before run_matches_vec retries on a fresh Session,
+    # not 120s.
+    start_timeout_seconds: float = 30.0
     tmp_home_directory: bool = True
     # Eval sessions poll slippstream so a hung/paused match trips
     # step_timeout_seconds instead of blocking forever (see Session.polling_mode).
