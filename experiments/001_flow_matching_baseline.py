@@ -291,8 +291,16 @@ class FlowMatchingPolicy(nn.Module):
 
 
 # %%
-def flow_loss(model: FlowMatchingPolicy, batch: TrainBatch, *, gen: torch.Generator | None = None) -> Tensor:
-    """Conditional flow-matching MSE on the velocity over the whole chunk."""
+def flow_loss(
+    model: FlowMatchingPolicy, batch: TrainBatch, *, gen: torch.Generator | None = None
+) -> Float[Tensor, "B L_chunk d_action"]:
+    """Per-element conditional flow-matching squared error on the velocity (unreduced).
+
+    Draws a timestep t ~ U[0,1] and noise z ~ N(0,I), interpolates a_t between z and
+    the ground-truth chunk, and returns the element-wise squared error v̂ vs the
+    target velocity. ``.mean()`` it for the training scalar; slice + ``.mean()`` it
+    for the modality/horizon decomposition (``velocity_mse_breakdown``) — same tensor,
+    so the marginals exactly partition the scalar."""
     target = batch.target
     B = target.shape[0]
     t = torch.rand(B, device=target.device, generator=gen)
@@ -300,7 +308,7 @@ def flow_loss(model: FlowMatchingPolicy, batch: TrainBatch, *, gen: torch.Genera
     t_b = t.view(B, 1, 1)
     a_t = (1 - t_b) * z + t_b * target
     v_target = target - z
-    return F.mse_loss(model(batch.context, a_t, t), v_target)
+    return F.mse_loss(model(batch.context, a_t, t), v_target, reduction="none")
 
 
 @torch.no_grad()
@@ -376,25 +384,58 @@ def lr_schedule(cfg: TrainConfig):
 
 
 @torch.no_grad()
-def val_loss(model: FlowMatchingPolicy, val_cache: list[TrainBatch]) -> float:
-    """Sample-weighted MSE over cached val batches with FIXED noise (re-seeded
-    each call). Toggles model.eval/train."""
+def val_loss(model: FlowMatchingPolicy, val_cache: list[TrainBatch]) -> tuple[float, dict[str, float]]:
+    """Sample-weighted velocity MSE over cached val batches with FIXED noise
+    (re-seeded each call), plus its per-modality / per-horizon marginal breakdown
+    (``velocity_mse_breakdown``), off the same forward pass. Toggles eval/train."""
     was_training = model.training
     model.eval()
     gen = torch.Generator(device=DEVICE).manual_seed(0)
     total = 0.0
     count = 0
+    breakdown_sums: dict[str, float] = {}
     for batch in val_cache:
         n = batch.target.shape[0]
-        total += flow_loss(model, batch, gen=gen).item() * n
+        err2 = flow_loss(model, batch, gen=gen)
+        total += err2.mean().item() * n
+        for k, v in velocity_mse_breakdown(err2).items():
+            breakdown_sums[k] = breakdown_sums.get(k, 0.0) + v * n
         count += n
     if was_training:
         model.train()
-    return total / count
+    return total / count, {k: s / count for k, s in breakdown_sums.items()}
 
 
-# Channel split inside the 15-vec: [0:6] sticks+triggers (continuous), [6:15] buttons {0,1}.
+# Channel split inside the A_DIM=14 action vec: [0:6] sticks+triggers (continuous), [6:14] buttons {0,1}.
 _N_CONT = 6
+
+# Action-vector modality slices over ACTION_CHANNELS (hal.training.features).
+ACTION_MODALITIES: dict[str, slice] = {
+    "main_stick": slice(0, 2),
+    "c_stick": slice(2, 4),
+    "triggers": slice(4, 6),
+    "buttons": slice(6, A_DIM),
+}
+
+
+@jaxtyped(typechecker=beartype)
+def velocity_mse_breakdown(err2: Float[Tensor, "B L_chunk d_action"]) -> dict[str, float]:
+    """Marginal velocity MSE by modality and by horizon (frame offset), from the
+    per-element squared error of ``flow_loss`` (reduction='none').
+
+    ``modality/<name>``: mean over batch, all frames, that modality's channels.
+    ``horizon/frame_<k>``: mean over batch, all channels, chunk position k (k frames
+    into the future). One host sync (a single ``.tolist()``)."""
+    names: list[str] = []
+    vals: list[Tensor] = []
+    for name, sl in ACTION_MODALITIES.items():
+        names.append(f"modality/{name}")
+        vals.append(err2[..., sl].mean())
+    per_frame = err2.mean(dim=(0, 2))  # [L_chunk]
+    for k in range(per_frame.shape[0]):
+        names.append(f"horizon/frame_{k + 1:02d}")
+        vals.append(per_frame[k])
+    return dict(zip(names, torch.stack(vals).tolist()))
 
 
 @torch.no_grad()
@@ -548,6 +589,7 @@ def train(
         with profile("step") as sw:
             opt.zero_grad()
             loss_val = 0.0  # mean loss over the effective (accumulated) batch
+            errs: list[Tensor] = []  # detached per-element squared error per micro-batch
             for _ in range(cfg.grad_accum_steps):
                 try:
                     batch = next(it).to(DEVICE)
@@ -555,9 +597,11 @@ def train(
                     it = iter(train_loader)
                     batch = next(it).to(DEVICE)
                 with autocast:
-                    loss = flow_loss(model, batch) / cfg.grad_accum_steps
+                    err2 = flow_loss(model, batch)
+                    loss = err2.mean() / cfg.grad_accum_steps
                 loss.backward()
                 loss_val += loss.item()
+                errs.append(err2.detach())
             opt.step()
             sched.step()
             if DEVICE == "cuda":
@@ -565,10 +609,14 @@ def train(
                 # not the work, and step_s/samples_per_s read ~10-30x too fast (a real
                 # past footgun). Sync inside the timed block so throughput is honest.
                 torch.cuda.synchronize()
+        # Decompose the train loss over the full effective batch outside the timed
+        # block, so its extra host sync doesn't inflate the throughput measurement.
+        breakdown = velocity_mse_breakdown(torch.cat(errs))
         sps = cfg.batch_size * cfg.grad_accum_steps / sw.elapsed
         wandb.log(
             {
                 "train/loss": loss_val,
+                **{f"train/loss/{k}": v for k, v in breakdown.items()},
                 "train/lr": opt.param_groups[0]["lr"],
                 "throughput/step_s": sw.elapsed,
                 "throughput/samples_per_s": sps,
@@ -593,9 +641,16 @@ def train(
                 uploader=uploader,
             )
         if cfg.val_every > 0 and step > 0 and step % cfg.val_every == 0:
-            vl = val_loss(model, val_cache)
+            vl, vbreak = val_loss(model, val_cache)
             rm = recon_metrics(model, val_cache, n_steps=cfg.n_flow_steps)
-            wandb.log({"val/loss": vl, **{f"val/{k}": v for k, v in rm.items()}}, step=step)
+            wandb.log(
+                {
+                    "val/loss": vl,
+                    **{f"val/loss/{k}": v for k, v in vbreak.items()},
+                    **{f"val/{k}": v for k, v in rm.items()},
+                },
+                step=step,
+            )
             print(
                 f"[t+{time.monotonic() - run_t0:.0f}s] step {step}: val_loss {vl:.4f} "
                 f"recon_btn_f1 {rm['recon_button_f1']:.3f} recon_cont_mae {rm['recon_cont_mae']:.4f}",
@@ -616,9 +671,16 @@ def train(
             wandb.log({f"eval/{k}": v for k, v in metrics.items()}, step=step)
             print(f"[t+{time.monotonic() - run_t0:.0f}s] step {step}: closed_loop {metrics}", flush=True)
 
-    vl_final = val_loss(model, val_cache)
+    vl_final, vbreak_final = val_loss(model, val_cache)
     rm_final = recon_metrics(model, val_cache, n_steps=cfg.n_flow_steps)
-    wandb.log({"val/loss": vl_final, **{f"val/{k}": v for k, v in rm_final.items()}}, step=cfg.max_steps)
+    wandb.log(
+        {
+            "val/loss": vl_final,
+            **{f"val/loss/{k}": v for k, v in vbreak_final.items()},
+            **{f"val/{k}": v for k, v in rm_final.items()},
+        },
+        step=cfg.max_steps,
+    )
     print(f"[final] val_loss {vl_final:.4f} recon {rm_final}", flush=True)
     metrics_final = _eval_and_upload("final")
     wandb.log({f"eval/{k}": v for k, v in metrics_final.items()}, step=cfg.max_steps)
