@@ -69,12 +69,15 @@ REQUIRED_ACCOUNT_VARS = (
 )
 
 
-def build_query(max_price: float, disk: int) -> str:
-    return " ".join((*FILTERS, f"disk_space>={disk}", f"dph_total<{max_price}"))
+def build_query(max_price: float, disk: int, min_vram: int) -> str:
+    q = [*FILTERS, f"disk_space>={disk}", f"dph_total<{max_price}"]
+    if min_vram > 0:  # vast `gpu_ram` query is in GB; 0 = no VRAM floor
+        q.append(f"gpu_ram>={min_vram}")
+    return " ".join(q)
 
 
-def search(vast: VastAI, *, max_price: float, limit: int, disk: int) -> list[dict]:
-    return vast.search_offers(query=build_query(max_price, disk), order=ORDER, limit=limit)
+def search(vast: VastAI, *, max_price: float, limit: int, disk: int, min_vram: int) -> list[dict]:
+    return vast.search_offers(query=build_query(max_price, disk, min_vram), order=ORDER, limit=limit)
 
 
 def print_offers(offers: list[dict]) -> None:
@@ -137,10 +140,10 @@ def preflight(vast: VastAI) -> tuple[str, str | None]:
     return sha, token
 
 
-def queue(vast: VastAI, *, max_price: float, limit: int, disk: int, poll_interval_s: int) -> list[dict]:
+def queue(vast: VastAI, *, max_price: float, limit: int, disk: int, min_vram: int, poll_interval_s: int) -> list[dict]:
     """Poll the market until at least one offer clears the bar; return them ranked."""
     while True:
-        offers = search(vast, max_price=max_price, limit=limit, disk=disk)
+        offers = search(vast, max_price=max_price, limit=limit, disk=disk, min_vram=min_vram)
         if offers:
             return offers
         logger.info(f"no offer <= ${max_price:.2f}/hr clears the bar; retrying in {poll_interval_s}s")
@@ -240,6 +243,10 @@ class Args:
     whole prod MDS on disk (~380 GB decompressed) plus the image + ISO, so shards cache
     once with no eviction/re-download churn across epochs; cache_limit (cfg) caps just
     under as a disk-full guard. Offers are filtered to disk_space >= this."""
+    min_vram: int = 0
+    """Minimum GPU VRAM in GB (vast `gpu_ram`); 0 = no floor. Memory-heavy runs need this
+    so the $/perf ranking doesn't land them on a small card that OOMs (the launcher picks
+    best DLPerf/$ first, which is usually a 12-16 GB card)."""
     limit: int = 10
     """How many offers to fetch/print."""
     poll_interval_s: int = 30
@@ -256,7 +263,7 @@ def main(args: Args) -> None:
     vast = VastAI()
 
     if not args.cmd:
-        print_offers(search(vast, max_price=args.max_price, limit=args.limit, disk=args.disk))
+        print_offers(search(vast, max_price=args.max_price, limit=args.limit, disk=args.disk, min_vram=args.min_vram))
         logger.info("search-only (pass a training command after `--` to launch). Nothing rented.")
         return
 
@@ -267,7 +274,7 @@ def main(args: Args) -> None:
         env["HAL_KEEP_ALIVE"] = "1"
 
     if args.dry_run:
-        offers = search(vast, max_price=args.max_price, limit=args.limit, disk=args.disk)
+        offers = search(vast, max_price=args.max_price, limit=args.limit, disk=args.disk, min_vram=args.min_vram)
         print_offers(offers)
         login = f"'-u {GHCR_USER} -p *** ghcr.io'" if token else "none (public image)"
         logger.info(f"[dry-run] image={args.image} disk={args.disk}GB runtype=ssh_proxy login={login}")
@@ -278,7 +285,12 @@ def main(args: Args) -> None:
         return
 
     offers = queue(
-        vast, max_price=args.max_price, limit=args.limit, disk=args.disk, poll_interval_s=args.poll_interval_s
+        vast,
+        max_price=args.max_price,
+        limit=args.limit,
+        disk=args.disk,
+        min_vram=args.min_vram,
+        poll_interval_s=args.poll_interval_s,
     )
     print_offers(offers)
     # Try offers best-first; a stuck/dead box (e.g. a host that can't provision the
