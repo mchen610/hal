@@ -25,6 +25,7 @@ import warnings
 from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from pathlib import Path
 
 import melee
@@ -90,6 +91,12 @@ class TrainConfig:
     # window / chunking
     L_ctx: int = 256
     L_chunk: int = 16
+    # multi-position supervision: number of context positions to supervise per sequence
+    # each step (random subset, redrawn per step). Adjacent positions predict overlapping
+    # chunks, so the learning signal is sublinear in L_ctx — sampling K << L_ctx cuts the
+    # per-position head's flattened batch (and thus its compute) ~L_ctx/K with little loss.
+    # -1 supervises every valid position (the original all-positions objective).
+    train_positions: int = 64
     # inference
     n_flow_steps: int = 8
     # optimization
@@ -130,7 +137,8 @@ class TrainConfig:
     # stalls. ~3 shards' worth starts after pulling ~17 GB while still mixing shard order.
     shuffle_block_size: int = 2000
     val_split: str = "val"  # tiny datasets may have an empty val split; point this at "test"/"train"
-    num_workers: int = 8
+    num_workers: int = 16  # data-pipeline-bound: the per-batch numpy preprocess + shard
+    # decompress is CPU-heavy, so feed the GPU from more cores (cloud boxes have 24-36).
     prefetch_factor: int = 8
 
 
@@ -318,7 +326,12 @@ def _position_targets(ctx: Context, target: Tensor, H: int) -> tuple[Tensor, Ten
 
 
 def flow_loss(
-    model: FlowMatchingPolicy, batch: TrainBatch, *, gen: torch.Generator | None = None, multi: bool = True
+    model: FlowMatchingPolicy,
+    batch: TrainBatch,
+    *,
+    gen: torch.Generator | None = None,
+    multi: bool = True,
+    max_positions: int = -1,
 ) -> Float[Tensor, "N L_chunk d_action"]:
     """Per-element conditional flow-matching squared error on the velocity (unreduced),
     over the supervised context positions flattened into ``N``.
@@ -337,6 +350,15 @@ def flow_loss(
     tgt, valid = _position_targets(ctx, batch.target, H)
     if not multi:
         valid = valid & (torch.arange(T, device=hidden.device)[None, :] == T - 1)
+    elif 0 < max_positions < T:
+        # Supervise a random ``max_positions`` of each row's valid positions (the head's
+        # flattened batch — and its compute — scales with the count kept). Rank valid
+        # positions by uniform noise, take the top-K; invalid positions score below 0 so
+        # they only enter the top-K in rows with fewer than K valid, where ``valid &`` drops
+        # them. Redrawn each step via ``gen``, so every position is supervised in expectation.
+        scores = torch.rand(B, T, device=hidden.device, generator=gen).masked_fill(~valid, -1.0)
+        keep = torch.zeros_like(valid).scatter_(1, scores.topk(max_positions, dim=1).indices, True)
+        valid = valid & keep
     sel = valid.reshape(B * T)
     cond = hidden.reshape(B * T, -1)[sel]
     tgt = tgt.reshape(B * T, H, A_DIM)[sel]
@@ -648,7 +670,7 @@ def train(
                     it = iter(train_loader)
                     batch = next(it).to(DEVICE)
                 with autocast:
-                    err2 = flow_loss(model, batch)
+                    err2 = flow_loss(model, batch, max_positions=cfg.train_positions)
                     loss = err2.mean() / cfg.grad_accum_steps
                 loss.backward()
                 loss_val += loss.item()
@@ -905,7 +927,16 @@ def main(args: Args) -> None:
         state = load_for_resume(args.resume, Path("runs") / args.resume, device=DEVICE)
         if state is None:
             raise SystemExit(f"no latest.pt for run {args.resume!r} (local or R2)")
-        cfg = TrainConfig(**state["cfg"])
+        # Model/optimizer cfg must match the checkpoint, but host-scaling and objective
+        # knobs (worker count, supervised-position budget) are not training state — let
+        # them follow the current code so a resume picks up dataloader/throughput fixes.
+        d = TrainConfig()
+        cfg = replace(
+            TrainConfig(**state["cfg"]),
+            num_workers=d.num_workers,
+            prefetch_factor=d.prefetch_factor,
+            train_positions=d.train_positions,
+        )
         stats = load_consolidated_stats(Path(cfg.data_root) / "stats.json")
         train(cfg, stats, resume_run=args.resume, resume_state=state)
         return
