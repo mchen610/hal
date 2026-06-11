@@ -504,7 +504,8 @@ def make_policy(
     s: int | None = None,
 ) -> RecedingHorizon:
     """Fresh open-loop closed-loop policy for one eval wave (rolling state must not leak).
-    The driver replans every ``s`` frames (default ``L_chunk``), decoding one chunk from the
+    The driver replans every ``s`` frames (default 1: per-frame replanning — 16 frames of
+    open-loop execution is longer than human reaction time), decoding one chunk from the
     last context position and executing its first ``s`` actions. ``decode_mode``/``decode_temp``
     override ``cfg`` for a test-time decode sweep (the AR analog of the flow policies'
     ``n_flow_steps`` override) without retraining; ``s`` overrides the execution horizon to
@@ -523,7 +524,7 @@ def make_policy(
         stats=stats,
         L_ctx=cfg.L_ctx,
         L_chunk=cfg.L_chunk,
-        s=cfg.L_chunk if s is None else s,
+        s=1 if s is None else s,
         d=0,
         device=device,
     )
@@ -1026,7 +1027,7 @@ def eval_control_freq(
     """D1 diagnostic: closed-loop control-frequency sweep on FD vs lvl-9 CPU, WITHOUT retraining.
 
     A trained chunk model decodes ``L_chunk`` actions per replan; the execution horizon ``s``
-    controls how many it commits before replanning. ``s=L_chunk`` is the trained open-loop default
+    controls how many it commits before replanning. ``s=L_chunk`` is the full-chunk open-loop extreme
     (~267 ms of unreactive input); ``s=1`` replans every frame using only the next-frame prediction
     (the old AR every-frame regime). A large ``stocks_taken`` gap from ``s=1`` to ``s=L_chunk``
     implicates control frequency rather than model quality. Same checkpoint, same decode."""
@@ -1036,7 +1037,7 @@ def eval_control_freq(
     reps = replicas or cfg.eval_replicas
     replay_dir = Path(ckpt_path).resolve().parent / "eval_replays"
     replay_dir.mkdir(parents=True, exist_ok=True)
-    # de-dup and always include the trained default L_chunk as the reference point
+    # de-dup and always include the full-chunk horizon L_chunk as the reference point
     horizons = sorted({s for s in (*s_values, cfg.L_chunk) if 0 < s <= cfg.L_chunk})
     print(
         f"[d1] {ckpt_path}  step={state['step']}  decode={mode} temp={temp}  "

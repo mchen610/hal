@@ -674,7 +674,7 @@ def make_policy(
         stats=stats,
         L_ctx=cfg.L_ctx,
         L_chunk=cfg.L_chunk,
-        s=cfg.L_chunk if s is None else s,
+        s=1 if s is None else s,
         d=0,
         device=device,
     )
@@ -1128,7 +1128,7 @@ def eval_control_freq(
     max_frames: int = 7200,
 ) -> None:
     """D1 diagnostic: closed-loop control-frequency sweep on FD vs lvl-9 CPU, WITHOUT retraining
-    (verbatim semantics from 005). ``s=L_chunk`` is the trained open-loop default; ``s=1``
+    (verbatim semantics from 005). ``s=L_chunk`` is the full-chunk open-loop extreme; ``s=1``
     replans every frame using only the next-frame prediction."""
     model, cfg, stats, state = _load_ckpt(ckpt_path)
     mode = decode_mode or cfg.decode
@@ -1136,7 +1136,7 @@ def eval_control_freq(
     reps = replicas or cfg.eval_replicas
     replay_dir = Path(ckpt_path).resolve().parent / "eval_replays"
     replay_dir.mkdir(parents=True, exist_ok=True)
-    # de-dup and always include the trained default L_chunk as the reference point
+    # de-dup and always include the full-chunk horizon L_chunk as the reference point
     horizons = sorted({s for s in (*s_values, cfg.L_chunk) if 0 < s <= cfg.L_chunk})
     print(
         f"[d1] {ckpt_path}  step={state['step']}  decode={mode} temp={temp}  "

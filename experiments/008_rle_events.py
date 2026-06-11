@@ -754,7 +754,7 @@ def make_policy(
         stats=stats,
         L_ctx=cfg.L_ctx,
         L_chunk=cfg.L_chunk,
-        s=cfg.L_chunk if s is None else s,
+        s=1 if s is None else s,
         d=0,
         device=device,
     )
@@ -1178,8 +1178,8 @@ def eval_control_freq(
     max_frames: int = 7200,
 ) -> None:
     """D1 diagnostic: closed-loop control-frequency sweep on FD vs lvl-9 CPU, WITHOUT retraining
-    (see 005). ``s`` is the execution horizon; ``s=1`` replans every frame, ``s=L_chunk`` is the
-    trained open-loop default."""
+    (see 005). ``s`` is the execution horizon; ``s=1`` replans every frame (the deployed default), ``s=L_chunk`` is the
+    full-chunk open-loop extreme."""
     model, cfg, stats, state = _load_ckpt(ckpt_path)
     mode = decode_mode or cfg.decode
     temp = cfg.decode_temp if decode_temp is None else decode_temp

@@ -574,7 +574,8 @@ def make_policy(
     s: int | None = None,
 ) -> RecedingHorizon:
     """Fresh open-loop closed-loop policy for one eval wave (rolling state must not leak).
-    The driver replans every ``s`` frames (default ``L_chunk``), decoding one chunk from the
+    The driver replans every ``s`` frames (default 1: per-frame replanning — 16 frames of
+    open-loop execution is longer than human reaction time), decoding one chunk from the
     last context position and executing its first ``s`` actions. ``decode_mode``/``decode_temp``
     override ``cfg`` for a test-time decode sweep without retraining; ``s`` overrides the
     execution horizon to probe control frequency. Closed-loop sampling draws fresh randomness each
@@ -592,7 +593,7 @@ def make_policy(
         stats=stats,
         L_ctx=cfg.L_ctx,
         L_chunk=cfg.L_chunk,
-        s=cfg.L_chunk if s is None else s,
+        s=1 if s is None else s,
         d=0,
         device=device,
     )
@@ -980,7 +981,7 @@ def eval_control_freq(
     """D1 diagnostic: closed-loop control-frequency sweep on FD vs lvl-9 CPU, WITHOUT retraining.
 
     A trained chunk model decodes ``L_chunk`` actions per replan; the execution horizon ``s``
-    controls how many it commits before replanning. ``s=L_chunk`` is the trained open-loop default;
+    controls how many it commits before replanning. ``s=L_chunk`` is the full-chunk open-loop extreme;
     ``s=1`` replans every frame using only the next-frame prediction (the old AR every-frame
     regime). A large ``stocks_taken`` gap from ``s=1`` to ``s=L_chunk`` implicates control
     frequency rather than model quality. Same checkpoint, same decode."""
