@@ -47,7 +47,6 @@ ONSTART_PATH = Path(__file__).resolve().parents[1] / "docker" / "on-start.sh"
 FILTERS = (
     "num_gpus=1",
     "total_flops>=28",  # >= 28 TFLOPS
-    "dlperf>20",
     "dlperf_usd>70",  # DLPerf per $/hr
     "reliability>0.96",  # > 96%
     "inet_down>300",  # > 300 Mbps down
@@ -113,11 +112,11 @@ def value_metric(offer: dict, *, disk: int, data_gb: float, upload_gb: float, ru
     return amortized_dph(offer, disk=disk, data_gb=data_gb, upload_gb=upload_gb, run_hours=run_hours) / offer["dlperf"]
 
 
-def build_query(max_price: float, disk: int, min_vram: int) -> str:
+def build_query(max_price: float, disk: int, min_vram: int, min_dlperf: float) -> str:
     # dph_total<max_price is a safe coarse prefilter: effective_dph >= dph_total, so any
     # offer clearing the effective cap also clears this. The real (disk-inclusive) cap is
     # enforced client-side in search(), since storage_cost*disk isn't expressible here.
-    q = [*FILTERS, f"disk_space>={disk}", f"dph_total<{max_price}"]
+    q = [*FILTERS, f"disk_space>={disk}", f"dph_total<{max_price}", f"dlperf>={min_dlperf}"]
     if min_vram > 0:  # vast `gpu_ram` query is in GB; 0 = no VRAM floor
         q.append(f"gpu_ram>={min_vram}")
     return " ".join(q)
@@ -130,13 +129,14 @@ def search(
     limit: int,
     disk: int,
     min_vram: int,
+    min_dlperf: float,
     data_gb: float,
     upload_gb: float,
     run_hours: float,
 ) -> list[dict]:
     """Offers whose *effective* $/hr (GPU + provisioned disk) clears --max-price, ranked by the
     value metric (eff$/dlperf/hr, transfers folded in) — best bang-for-buck first."""
-    offers = vast.search_offers(query=build_query(max_price, disk, min_vram), order=ORDER, limit=limit)
+    offers = vast.search_offers(query=build_query(max_price, disk, min_vram, min_dlperf), order=ORDER, limit=limit)
     qualifying = [o for o in offers if effective_dph(o, disk) <= max_price]
     qualifying.sort(
         key=lambda o: value_metric(o, disk=disk, data_gb=data_gb, upload_gb=upload_gb, run_hours=run_hours)
@@ -217,6 +217,7 @@ def queue(
     limit: int,
     disk: int,
     min_vram: int,
+    min_dlperf: float,
     data_gb: float,
     upload_gb: float,
     run_hours: float,
@@ -230,6 +231,7 @@ def queue(
             limit=limit,
             disk=disk,
             min_vram=min_vram,
+            min_dlperf=min_dlperf,
             data_gb=data_gb,
             upload_gb=upload_gb,
             run_hours=run_hours,
@@ -339,6 +341,10 @@ class Args:
     """Minimum GPU VRAM in GB (vast `gpu_ram`); 0 = no floor. Memory-heavy runs need this
     so the $/perf ranking doesn't land them on a small card that OOMs (the launcher picks
     best DLPerf/$ first, which is usually a 12-16 GB card)."""
+    min_dlperf: float = 20.0
+    """Minimum raw DLPerf score (vast `dlperf`). A floor on absolute throughput — the $/perf
+    ranking alone can pick a slow-but-cheap card; raise this to force a faster GPU regardless
+    of value. Distinct from the dlperf_usd>70 perf-per-dollar filter."""
     limit: int = 10
     """How many offers to fetch/print."""
     poll_interval_s: int = 30
@@ -370,6 +376,7 @@ def main(args: Args) -> None:
         limit=args.limit,
         disk=args.disk,
         min_vram=args.min_vram,
+        min_dlperf=args.min_dlperf,
         data_gb=args.data_gb,
         upload_gb=args.upload_gb,
         run_hours=args.run_hours,
