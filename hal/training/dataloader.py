@@ -151,6 +151,7 @@ def make_loader(
     shuffle_block_size: int | None = None,
     num_workers: int = 4,
     prefetch_factor: int = 4,
+    predownload: int | None = None,
 ) -> DataLoader:
     """Build the (StreamingDataset → WindowDataset → DataLoader) chain. The
     DataLoader yields ``TrainBatch`` (preprocessing runs in the workers).
@@ -178,6 +179,15 @@ def make_loader(
     live behavior would be a per-batch ``len(batch[0])`` sample count — which a
     ``TrainBatch`` (not dict/Tensor) can't satisfy. StreamingDataset still owns
     sharding/shuffle; it's iterated inside the sampler."""
+    # ``predownload`` is how many samples each worker fetches ahead — the shard-prefetch
+    # depth that pipelines remote (R2) downloads. StreamingDataset ties its default to
+    # batch_size (``8 * batch_size``) and we pass batch_size=1, so it was only 8: the fast
+    # GPU stalled on every shard miss. Set it explicitly for the *remote* path. For a
+    # local-only dataset there's no download latency to hide — and over-prefetching a
+    # partial local cache would try to fetch shards that aren't there — so keep streaming's
+    # conservative default there.
+    if predownload is None:
+        predownload = 8 * batch_size if remote else None
     mds = StreamingDataset(
         remote=f"{remote}/{split}" if remote else None,
         local=str(Path(data_root) / split),
@@ -185,6 +195,7 @@ def make_loader(
         shuffle=(split == "train"),
         cache_limit=cache_limit if remote else None,
         shuffle_block_size=shuffle_block_size,
+        predownload=predownload,
     )
     sampler = WindowDataset(mds, L_ctx, L_chunk, seed=seed)
     collate = functools.partial(collate_train_batch, stats=stats, L_ctx=L_ctx)
