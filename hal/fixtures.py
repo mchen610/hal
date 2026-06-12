@@ -81,13 +81,15 @@ ISO: Final[Fixture] = Fixture(
     dest=Path("data/emulator/ssbm.ciso"),
 )
 # Our fork of vladfi1's exi-ai-0.2.0 with stock trigger pipe semantics restored
-# (see the exi-ai-0.2.1 release notes; validated by
-# tests/test_roundtrip.py::test_analog_sweep_reads_back_grid_exact).
+# (exi-ai-0.2.1), rebuilt on Ubuntu 24.04 as 0.2.2 so the AppImage's glibc floor
+# (2.39) runs on the cloud training container; 0.2.1 was packaged against glibc
+# 2.42/2.43 and crashed closed-loop eval there. Same source commit (7aca941);
+# validated by tests/test_roundtrip.py::test_analog_sweep_reads_back_grid_exact.
 DOLPHIN_EXIAI: Final[Fixture] = Fixture(
     name="dolphin-exiai",
-    url="https://github.com/ericyuegu/slippi-Ishiiruka/releases/download/exi-ai-0.2.1/Slippi_Online-x86_64-ExiAI.AppImage",
-    sha256="7f2e5ab4a65482cf164125dd7bbf0b1f8b997c0fd4d4435b71bd7fc8c6816cb4",
-    size_bytes=114_711_032,
+    url="https://github.com/ericyuegu/slippi-Ishiiruka/releases/download/exi-ai-0.2.2/Slippi_Online-x86_64-ExiAI.AppImage",
+    sha256="afca6e00868e11403e1ddb7dae11174f2cac19b09964932835e5e8c5f5439f7f",
+    size_bytes=64_035_320,
     dest=Path("data/emulator/exiai"),
     extract="appimage",
 )
