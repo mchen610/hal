@@ -65,8 +65,8 @@ from hal.training.closed_loop import RecedingHorizon
 from hal.training.dataloader import make_loader
 from hal.training.features import A_DIM
 from hal.training.features import ACTION_CHANNELS
+from hal.training.features import CAT_FEATURES
 from hal.training.features import FLOAT_FEATURES
-from hal.training.features import PLAYER_CAT_FEATURES
 from hal.training.features import Context
 from hal.training.features import TrainBatch
 from hal.training.features import stack_actions
@@ -305,11 +305,11 @@ class GPT(nn.Module):
 
         # Gamestate categoricals: one table per feature name, shared across the four players.
         self.cat_embeds = nn.ModuleDict(
-            {name: nn.Embedding(vocab, dim) for name, (vocab, dim) in PLAYER_CAT_FEATURES.items()}
+            {name: nn.Embedding(vocab, dim) for name, (vocab, dim) in CAT_FEATURES.items()}
         )
         self.char_emb = nn.Embedding(cfg.char_vocab, cfg.char_dim)
         self.stage_emb = nn.Embedding(cfg.stage_vocab, cfg.stage_dim)
-        per_player = len(FLOAT_FEATURES) * 2 + sum(dim for _, dim in PLAYER_CAT_FEATURES.values())  # float+mask+cat
+        per_player = len(FLOAT_FEATURES) * 2 + sum(dim for _, dim in CAT_FEATURES.values())  # float+mask+cat
         d_in = len(_PLAYER_PREFIXES) * per_player + A_DIM + 2 * cfg.char_dim + cfg.stage_dim
 
         self.ctx_proj = nn.Linear(d_in, cfg.d_model)
@@ -329,7 +329,7 @@ class GPT(nn.Module):
         for feat in FLOAT_FEATURES:
             mk = f"{prefix}_{feat}_mask"
             parts.append(features[mk][..., None] if mk in features else torch.zeros(B, L, 1, device=device))
-        for name, (vocab, _) in PLAYER_CAT_FEATURES.items():
+        for name, (vocab, _) in CAT_FEATURES.items():
             parts.append(self.cat_embeds[name](features[f"{prefix}_{name}"].clamp(0, vocab - 1)))
         return torch.cat(parts, dim=-1)
 
