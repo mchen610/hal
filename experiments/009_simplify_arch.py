@@ -27,7 +27,10 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import contextlib
 import itertools
+import json
 import math
+import subprocess
+import sys
 import time
 from dataclasses import asdict
 from dataclasses import dataclass
@@ -135,9 +138,12 @@ class TrainConfig:
     eval_max_frames: int = 7200
     eval_replicas: int = 16
     eval_max_parallel: int = 8
+    # Closed-loop eval always runs in a background subprocess (training keeps using the GPU); the
+    # trainer drains its result between steps. If a prior eval is still running at the next boundary
+    # the trainer waits for it, bounded by eval_timeout_seconds (then kills the worker).
+    eval_timeout_seconds: float = 900.0
     # checkpointing
     ckpt_every: int = 2048
-    push_to_r2: bool = True
     # data (v4 MDS carries the stage + p{1,2}_character + nana columns)
     data_root: str = "data/processed/ranked-anonymized-1/mds"
     cache_limit_gb: int = 440
@@ -455,8 +461,9 @@ def lr_schedule(cfg: TrainConfig):
 
 
 def nll_breakdown(comps: dict[str, Tensor]) -> dict[str, float]:
-    """Per-group modality NLL (bits) + total bits/frame, from the per-group ``[n_valid]`` nats."""
-    out = {f"modality/{name}": (c.mean().item() / _LN2) for name, c in comps.items()}
+    """Per-group NLL (bits) + ``total`` bits/frame, from the per-group ``[n_valid]`` nats. Flat keys
+    (``buttons``/``main_stick``/``c_stick``/``triggers``/``total``) so callers land in one W&B section."""
+    out = {name: (c.mean().item() / _LN2) for name, c in comps.items()}
     out["total"] = sum(c.mean() for c in comps.values()).item() / _LN2
     return out
 
@@ -485,15 +492,17 @@ def val_metrics(model: GPT, val_cache: list[TrainBatch], cfg: TrainConfig) -> di
         btn_tgts.append(tgt_btn)
         multipress.append((tgt_btn > 0.5).sum(-1) >= 2)
     comps = {k: torch.cat(v) for k, v in comps_cat.items()}
-    out = {f"loss/{k}": v for k, v in nll_breakdown(comps).items()}
-    out["action_nll_bits_per_frame"] = sum(c.mean() for c in comps.values()).item() / _LN2
-    out["cont_discrete_bits"] = (
-        comps["main_stick"].mean() + comps["c_stick"].mean() + comps["triggers"].mean()
-    ).item() / _LN2
+    nll = nll_breakdown(comps)
     logloss, brier = scoring.bernoulli_scores_from_probs(torch.cat(btn_probs), torch.cat(btn_tgts))
-    out["buttons/logloss_bits"] = logloss.item()
-    out["buttons/brier"] = brier.item()
-    out["buttons/multipress_rate"] = torch.cat(multipress).float().mean().item()
+    out = {
+        "loss": nll["total"],  # total bits/frame (== action NLL); per-group below
+        **{f"nll_{name}": nll[name] for name in _GROUP_NAMES},
+        "cont_discrete_bits": (comps["main_stick"].mean() + comps["c_stick"].mean() + comps["triggers"].mean()).item()
+        / _LN2,
+        "btn_logloss": logloss.item(),
+        "btn_brier": brier.item(),
+        "btn_multipress": torch.cat(multipress).float().mean().item(),
+    }
     if was_training:
         model.train()
     return out
@@ -565,7 +574,7 @@ def train(
     resume_state: dict | None = None,
 ) -> None:
     run_name = resume_run or make_run_name(_model_tag(cfg), cfg.data_root, comment)
-    uploader = BackgroundUploader(run_name) if cfg.push_to_r2 else None
+    uploader = BackgroundUploader(run_name)
     wandb.init(
         project="hal",
         name=run_name,
@@ -574,6 +583,11 @@ def train(
         tags=["gpt", f"d{cfg.d_model}", f"L{cfg.n_layers}"],
         config=asdict(cfg),
     )
+    # W&B's own step is a free-running monotonic timestamp; we plot everything against the training
+    # step logged as data (``global_step``). This lets an async eval that *finishes* late be logged
+    # at its *origin* step without violating step monotonicity.
+    wandb.define_metric("global_step")
+    wandb.define_metric("*", step_metric="global_step")
     ckpt_dir, replay_dir = setup_run_dir(run_name)
 
     torch.manual_seed(cfg.seed)
@@ -630,27 +644,31 @@ def train(
         return wandb.run.id if wandb.run is not None else None
 
     def _eval_and_upload(step_tag: str) -> dict[str, float]:
+        """Synchronous closed-loop eval on the live model + .slp upload (the final eval).
+        Returns the flat metric dict."""
         sub = replay_dir / step_tag
         metrics = eval_vs_cpu(model, stats, cfg, max_frames=cfg.eval_max_frames, replay_dir=sub)
-        if uploader is not None:
-            n = uploader.upload_tree(sub, base=ckpt_dir, pattern="*.slp")
-            print(f"[eval] queued {n} .slp for R2 ({step_tag})", flush=True)
+        n = uploader.upload_tree(sub, base=ckpt_dir, pattern="*.slp")
+        print(f"[eval] queued {n} .slp for R2 ({step_tag})", flush=True)
         return metrics
 
-    def _log_val(step: int) -> dict[str, float]:
+    def _val_log_dict() -> dict[str, float]:
+        """Flat ``val/*`` metric dict (one W&B section). Merged into the per-step log; no wandb.log here."""
         vm = val_metrics(model, val_cache, cfg)
         gen = torch.Generator(device=DEVICE).manual_seed(0)
-        rm_arg = recon_metrics(model, val_cache, argmax=True)
-        rm_smp = recon_metrics(model, val_cache, argmax=False, temp=cfg.decode_temp, gen=gen)
-        wandb.log(
-            {
-                **{f"val/{k}": v for k, v in vm.items()},
-                **{f"val/argmax/{k}": v for k, v in rm_arg.items()},
-                **{f"val/sample/{k}": v for k, v in rm_smp.items()},
-            },
-            step=step,
-        )
-        return vm
+        recon = {"argmax": recon_metrics(model, val_cache, argmax=True)}
+        recon["sample"] = recon_metrics(model, val_cache, argmax=False, temp=cfg.decode_temp, gen=gen)
+        out = {f"val/{k}": v for k, v in vm.items()}
+        for tag, rm in recon.items():
+            out[f"val/recon_{tag}_acc"] = rm["recon_button_acc"]
+            out[f"val/recon_{tag}_f1"] = rm["recon_button_f1"]
+            out[f"val/recon_{tag}_mae"] = rm["recon_cont_mae"]
+        return out
+
+    def _log_eval(step: int, metrics: dict[str, float]) -> None:
+        """Sole eval-logging site: plot ``eval/*`` at the eval's origin ``global_step``."""
+        wandb.log({**{f"eval/{k}": v for k, v in metrics.items()}, "global_step": step})
+        print(f"[t+{time.monotonic() - run_t0:.0f}s] step {step}: closed_loop {metrics}", flush=True)
 
     def _save(name: str, step: int) -> None:
         save_checkpoint(
@@ -664,13 +682,89 @@ def train(
             uploader=uploader,
         )
 
+    # At most one async eval in flight. The worker is a separate process (own GPU/CUDA + GIL) that
+    # evals the just-saved checkpoint and writes a metrics JSON; the trainer drains it between steps.
+    pending_eval: dict | None = None
+
+    def _drain_eval(*, wait: bool) -> None:
+        """Reap the in-flight eval. ``wait`` blocks (bounded by ``eval_timeout_seconds``) for the
+        result; otherwise just polls. A worker over budget is killed. On success: log + upload .slp."""
+        nonlocal pending_eval
+        if pending_eval is None:
+            return
+        proc: subprocess.Popen = pending_eval["proc"]
+        if wait:
+            try:
+                proc.wait(timeout=max(0.0, cfg.eval_timeout_seconds - (time.monotonic() - pending_eval["t0"])))
+            except subprocess.TimeoutExpired:
+                pass
+        rc = proc.poll()
+        if rc is None:
+            if not wait and (time.monotonic() - pending_eval["t0"]) <= cfg.eval_timeout_seconds:
+                return  # still running, within budget — re-check next iteration
+            proc.kill()
+            proc.wait()
+            print(
+                f"[eval] step {pending_eval['step']} timed out (>{cfg.eval_timeout_seconds:.0f}s); "
+                f"killed. see {pending_eval['log']}",
+                flush=True,
+            )
+        else:
+            step, result = pending_eval["step"], pending_eval["result"]
+            if rc == 0 and result.is_file():
+                data = json.loads(result.read_text())
+                _log_eval(data["step"], data["metrics"])
+                n = uploader.upload_tree(pending_eval["replay"], base=ckpt_dir, pattern="*.slp")
+                print(f"[eval] queued {n} .slp for R2 (step {step})", flush=True)
+            else:
+                print(f"[eval] worker for step {step} failed (rc={rc}); see {pending_eval['log']}", flush=True)
+        pending_eval["log_f"].close()
+        pending_eval = None
+
+    def _launch_eval(step: int) -> None:
+        """Save the checkpoint and spawn a background eval worker for it. Waits out any prior eval
+        first (bounded), so only one runs at a time."""
+        nonlocal pending_eval
+        _drain_eval(wait=True)
+        _save(f"step_{step:06d}.pt", step)
+        result = ckpt_dir / "eval_results" / f"step_{step:06d}.json"
+        log = ckpt_dir / "eval_logs" / f"step_{step:06d}.log"
+        result.parent.mkdir(parents=True, exist_ok=True)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log_f = open(log, "w")  # noqa: SIM115 — spans the worker's lifetime; closed in _drain_eval
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--eval-worker",
+                str(ckpt_dir / f"step_{step:06d}.pt"),
+                "--eval-worker-step",
+                str(step),
+                "--eval-worker-result",
+                str(result),
+                "--eval-worker-replay",
+                str(replay_dir / f"step_{step:06d}"),
+            ],
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+        )
+        pending_eval = {
+            "step": step,
+            "proc": proc,
+            "result": result,
+            "replay": replay_dir / f"step_{step:06d}",
+            "log": log,
+            "log_f": log_f,
+            "t0": time.monotonic(),
+        }
+        print(f"[t+{time.monotonic() - run_t0:.0f}s] step {step}: launched async eval (pid {proc.pid})", flush=True)
+
     model.train()
     it = iter(train_loader)
     run_t0 = time.monotonic()
     for step in range(start_step, cfg.max_steps):
         with profile("step") as sw:
             opt.zero_grad()
-            loss_val = 0.0
             comps_acc: dict[str, list[Tensor]] = {}
             for _ in range(cfg.grad_accum_steps):
                 try:
@@ -682,7 +776,6 @@ def train(
                     comps = action_loss(model, batch)
                     loss = sum(comps.values()).mean() / cfg.grad_accum_steps
                 loss.backward()
-                loss_val += loss.item()
                 for k, v in comps.items():
                     comps_acc.setdefault(k, []).append(v.detach())
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf"))  # measure only
@@ -693,48 +786,45 @@ def train(
         breakdown = nll_breakdown({k: torch.cat(v) for k, v in comps_acc.items()})
         sps = cfg.batch_size * cfg.grad_accum_steps / sw.elapsed
         samples = (step + 1) * cfg.batch_size * cfg.grad_accum_steps
-        wandb.log(
-            {
-                "train/loss": loss_val,
-                **{f"train/loss/{k}": v for k, v in breakdown.items()},
-                "train/lr": opt.param_groups[0]["lr"],
-                "train/gnorm": grad_norm.item(),
-                "throughput/step_s": sw.elapsed,
-                "throughput/samples_per_s": sps,
-                "samples": samples,
-                "tokens": samples * cfg.L_ctx,
-            },
-            step=step,
-        )
+        log = {
+            "global_step": step,
+            "samples": samples,
+            "tokens": samples * cfg.L_ctx,
+            "train/loss": breakdown["total"],
+            **{f"train/nll_{name}": breakdown[name] for name in _GROUP_NAMES},
+            "train/lr": opt.param_groups[0]["lr"],
+            "train/gnorm": grad_norm.item(),
+            "train/step_s": sw.elapsed,
+            "train/samples_per_s": sps,
+        }
         if step < 20 or step % 50 == 0:
             print(
-                f"[t+{time.monotonic() - run_t0:.0f}s] step {step}: loss {loss_val:.4f} "
+                f"[t+{time.monotonic() - run_t0:.0f}s] step {step}: loss {breakdown['total']:.4f} "
                 f"step_dt={sw.elapsed * 1000:.0f}ms ({sps:.1f} samples/s)",
                 flush=True,
             )
         if cfg.ckpt_every > 0 and step > 0 and step % cfg.ckpt_every == 0:
             _save("latest.pt", step)
         if cfg.val_every > 0 and step > 0 and step % cfg.val_every == 0:
-            vm = _log_val(step)
+            vm = _val_log_dict()
+            log.update(vm)
             print(
                 f"[t+{time.monotonic() - run_t0:.0f}s] step {step}: "
-                f"action_nll {vm['action_nll_bits_per_frame']:.3f} btn_logloss {vm['buttons/logloss_bits']:.3f}",
+                f"action_nll {vm['val/loss']:.3f} btn_logloss {vm['val/btn_logloss']:.3f}",
                 flush=True,
             )
+        wandb.log(log)
+        _drain_eval(wait=False)
         if cfg.eval_every > 0 and step > 0 and step % cfg.eval_every == 0:
-            _save(f"step_{step:06d}.pt", step)
-            metrics = _eval_and_upload(f"step_{step:06d}")
-            wandb.log({f"eval/{k}": v for k, v in metrics.items()}, step=step)
-            print(f"[t+{time.monotonic() - run_t0:.0f}s] step {step}: closed_loop {metrics}", flush=True)
+            _launch_eval(step)
 
-    vm_final = _log_val(cfg.max_steps)
-    print(f"[final] action_nll {vm_final['action_nll_bits_per_frame']:.3f}", flush=True)
-    metrics_final = _eval_and_upload("final")
-    wandb.log({f"eval/{k}": v for k, v in metrics_final.items()}, step=cfg.max_steps)
-    print(f"[final] closed_loop {metrics_final}", flush=True)
+    _drain_eval(wait=True)  # finish the last async eval before the final pass
+    vm_final = _val_log_dict()
+    wandb.log({**vm_final, "global_step": cfg.max_steps})
+    print(f"[final] action_nll {vm_final['val/loss']:.3f}", flush=True)
+    _log_eval(cfg.max_steps, _eval_and_upload("final"))
     _save("final.pt", cfg.max_steps)
-    if uploader is not None:
-        uploader.close()
+    uploader.close()
 
 
 # %%
@@ -787,6 +877,20 @@ def eval_ckpt(ckpt_path: str, *, decode_temp: float | None = None) -> None:
 
 
 # %%
+def run_eval_worker(ckpt_path: str, step: int, result_path: str, replay_dir: str) -> None:
+    """One-shot closed-loop eval for the async path: load a checkpoint, sweep vs CPU, and write the
+    flat metric dict to ``result_path`` (atomically) with the .slp recordings under ``replay_dir``.
+    Touches neither W&B nor R2 — the launching trainer is the sole writer/uploader."""
+    model, cfg, stats, _ = _load_ckpt(ckpt_path)
+    metrics = eval_vs_cpu(model, stats, cfg, max_frames=cfg.eval_max_frames, replay_dir=Path(replay_dir))
+    out = Path(result_path)
+    tmp = out.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"step": step, "metrics": metrics}))
+    tmp.replace(out)  # atomic rename: the trainer never reads a partial file
+    print(f"[eval-worker] step {step}: {metrics}", flush=True)
+
+
+# %%
 @dataclass
 class Args:
     """Top-level CLI surface. Pass TrainConfig fields as kebab-case flags, e.g. ``--cfg.d-model 512``."""
@@ -796,9 +900,18 @@ class Args:
     eval_temp: float | None = None  # override decode temperature for --eval
     resume: str | None = None  # run_name to resume; pulls latest.pt (local, else R2)
     comment: str = ""
+    # internal: one-shot async-eval worker (the trainer spawns this; not for manual use).
+    eval_worker: str | None = None  # ckpt path
+    eval_worker_step: int = 0
+    eval_worker_result: str | None = None
+    eval_worker_replay: str | None = None
 
 
 def main(args: Args) -> None:
+    if args.eval_worker is not None:
+        assert args.eval_worker_result is not None and args.eval_worker_replay is not None
+        run_eval_worker(args.eval_worker, args.eval_worker_step, args.eval_worker_result, args.eval_worker_replay)
+        return
     if args.eval is not None:
         eval_ckpt(args.eval, decode_temp=args.eval_temp)
         return
