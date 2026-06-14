@@ -100,6 +100,17 @@ class RecordingPolicy:
         return {slot: _NEUTRAL for slot in obs}
 
 
+class RecordingObsPolicy:
+    """Records full observations seen each frame; returns neutral for every slot."""
+
+    def __init__(self) -> None:
+        self.frames: list[Mapping[Slot, dict]] = []
+
+    def __call__(self, frame_index: int, obs: Mapping[Slot, dict]) -> Mapping[Slot, ControllerInputs]:
+        self.frames.append(obs)
+        return {slot: _NEUTRAL for slot in obs}
+
+
 class RaisingPolicy:
     """Stands in for a model forward that blows up (e.g. CUDA OOM) on first call."""
 
@@ -136,6 +147,28 @@ def test_drive_vec_self_play_batches_both_ports_and_skips_internal() -> None:
     assert [len(t) for t in trajs] == [7, 5]  # length + the start frame
     assert set(trajs[0].post) == {1, 2}
     assert set(trajs[1].post) == {1, 2}
+
+
+def test_drive_vec_injects_slippi_character_ids() -> None:
+    matchup = Matchup(
+        stage=melee.Stage.FINAL_DESTINATION,
+        players=(
+            PlayerSetup(port=1, character=melee.Character.FOX),
+            PlayerSetup(port=2, character=melee.Character.MARTH),
+        ),
+    )
+    policy = RecordingObsPolicy()
+
+    drive_vec(
+        [FakeSession(length=2, ports=(1, 2))],
+        [VecMatch(matchup=matchup, model_ports=(1,))],
+        policy,
+        max_frames=3,
+    )
+
+    matchup_meta = policy.frames[0][Slot(0, 1)]["_matchup"]
+    assert matchup_meta["stage"] == int(melee.Stage.FINAL_DESTINATION.value)
+    assert matchup_meta["character"] == {1: 2, 2: 9}
 
 
 def test_drive_vec_isolates_a_crashing_session() -> None:

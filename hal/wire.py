@@ -10,6 +10,7 @@ controller representation and the peppi → MDS → libmelee → Dolphin data fl
 """
 
 from collections.abc import Sequence
+from enum import IntEnum
 from typing import Final
 
 import melee
@@ -159,21 +160,98 @@ def slp_stage_to_libmelee(slp_stage_id: int) -> melee.Stage:
     return stage
 
 
-def slp_character_to_libmelee(slp_character_id: int) -> melee.Character:
-    """slp-native character id -> ``melee.Character`` enum.
+class SlpCharacter(IntEnum):
+    """Slippi game-start/CSS character ids.
 
-    The two value spaces *happen* to coincide today (pinned by
-    ``tests/test_wire_bridges.py``); the bridge exists anyway so intent
-    is explicit and a future divergence shows up as a localized failure.
+    Sourced from https://github.com/hohav/peppi/blob/main/gen/resources/enums/character.json
+
+    These are replay-level character-select ids, which are completely different from
+    libmelee's `melee.Character` which represents a in-game id and have different values for every character.
+
+    `SlpCharacter`'s value detects the character you "start" the game as at frame 0 (allows for Sheik to be the "selected" character).
+
+    libmelee's `melee.Character` can change frame-by-frame, so if you transform from Sheik -> Zelda it would detect that.
     """
-    return melee.Character(slp_character_id)
+
+    CPTFALCON = 0
+    DK = 1
+    FOX = 2
+    GAMEANDWATCH = 3
+    KIRBY = 4
+    BOWSER = 5
+    LINK = 6
+    LUIGI = 7
+    MARIO = 8
+    MARTH = 9
+    MEWTWO = 10
+    NESS = 11
+    PEACH = 12
+    PIKACHU = 13
+    ICE_CLIMBERS = 14
+    JIGGLYPUFF = 15
+    SAMUS = 16
+    YOSHI = 17
+    ZELDA = 18
+    SHEIK = 19
+    FALCO = 20
+    YLINK = 21
+    DOC = 22
+    ROY = 23
+    PICHU = 24
+    GANONDORF = 25
+
+    CAPTAIN_FALCON = 0
+    DONKEY_KONG = 1
+    GAME_AND_WATCH = 3
+    ICECLIMBERS = 14
+    YOUNG_LINK = 21
+    DR_MARIO = 22
+
+SLP_CHARACTER_TO_LIBMELEE: Final[dict[SlpCharacter, melee.Character]] = {
+    SlpCharacter.CPTFALCON: melee.Character.CPTFALCON,
+    SlpCharacter.DK: melee.Character.DK,
+    SlpCharacter.FOX: melee.Character.FOX,
+    SlpCharacter.GAMEANDWATCH: melee.Character.GAMEANDWATCH,
+    SlpCharacter.KIRBY: melee.Character.KIRBY,
+    SlpCharacter.BOWSER: melee.Character.BOWSER,
+    SlpCharacter.LINK: melee.Character.LINK,
+    SlpCharacter.LUIGI: melee.Character.LUIGI,
+    SlpCharacter.MARIO: melee.Character.MARIO,
+    SlpCharacter.MARTH: melee.Character.MARTH,
+    SlpCharacter.MEWTWO: melee.Character.MEWTWO,
+    SlpCharacter.NESS: melee.Character.NESS,
+    SlpCharacter.PEACH: melee.Character.PEACH,
+    SlpCharacter.PIKACHU: melee.Character.PIKACHU,
+    SlpCharacter.ICE_CLIMBERS: melee.Character.POPO,
+    SlpCharacter.JIGGLYPUFF: melee.Character.JIGGLYPUFF,
+    SlpCharacter.SAMUS: melee.Character.SAMUS,
+    SlpCharacter.YOSHI: melee.Character.YOSHI,
+    SlpCharacter.ZELDA: melee.Character.ZELDA,
+    SlpCharacter.SHEIK: melee.Character.SHEIK,
+    SlpCharacter.FALCO: melee.Character.FALCO,
+    SlpCharacter.YLINK: melee.Character.YLINK,
+    SlpCharacter.DOC: melee.Character.DOC,
+    SlpCharacter.ROY: melee.Character.ROY,
+    SlpCharacter.PICHU: melee.Character.PICHU,
+    SlpCharacter.GANONDORF: melee.Character.GANONDORF,
+}
+
+LIBMELEE_CHARACTER_TO_SLP: Final[dict[melee.Character, SlpCharacter]] = {
+    character: slp for slp, character in SLP_CHARACTER_TO_LIBMELEE.items()
+} | {melee.Character.NANA: SlpCharacter.ICE_CLIMBERS}
 
 
-# Standard cast — slp-native ids 0..26 are the playable characters; higher ids
-# (WIRE_FRAME, MASTER_HAND, ...) are non-selectable. Derived rather than
-# enumerated so any libmelee enum update flows through.
-CHARACTERS_BY_NAME: Final[dict[str, int]] = {c.name: int(c.value) for c in melee.Character if 0 <= int(c.value) <= 26}
+def slp_character_to_libmelee(character: SlpCharacter) -> melee.Character:
+    """Slippi game-start character id -> ``melee.Character`` enum."""
+    return SLP_CHARACTER_TO_LIBMELEE[character]
 
+
+def libmelee_character_to_slp(character: melee.Character) -> SlpCharacter:
+    """``melee.Character`` enum -> Slippi game-start character id."""
+    return LIBMELEE_CHARACTER_TO_SLP[character]
+
+
+CHARACTERS_BY_NAME: Final[dict[str, int]] = {name: int(character) for name, character in SlpCharacter.__members__.items()}
 
 # ---------------------------------------------------------------------------
 # Post-frame field naming

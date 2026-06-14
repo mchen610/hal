@@ -35,7 +35,7 @@ def flatten_canonical_frame(frame: dict) -> dict[str, float]:
                 canonical_post_field(follower_post, suffix) if follower_post is not None else MASK_FLOAT
             )
     # Matchup conditioning (SCHEMA_VERSION 4): the driver injects per-match stage + per-port
-    # character (constants, the libmelee Stage/Character values that match the training columns).
+    # character (constants, the libmelee Stage + Slippi character-select ids that match the training columns).
     # Absent unless drive_vec injected them, so non-conditioned experiments are unaffected.
     matchup = frame.get("_matchup")
     if matchup is not None:

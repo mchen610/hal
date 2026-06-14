@@ -1,19 +1,54 @@
-"""Pin the slp-id ↔ libmelee-enum bridges in ``hal.wire``.
-
-Two facts that ARCHITECTURE used to cite from a notebook now live here:
-
-- Character ids identity-map between slp and libmelee today. If a future
-  libmelee update reorders the enum, this test fails loudly instead of
-  silently miscasting characters at the controller-injection boundary.
-- Stage ids do NOT identity-map (slp 2 = Fountain of Dreams; libmelee
-  ``Stage.FOUNTAIN_OF_DREAMS.value`` = 8). All stage conversion must go
-  through ``wire.slp_stage_to_libmelee``.
-"""
+"""Pin Slippi/libmelee id-space bridges in ``hal.wire``."""
 
 import melee
 import pytest
 
 from hal import wire
+
+
+def test_character_ids_do_not_identity_map() -> None:
+    """Fox is the simple example that Slippi start ids and libmelee ids disagree."""
+    fox_slp_id = wire.SlpCharacter.FOX
+    fox_libmelee = wire.slp_character_to_libmelee(fox_slp_id)
+    assert wire.SlpCharacter(2) is wire.SlpCharacter.FOX
+    assert fox_slp_id == 2
+    assert fox_libmelee is melee.Character.FOX
+    assert fox_libmelee.value != fox_slp_id
+
+
+def test_character_cases_resolve_to_libmelee() -> None:
+    cases = {
+        wire.SlpCharacter.CPTFALCON: melee.Character.CPTFALCON,
+        wire.SlpCharacter.FOX: melee.Character.FOX,
+        wire.SlpCharacter.MARTH: melee.Character.MARTH,
+        wire.SlpCharacter.ICE_CLIMBERS: melee.Character.POPO,
+        wire.SlpCharacter.FALCO: melee.Character.FALCO,
+        wire.SlpCharacter.DOC: melee.Character.DOC,
+        wire.SlpCharacter.GANONDORF: melee.Character.GANONDORF,
+    }
+    for slp_character, expected in cases.items():
+        assert wire.slp_character_to_libmelee(slp_character) is expected
+        assert wire.libmelee_character_to_slp(expected) is slp_character
+
+
+def test_character_name_table_uses_slippi_start_ids() -> None:
+    assert wire.SlpCharacter.__members__["FOX"] is wire.SlpCharacter.FOX
+    assert wire.SlpCharacter.__members__["MARTH"] is wire.SlpCharacter.MARTH
+    assert wire.SlpCharacter.__members__["FALCO"] is wire.SlpCharacter.FALCO
+    assert wire.SlpCharacter.__members__["ICE_CLIMBERS"] is wire.SlpCharacter.ICE_CLIMBERS
+    assert (
+        wire.SlpCharacter.__members__["DR_MARIO"]
+        is wire.SlpCharacter.__members__["DOC"]
+        is wire.SlpCharacter.DOC
+    )
+
+
+def test_unknown_character_raises() -> None:
+    with pytest.raises(ValueError, match="not a valid SlpCharacter"):
+        wire.SlpCharacter(9999)
+
+    with pytest.raises(KeyError):
+        wire.libmelee_character_to_slp(melee.Character.UNKNOWN_CHARACTER)
 
 # Tournament-legal slp-native stage ids. The slp ↔ libmelee id spaces disagree
 # (e.g. slp 2 = Fountain of Dreams, libmelee.Stage.FOUNTAIN_OF_DREAMS.value=8);
@@ -26,16 +61,6 @@ _LEGAL_STAGES_BY_NAME: dict[str, int] = {
     "BATTLEFIELD": 31,
     "FINAL_DESTINATION": 32,
 }
-
-
-def test_character_ids_identity_map_today() -> None:
-    """Every standard-cast slp character id round-trips to the same libmelee enum value."""
-    for name, slp_id in wire.CHARACTERS_BY_NAME.items():
-        libmelee_char = wire.slp_character_to_libmelee(slp_id)
-        assert libmelee_char.value == slp_id, (
-            f"{name}: slp id {slp_id} → libmelee {libmelee_char!r} with value "
-            f"{libmelee_char.value}. The two id spaces have diverged; update the bridge."
-        )
 
 
 def test_stage_ids_do_not_identity_map() -> None:

@@ -22,9 +22,8 @@ from hal.wire import BUTTON_BITS
 # 4: (a) re-add the global ``stage`` + per-player ``p{1,2}_character`` columns
 #    (dropped at v3's predecessor) as per-replay constants broadcast across
 #    frames, so the policy can condition on matchup again. ``stage`` is stored
-#    as the libmelee ``Stage`` value (not slp-native) so it matches the
-#    closed-loop obs without a second translation; ``character`` slp-native id
-#    already equals the libmelee ``Character`` value.
+#    as the libmelee ``Stage`` value (not slp-native); ``character`` is the
+#    Slippi game-start/external id (not libmelee ``Character.value``).
 #    (b) logical-only controller block: drop the raw stick byte columns and the
 #    fused ``trigger_logical``; rename ``trigger_{l,r}_physical`` →
 #    ``trigger_{l,r}`` with sub-deadzone values zeroed (wire.TRIGGER_DEADZONE).
@@ -87,6 +86,7 @@ def _nana_columns(prefix: str) -> dict[str, DTypeLike]:
 
 # ``stage`` + ``p{1,2}_character`` are per-replay constants broadcast across frames
 # (not in peppi's per-frame post block) — see extract.broadcast and SCHEMA_VERSION 4.
+# Stage uses libmelee ``Stage.value``; character uses Slippi game-start/external ids.
 MDS_PER_FRAME_DTYPES: dict[str, DTypeLike] = {
     "frame": np.int32,
     "stage": np.int32,
