@@ -179,9 +179,12 @@ def extract_replay(replay_path: str) -> dict[str, np.ndarray] | None:
 
     sample: dict[str, np.ndarray] = {
         "frame": kept_frame_ids[in_game],
-        # Per-replay constants broadcast across frames (SCHEMA_VERSION 4): stage as the
-        # libmelee Stage value (matches the closed-loop obs without a second translation);
-        # character is slp-native == libmelee Character value, broadcast per player below.
+        # Per-replay constants broadcast across frames (SCHEMA_VERSION 4). Stage is stored as
+        # the libmelee Stage value (matches the closed-loop obs without a second translation).
+        # Character (below) is stored as the raw slp start-block id, which is the EXTERNAL /
+        # character-select id — NOT the libmelee Character value (Fox is 2 here vs
+        # Character.FOX=1). Closed-loop eval encodes its matchup character into this same
+        # external space (wire.libmelee_character_to_slp) so conditioning stays consistent.
         "stage": np.full(out_length, int(slp_stage_to_libmelee(int(g.start.stage)).value), dtype=np.int32),
     }
 

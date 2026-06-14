@@ -2,9 +2,12 @@
 
 Two facts that ARCHITECTURE used to cite from a notebook now live here:
 
-- Character ids identity-map between slp and libmelee today. If a future
-  libmelee update reorders the enum, this test fails loudly instead of
-  silently miscasting characters at the controller-injection boundary.
+- Character ids do NOT identity-map. slp start-block ids are EXTERNAL/CSS ids
+  (Fox=2, Falco=20); libmelee's ``Character`` enum is internal (Fox=1,
+  Falco=22). Reading one as the other silently miscasts every character. All
+  conversion goes through ``wire.slp_character_to_libmelee`` (external→enum)
+  and ``wire.libmelee_character_to_slp`` (enum→external). Anchors below are
+  verified against post-frame internal ids in real replays.
 - Stage ids do NOT identity-map (slp 2 = Fountain of Dreams; libmelee
   ``Stage.FOUNTAIN_OF_DREAMS.value`` = 8). All stage conversion must go
   through ``wire.slp_stage_to_libmelee``.
@@ -28,14 +31,62 @@ _LEGAL_STAGES_BY_NAME: dict[str, int] = {
 }
 
 
-def test_character_ids_identity_map_today() -> None:
-    """Every standard-cast slp character id round-trips to the same libmelee enum value."""
-    for name, slp_id in wire.CHARACTERS_BY_NAME.items():
-        libmelee_char = wire.slp_character_to_libmelee(slp_id)
-        assert libmelee_char.value == slp_id, (
-            f"{name}: slp id {slp_id} → libmelee {libmelee_char!r} with value "
-            f"{libmelee_char.value}. The two id spaces have diverged; update the bridge."
-        )
+# slp EXTERNAL id -> libmelee internal Character. Anchors empirically verified
+# against post-frame internal character ids across 399 mang0 replays.
+_EXTERNAL_TO_CHARACTER_ANCHORS: dict[int, melee.Character] = {
+    0: melee.Character.CPTFALCON,
+    1: melee.Character.DK,
+    2: melee.Character.FOX,
+    8: melee.Character.MARIO,
+    9: melee.Character.MARTH,
+    14: melee.Character.POPO,  # Ice Climbers
+    15: melee.Character.JIGGLYPUFF,
+    19: melee.Character.SHEIK,
+    20: melee.Character.FALCO,
+    25: melee.Character.GANONDORF,
+}
+
+
+def test_slp_external_character_maps_to_internal() -> None:
+    """slp start-block ids are external/CSS ids; the bridge must translate them
+    to libmelee's internal Character enum (NOT reinterpret the integer)."""
+    for slp_id, char in _EXTERNAL_TO_CHARACTER_ANCHORS.items():
+        assert wire.slp_character_to_libmelee(slp_id) is char
+
+
+def test_external_fox_is_not_read_as_internal() -> None:
+    """Regression witness: the old bridge did ``melee.Character(slp_id)``, reading
+    external Fox (2) as internal CPTFALCON. The two must not be conflated."""
+    assert wire.slp_character_to_libmelee(2) is melee.Character.FOX
+    assert wire.slp_character_to_libmelee(2) is not melee.Character.CPTFALCON
+
+
+def test_character_bridge_round_trips() -> None:
+    """external → Character → external is the identity for every selectable id."""
+    for slp_id in wire.CHARACTERS_BY_NAME.values():
+        char = wire.slp_character_to_libmelee(slp_id)
+        assert wire.libmelee_character_to_slp(char) == slp_id
+
+
+def test_characters_by_name_are_external_ids() -> None:
+    """filter.py resolves ``--characters`` via CHARACTERS_BY_NAME against the
+    stored (external) ids, so the table must live in external space."""
+    assert wire.CHARACTERS_BY_NAME["FOX"] == 2
+    assert wire.CHARACTERS_BY_NAME["FALCO"] == 20
+    assert wire.CHARACTERS_BY_NAME["MARTH"] == 9
+    assert wire.CHARACTERS_BY_NAME["CPTFALCON"] == 0
+
+
+def test_slp_character_to_libmelee_rejects_unknown() -> None:
+    with pytest.raises(ValueError, match="unknown slp character id"):
+        wire.slp_character_to_libmelee(99)
+
+
+def test_libmelee_character_to_slp_rejects_unselectable() -> None:
+    """NANA (the Ice Climbers follower) is not CSS-selectable and has no
+    external id; converting it must fail loud rather than fabricate one."""
+    with pytest.raises(ValueError, match="no slp character id"):
+        wire.libmelee_character_to_slp(melee.Character.NANA)
 
 
 def test_stage_ids_do_not_identity_map() -> None:

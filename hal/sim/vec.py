@@ -32,6 +32,7 @@ from hal.sim.inputs import ControllerInputs
 from hal.sim.session import Matchup
 from hal.sim.session import Session
 from hal.sim.trajectory import Trajectory
+from hal.wire import libmelee_character_to_slp
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,13 +117,16 @@ def drive_vec(
         done = [not started[i] for i in range(n)]
         n_live0 = n - sum(done)
         logger.info(f"drive_vec: stepping {n_live0}/{n} matches up to {max_frames} frames")
-        # Per-match matchup metadata (stage + per-port character) as the libmelee enum *values*,
-        # so a char/stage-conditioned policy gets the same ids it trained on. Injected into each
-        # obs frame under ``_matchup``; flatten_canonical_frame emits the columns only when present.
+        # Per-match matchup metadata injected into each obs frame under ``_matchup``
+        # (flatten_canonical_frame emits the columns only when present), in the same id
+        # spaces the model trained on. Stage is the libmelee Stage value (the MDS stores
+        # slp_stage_to_libmelee(...).value). Character is the slp EXTERNAL id (the MDS
+        # p{1,2}_character columns store the raw slp start-block id, which is external and
+        # differs from the libmelee Character enum value — see wire.libmelee_character_to_slp).
         match_meta = [
             {
                 "stage": int(m.matchup.stage.value),
-                "character": {pl.port: int(pl.character.value) for pl in m.matchup.players},
+                "character": {pl.port: libmelee_character_to_slp(pl.character) for pl in m.matchup.players},
             }
             for m in matches
         ]

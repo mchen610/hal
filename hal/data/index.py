@@ -4,8 +4,10 @@ Stage 1 emits one entry per slp into ``index.jsonl``. Stage 3 writes the
 subset that landed in MDS into ``manifest.jsonl`` with ``Stage3Annotation``
 populated.
 
-Integer ids are slp-native (peppi-py vocabulary) — see CLAUDE.md
-(Architecture → Conventions / Footguns) for the stage/character/port translation rules.
+Integer ids are slp-native (peppi-py vocabulary): characters are the slp EXTERNAL
+character-select id (Fox=2), stages the slp stage id — both differ from the libmelee
+enum values. See CLAUDE.md (Controller data model → Character-id footgun) and convert
+only through the ``wire.slp_*_to_libmelee`` bridges.
 LRAS = "L + R + A + Start" controller-combo forfeit; valid only when the slp
 ended via ``NO_CONTEST`` — ``GameOutcome`` enforces this at construction.
 

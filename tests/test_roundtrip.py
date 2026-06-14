@@ -52,6 +52,7 @@ from hal.sim.sources import MdsControllerSource
 from hal.sim.sources import ScriptedControllerSource
 from hal.sim.sources import demo_sequence
 from hal.sim.trajectory import Trajectory
+from hal.wire import CHARACTERS_BY_NAME
 from hal.wire import GAME_START_FRAME
 from hal.wire import TRIGGER_DEADZONE
 
@@ -59,10 +60,18 @@ ISO_PATH = Path(_ISO_PATH)
 DOLPHIN_PATH = Path(EMULATOR_PATH)
 DEV_MDS_DIR = Path(_DEV_MDS_DIR)
 
-# Stage filter — peppi/slp-native ids for BF, FD, DL, YS — and no Peach
-# (turnips) or G&W (hammer). Picked for stability across runs.
-_RNG_STABLE_STAGES = {31, 32, 28, 8}
-_RNG_HEAVY_CHARACTERS = {9, 24}
+# Fixture filter for bit-exact round-trips. Both sets are slp-native ids, matching
+# entry.stage (slp stage id) and p.character (slp EXTERNAL id) — character names go
+# through the external-id table so they can't silently drift to the wrong space.
+# Excluded characters: Peach (turnips) / G&W (hammer) desync across runs; Sheik is
+# not directly character-select-selectable (libmelee from_internal(SHEIK)=255), so
+# ReplayMatchup.from_replay can't set it up via menu_helper.
+_RNG_STABLE_STAGES = {31, 32, 28, 8}  # BF, FD, Dreamland, Yoshi's Story
+_EXCLUDED_FIXTURE_CHARACTERS = {
+    CHARACTERS_BY_NAME["PEACH"],
+    CHARACTERS_BY_NAME["GAMEANDWATCH"],
+    CHARACTERS_BY_NAME["SHEIK"],
+}
 
 
 def _check_prereqs() -> None:
@@ -80,7 +89,7 @@ def _pick_safe_entry():
     for entry in read_jsonl(DEV_MDS_DIR / "manifest.jsonl"):
         if (
             entry.stage in _RNG_STABLE_STAGES
-            and not any(p.character in _RNG_HEAVY_CHARACTERS for p in entry.players)
+            and not any(p.character in _EXCLUDED_FIXTURE_CHARACTERS for p in entry.players)
             and len(entry.players) == 2
             and entry.annotation is not None
         ):

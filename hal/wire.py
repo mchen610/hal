@@ -159,20 +159,66 @@ def slp_stage_to_libmelee(slp_stage_id: int) -> melee.Stage:
     return stage
 
 
+# slp "External Character ID" (game-start block) -> libmelee internal Character.
+# Two distinct id spaces: the slp start block stores Melee's external (character-
+# select) id (Fox=2, Falco=20); libmelee's Character enum is the internal/in-game
+# id (Fox=1, Falco=22) reported in every post-frame. They are NOT equal and must
+# never be cast into each other. (libmelee's own ``enums.to_internal`` is yet a
+# THIRD, cursor-slot numbering — also not this map.) Anchors verified against
+# post-frame internal ids in real replays; the full table is Melee's canonical
+# external character id list.
+_SLP_EXTERNAL_TO_CHARACTER: Final[dict[int, melee.Character]] = {
+    0: melee.Character.CPTFALCON,
+    1: melee.Character.DK,
+    2: melee.Character.FOX,
+    3: melee.Character.GAMEANDWATCH,
+    4: melee.Character.KIRBY,
+    5: melee.Character.BOWSER,
+    6: melee.Character.LINK,
+    7: melee.Character.LUIGI,
+    8: melee.Character.MARIO,
+    9: melee.Character.MARTH,
+    10: melee.Character.MEWTWO,
+    11: melee.Character.NESS,
+    12: melee.Character.PEACH,
+    13: melee.Character.PIKACHU,
+    14: melee.Character.POPO,  # Ice Climbers; Nana is the follower and has no external id
+    15: melee.Character.JIGGLYPUFF,
+    16: melee.Character.SAMUS,
+    17: melee.Character.YOSHI,
+    18: melee.Character.ZELDA,
+    19: melee.Character.SHEIK,
+    20: melee.Character.FALCO,
+    21: melee.Character.YLINK,
+    22: melee.Character.DOC,
+    23: melee.Character.ROY,
+    24: melee.Character.PICHU,
+    25: melee.Character.GANONDORF,
+}
+_CHARACTER_TO_SLP_EXTERNAL: Final[dict[melee.Character, int]] = {c: i for i, c in _SLP_EXTERNAL_TO_CHARACTER.items()}
+
+
 def slp_character_to_libmelee(slp_character_id: int) -> melee.Character:
-    """slp-native character id -> ``melee.Character`` enum.
-
-    The two value spaces *happen* to coincide today (pinned by
-    ``tests/test_wire_bridges.py``); the bridge exists anyway so intent
-    is explicit and a future divergence shows up as a localized failure.
-    """
-    return melee.Character(slp_character_id)
+    """slp external (character-select) character id -> ``melee.Character`` enum."""
+    char = _SLP_EXTERNAL_TO_CHARACTER.get(slp_character_id)
+    if char is None:
+        raise ValueError(f"unknown slp character id {slp_character_id}")
+    return char
 
 
-# Standard cast — slp-native ids 0..26 are the playable characters; higher ids
-# (WIRE_FRAME, MASTER_HAND, ...) are non-selectable. Derived rather than
-# enumerated so any libmelee enum update flows through.
-CHARACTERS_BY_NAME: Final[dict[str, int]] = {c.name: int(c.value) for c in melee.Character if 0 <= int(c.value) <= 26}
+def libmelee_character_to_slp(character: melee.Character) -> int:
+    """``melee.Character`` -> slp external character id (inverse of
+    ``slp_character_to_libmelee``). Encodes a matchup's libmelee character into the
+    external id space the model was trained on, so closed-loop conditioning matches."""
+    slp_id = _CHARACTER_TO_SLP_EXTERNAL.get(character)
+    if slp_id is None:
+        raise ValueError(f"no slp character id for {character!r} (not character-select selectable)")
+    return slp_id
+
+
+# Character name -> slp external id (the id space stored in the index/MDS). Used by
+# the filter CLI to resolve ``--characters FOX`` against stored ids.
+CHARACTERS_BY_NAME: Final[dict[str, int]] = {c.name: i for i, c in _SLP_EXTERNAL_TO_CHARACTER.items()}
 
 
 # ---------------------------------------------------------------------------
