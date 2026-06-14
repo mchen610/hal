@@ -204,6 +204,15 @@ def make_loader(
     # wasted on a CPU run). ``TrainBatch.pin_memory`` makes the custom batch poolable.
     if pin_memory is None:
         pin_memory = torch.cuda.is_available()
+    # Workers hand batch tensors to the main process via shared memory. The default
+    # 'file_descriptor' strategy backs that with /dev/shm, whose size is host/container-fixed
+    # (64MB on a stock vast box, and an on-start remount can fail or be undersized); at high
+    # worker x prefetch x batch the in-flight tensors hit several GB and overrun it, killing
+    # workers ("exited unexpectedly"). 'file_system' backs the handoff with TMPDIR files (the
+    # overlay disk, page-cached) instead, so IPC capacity doesn't depend on /dev/shm size. Set
+    # once in the main process before workers spawn (module stays import-clean for workers).
+    if num_workers > 0:
+        torch.multiprocessing.set_sharing_strategy("file_system")
     return DataLoader(
         sampler,
         batch_size=batch_size,

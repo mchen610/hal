@@ -83,17 +83,27 @@ cd /opt/hal
 git checkout --quiet "$HAL_GIT_SHA"
 uv sync --locked
 
+# Shared memory, provisioned BEFORE the (billed) fetch so a shm-incapable host aborts in
+# seconds, not after downloading the ISO+dataset. vast's container /dev/shm defaults to 64MB.
+# The trainer uses the 'file_system' tensor-sharing strategy, so per-batch worker IPC (several
+# GB at high worker/batch counts) no longer rides /dev/shm — but StreamingDataset's own
+# coordination arrays still need room beyond 64MB. Remount to 16g (compose uses the same), then
+# FAIL FAST if it didn't take: a too-small /dev/shm otherwise only surfaces as a DataLoader
+# worker dying at step 0 (RuntimeError: worker exited unexpectedly), wasting the whole boot.
+mount -o remount,size=16g /dev/shm 2>/dev/null && log "/dev/shm -> 16g" || log "WARN: /dev/shm remount failed"
+shm_mb=$(df -m /dev/shm | awk 'NR==2 {print $2}')
+log "/dev/shm = ${shm_mb}MB"
+if [ "${shm_mb:-0}" -lt 1024 ]; then
+  log "FATAL: /dev/shm ${shm_mb}MB < 1GB (remount failed/undersized) — dataloader would die at step 0; aborting"
+  teardown stop "insufficient /dev/shm (${shm_mb}MB)"
+  exit 1
+fi
+
 # Datasets/fixtures from R2 (sha-pinned, idempotent); stats.json sits outside the
 # streamed shards so pull it up front. Shards stream lazily during training.
 log "fetching fixtures + dataset stats"
 uv run fetch
 uv run python -c "from hal import streams; [streams.pull_stats(s) for s in streams.ALL]"
-
-# StreamingDataset + the PyTorch DataLoader coordinate workers through /dev/shm; vast's
-# default 64MB is far too small (StreamingDataset shm arrays + batched-tensor IPC need a
-# few hundred MB) and silently stalls the loader before the first batch. compose sets
-# shm_size: 16gb for the same reason. Remount larger; tolerate a host that forbids it.
-mount -o remount,size=4g /dev/shm 2>/dev/null && log "/dev/shm -> 4g" || log "WARN: could not enlarge /dev/shm"
 
 # Headless GL context for the closed-loop Dolphin eval.
 pgrep -x Xvfb >/dev/null || (Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &)
