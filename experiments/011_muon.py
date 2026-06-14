@@ -128,11 +128,11 @@ class TrainConfig:
     seed: int = 0
     L_ctx: int = 256
     # optimization
-    batch_size: int = 128
+    batch_size: int = 1024
     grad_accum_steps: int = 1
     # Two LRs: Muon for the blocks' hidden matrices, AdamW for the input proj / head / embeddings / biases.
     muon_lr: float = 0.02
-    adam_lr: float = 3e-4
+    adam_lr: float = 8.5e-4
     weight_decay: float = 0.01
     warmup_steps: int = 500
     max_steps: int = 2**15
@@ -156,7 +156,7 @@ class TrainConfig:
     cache_limit_gb: int = 440
     shuffle_block_size: int = 2000
     val_split: str = "val"
-    num_workers: int = 8
+    num_workers: int = 16
     prefetch_factor: int = 4
 
 
@@ -831,11 +831,11 @@ def train(
             "tokens": samples * cfg.L_ctx,
             "train/loss": breakdown["total"],
             **{f"train/nll_{name}": breakdown[name] for name in _GROUP_NAMES},
-            "train/lr_muon": next(g["lr"] for g in opt.param_groups if g["use_muon"]),
-            "train/lr_adam": next(g["lr"] for g in opt.param_groups if not g["use_muon"]),
+            "lr/muon": next(g["lr"] for g in opt.param_groups if g["use_muon"]),
+            "lr/adam": next(g["lr"] for g in opt.param_groups if not g["use_muon"]),
             "train/gnorm": grad_norm.item(),
-            "train/step_s": sw.elapsed,
-            "train/samples_per_s": sps,
+            "throughput/step_s": sw.elapsed,
+            "throughput/samples_per_s": sps,
         }
         if step < 20 or step % 50 == 0:
             print(
