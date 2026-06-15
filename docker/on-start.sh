@@ -10,6 +10,7 @@
 #
 # Driven entirely by env injected at create time:
 #   HAL_GIT_SHA          commit to check out
+#   HAL_GIT_REMOTE       repo URL containing HAL_GIT_SHA
 #   HAL_TRAIN_CMD_B64    base64 of the training command (base64 survives the env string)
 #   AWS_*, WANDB_API_KEY  R2 + W&B credentials
 #   GITHUB_TOKEN         optional; only set when the repo/image is private
@@ -35,7 +36,7 @@ if [ -r /proc/1/environ ]; then
     case "$kv" in AWS_*=* | WANDB_*=* | GITHUB_TOKEN=* | HAL_*=*) export "$kv" ;; esac
   done < /proc/1/environ
 fi
-log "env check: AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL:+set} WANDB_API_KEY=${WANDB_API_KEY:+set} HAL_GIT_SHA=${HAL_GIT_SHA:+set} HAL_TRAIN_CMD_B64=${HAL_TRAIN_CMD_B64:+set}"
+log "env check: AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL:+set} WANDB_API_KEY=${WANDB_API_KEY:+set} HAL_GIT_SHA=${HAL_GIT_SHA:+set} HAL_GIT_REMOTE=${HAL_GIT_REMOTE:+set} HAL_TRAIN_CMD_B64=${HAL_TRAIN_CMD_B64:+set}"
 
 # Teardown, gated on HAL_KEEP_ALIVE so a debug run leaves the box SSH-able. $1 is the
 # vast verb (stop|destroy), $2 a human reason for the log.
@@ -76,9 +77,15 @@ log "cloning hal @ ${HAL_GIT_SHA}"
 # current working directory". Don't rely on the image WORKDIR being a safe value.
 cd /
 rm -rf /opt/hal
-# Public repo clones anonymously; the ${GITHUB_TOKEN:+…@} prefix injects auth only
+# Public repos clone anonymously; the ${GITHUB_TOKEN:+…@} prefix injects auth only
 # if a token was set (private repo/image). Safe under `set -u`.
-git clone --quiet "https://${GITHUB_TOKEN:+${GITHUB_TOKEN}@}github.com/ericyuegu/hal.git" /opt/hal
+git_remote="${HAL_GIT_REMOTE:-https://github.com/ericyuegu/hal.git}"
+case "$git_remote" in
+  https://github.com/*) clone_url="https://${GITHUB_TOKEN:+${GITHUB_TOKEN}@}${git_remote#https://}" ;;
+  *) clone_url="$git_remote" ;;
+esac
+log "clone remote: ${git_remote}"
+git clone --quiet "$clone_url" /opt/hal
 cd /opt/hal
 git checkout --quiet "$HAL_GIT_SHA"
 uv sync --locked
