@@ -59,12 +59,21 @@ class WindowDataset(IterableDataset):
     actions slices that prefix out of the chunk itself (its first frames).
     """
 
-    def __init__(self, mds: StreamingDataset, L_ctx: int, L_chunk: int, *, seed: int) -> None:
+    def __init__(
+        self,
+        mds: StreamingDataset,
+        L_ctx: int,
+        L_chunk: int,
+        *,
+        seed: int,
+        character_pair: tuple[int, int] | None = None,
+    ) -> None:
         self._mds = mds
         self.L_ctx = L_ctx
         self.L_chunk = L_chunk
         self._L = L_ctx + L_chunk
         self._seed = seed
+        self.character_pair = character_pair
         self._epoch = 0
 
     def __iter__(self) -> Iterator[dict[str, np.ndarray]]:
@@ -78,6 +87,11 @@ class WindowDataset(IterableDataset):
         self._epoch += 1
         for sample in self._mds:
             check_schema_version(sample)
+            if self.character_pair is not None and (
+                int(sample["p1_character"][0]) != self.character_pair[0]
+                or int(sample["p2_character"][0]) != self.character_pair[1]
+            ):
+                continue
             # Shallow copy without the row scalar; windowing slices every value.
             sample = {k: v for k, v in sample.items() if k != "schema_version"}
             T = len(sample["frame"])
@@ -153,6 +167,7 @@ def make_loader(
     prefetch_factor: int = 4,
     predownload: int | None = None,
     pin_memory: bool | None = None,
+    character_pair: tuple[int, int] | None = None,
 ) -> DataLoader:
     """Build the (StreamingDataset → WindowDataset → DataLoader) chain. The
     DataLoader yields ``TrainBatch`` (preprocessing runs in the workers).
@@ -198,7 +213,7 @@ def make_loader(
         shuffle_block_size=shuffle_block_size,
         predownload=predownload,
     )
-    sampler = WindowDataset(mds, L_ctx, L_chunk, seed=seed)
+    sampler = WindowDataset(mds, L_ctx, L_chunk, seed=seed, character_pair=character_pair)
     collate = functools.partial(collate_train_batch, stats=stats, L_ctx=L_ctx)
     # Pin by default only when there's a GPU to copy to (page-locking host memory is
     # wasted on a CPU run). ``TrainBatch.pin_memory`` makes the custom batch poolable.

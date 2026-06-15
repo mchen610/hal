@@ -110,7 +110,7 @@ class TrainConfig:
     d_model: int = 256
     n_layers: int = 8
     n_heads: int = 4
-    # Matchup conditioning (schema v4). char/stage embeddings are indexed by the RAW libmelee id
+    # Matchup conditioning (schema v5). char/stage embeddings are indexed by the libmelee id
     # (characters 0-26 dense; stages sparse in 0-26), so the vocab must exceed the max id, not the
     # number of included categories; out-of-range ids clamp to the last row.
     char_vocab: int = 32
@@ -144,8 +144,9 @@ class TrainConfig:
     eval_timeout_seconds: float = 900.0
     # checkpointing
     ckpt_every: int = 2048
-    # data (v4 MDS carries the stage + p{1,2}_character + nana columns)
+    # data (v5 MDS carries libmelee-valued stage + p{1,2}_character + nana columns)
     data_root: str = "data/processed/ranked-anonymized-1/mds"
+    character_pair: tuple[int, int] | None = None
     cache_limit_gb: int = 440
     shuffle_block_size: int = 2000
     val_split: str = "val"
@@ -155,6 +156,12 @@ class TrainConfig:
 
 def _model_tag(cfg: TrainConfig) -> str:
     return f"gpt-d{cfg.d_model}-L{cfg.n_layers}-h{cfg.n_heads}-Lc{cfg.L_ctx}"
+
+
+def _character_pair_tag(pair: tuple[int, int] | None) -> str:
+    if pair is None:
+        return ""
+    return f"{melee.Character(pair[0]).name.lower()}-vs-{melee.Character(pair[1]).name.lower()}"
 
 
 # %%
@@ -615,6 +622,7 @@ def train(
         L_chunk=L_CHUNK,
         batch_size=cfg.batch_size,
         seed=cfg.seed,
+        character_pair=cfg.character_pair,
     )
     train_loader = make_loader(
         split="train", num_workers=cfg.num_workers, prefetch_factor=cfg.prefetch_factor, **loader_kwargs
@@ -928,7 +936,10 @@ def main(args: Args) -> None:
         return
     cfg = args.cfg
     stats = load_consolidated_stats(Path(cfg.data_root) / "stats.json")
-    auto_comment = f"gpt-{cfg.max_steps // 1000}k-b{cfg.batch_size}"
+    auto_comment_parts = [f"gpt-{cfg.max_steps // 1000}k-b{cfg.batch_size}"]
+    if tag := _character_pair_tag(cfg.character_pair):
+        auto_comment_parts.append(tag)
+    auto_comment = "-".join(auto_comment_parts)
     train(cfg, stats, comment=args.comment or auto_comment)
 
 

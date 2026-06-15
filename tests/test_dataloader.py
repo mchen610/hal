@@ -10,17 +10,26 @@ L_CTX, L_CHUNK = 6, 4
 _L = L_CTX + L_CHUNK
 
 
-def _fake_mds(n_samples: int = 6, length: int = 60) -> list[dict[str, np.ndarray]]:
+def _fake_mds(
+    n_samples: int = 6,
+    length: int = 60,
+    character_pairs: list[tuple[int, int]] | None = None,
+) -> list[dict[str, np.ndarray]]:
     """In-memory stand-in for a StreamingDataset: each sample is one replay."""
-    return [
-        {
+    out = []
+    for i in range(n_samples):
+        sample = {
             "schema_version": SCHEMA_VERSION,
             "frame": np.arange(length, dtype=np.int32),
             "p1_position_x": np.arange(length, dtype=np.float32),
             "p2_position_x": np.arange(length, dtype=np.float32) + 1000.0,
         }
-        for _ in range(n_samples)
-    ]
+        if character_pairs is not None:
+            p1, p2 = character_pairs[i]
+            sample["p1_character"] = np.full(length, p1, dtype=np.int32)
+            sample["p2_character"] = np.full(length, p2, dtype=np.int32)
+        out.append(sample)
+    return out
 
 
 def _fingerprint(sampler: WindowDataset) -> list[tuple[int, str]]:
@@ -71,3 +80,18 @@ def test_cold_start_floor_skips_too_short() -> None:
     assert list(WindowDataset(_fake_mds(n_samples=2, length=L_CHUNK), L_CTX, L_CHUNK, seed=0)) == []
     # one extra frame is enough for a single anchor (cs=1, fully left-padded ctx).
     assert list(WindowDataset(_fake_mds(n_samples=2, length=L_CHUNK + 1), L_CTX, L_CHUNK, seed=0))
+
+
+def test_character_pair_filter_keeps_matching_replays() -> None:
+    rows = list(
+        WindowDataset(
+            _fake_mds(character_pairs=[(1, 1), (1, 22), (1, 1), (2, 1), (1, 1), (18, 18)]),
+            L_CTX,
+            L_CHUNK,
+            seed=0,
+            character_pair=(1, 1),
+        )
+    )
+    assert len(rows) == 3
+    assert all(set(row["ego_character"]) <= {0, 1} and set(row["opp_character"]) <= {0, 1} for row in rows)
+    assert all(row["ego_character"][-1] == 1 and row["opp_character"][-1] == 1 for row in rows)

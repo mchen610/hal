@@ -189,7 +189,7 @@ def _account_env_keys(vast: VastAI) -> set[str]:
     return set()
 
 
-def preflight(vast: VastAI) -> tuple[str, str | None]:
+def preflight(vast: VastAI) -> tuple[str, str, str | None]:
     """Ensure the run is reproducible and credentialed before spending money.
 
     Returns (sha, github_token_or_none). Exits with a clear message on a dirty tree,
@@ -212,8 +212,9 @@ def preflight(vast: VastAI) -> tuple[str, str | None]:
             "Vars, or `vastai create env-var <name> <value>`) so they inject into the box without "
             "leaking into extra_env."
         )
+    remote = _git("remote", "get-url", "origin")
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    return sha, token
+    return sha, remote, token
 
 
 def queue(
@@ -250,11 +251,12 @@ def queue(
         time.sleep(poll_interval_s)
 
 
-def _instance_env(*, sha: str, train_cmd: str) -> dict[str, str]:
+def _instance_env(*, sha: str, git_remote: str, train_cmd: str) -> dict[str, str]:
     # Only non-secret per-run vars go through `-e` (these are visible in extra_env).
     # Secrets come from the vast account env-vars; see REQUIRED_ACCOUNT_VARS.
     return {
         "HAL_GIT_SHA": sha,
+        "HAL_GIT_REMOTE": git_remote,
         "HAL_TRAIN_CMD_B64": base64.b64encode(train_cmd.encode()).decode(),
     }
 
@@ -485,9 +487,9 @@ def main(args: Args) -> None:
         logger.info("search-only (pass a training command after `--` to launch). Nothing rented.")
         return
 
-    sha, token = preflight(vast)
+    sha, git_remote, token = preflight(vast)
     train_cmd = shlex.join(args.cmd)
-    env = _instance_env(sha=sha, train_cmd=train_cmd)
+    env = _instance_env(sha=sha, git_remote=git_remote, train_cmd=train_cmd)
     if args.keep_alive:
         env["HAL_KEEP_ALIVE"] = "1"
 
@@ -499,6 +501,7 @@ def main(args: Args) -> None:
         logger.info(f"[dry-run] env (non-secret; secrets come from vast account env-vars)={env}")
         logger.info(f"[dry-run] onstart=<inline {ONSTART_PATH.name}, {len(ONSTART_PATH.read_text())} bytes>")
         logger.info(f"[dry-run] HAL_GIT_SHA={sha}")
+        logger.info(f"[dry-run] HAL_GIT_REMOTE={git_remote}")
         logger.info(f"[dry-run] train cmd: {train_cmd}")
         return
 
