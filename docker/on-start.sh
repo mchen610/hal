@@ -10,9 +10,11 @@
 #
 # Driven entirely by env injected at create time:
 #   HAL_GIT_SHA          commit to check out
+#   HAL_GIT_REMOTE       repo URL containing HAL_GIT_SHA
 #   HAL_TRAIN_CMD_B64    base64 of the training command (base64 survives the env string)
 #   AWS_*, WANDB_API_KEY  R2 + W&B credentials
 #   GITHUB_TOKEN         optional; only set when the repo/image is private
+#   HAL_FAILURE_ACTION   optional; "destroy" (default) or "stop" on boot/train failure
 #   HAL_KEEP_ALIVE       optional; "1" disables all self-teardown (debug: leave box up)
 # vast injects CONTAINER_ID + CONTAINER_API_KEY (a per-instance key) so the box
 # can stop/destroy itself.
@@ -35,7 +37,7 @@ if [ -r /proc/1/environ ]; then
     case "$kv" in AWS_*=* | WANDB_*=* | GITHUB_TOKEN=* | HAL_*=*) export "$kv" ;; esac
   done < /proc/1/environ
 fi
-log "env check: AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL:+set} WANDB_API_KEY=${WANDB_API_KEY:+set} HAL_GIT_SHA=${HAL_GIT_SHA:+set} HAL_TRAIN_CMD_B64=${HAL_TRAIN_CMD_B64:+set}"
+log "env check: AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL:+set} WANDB_API_KEY=${WANDB_API_KEY:+set} HAL_GIT_SHA=${HAL_GIT_SHA:+set} HAL_GIT_REMOTE=${HAL_GIT_REMOTE:+set} HAL_TRAIN_CMD_B64=${HAL_TRAIN_CMD_B64:+set} HAL_FAILURE_ACTION=${HAL_FAILURE_ACTION:-destroy}"
 
 # Teardown, gated on HAL_KEEP_ALIVE so a debug run leaves the box SSH-able. $1 is the
 # vast verb (stop|destroy), $2 a human reason for the log.
@@ -52,9 +54,19 @@ teardown() {
   VAST_API_KEY="$CONTAINER_API_KEY" vastai "$1" instance "$CONTAINER_ID" $yes_flag || true
 }
 
-# Any failure during boot (clone, sync, fetch) stops the box (or keeps it under
-# HAL_KEEP_ALIVE) rather than leaving it idle-billing.
-trap 'log "boot failed (line $LINENO)"; teardown stop "boot failure"; exit 1' ERR
+failure_action="${HAL_FAILURE_ACTION:-destroy}"
+case "$failure_action" in
+  destroy | stop) ;;
+  *)
+    log "WARN: invalid HAL_FAILURE_ACTION=${failure_action}; defaulting to destroy"
+    failure_action="destroy"
+    ;;
+esac
+
+# Any failure during boot (clone, sync, fetch) destroys the box by default so a stopped
+# instance cannot keep billing disk. Use HAL_FAILURE_ACTION=stop or HAL_KEEP_ALIVE=1
+# only when you intentionally want a failed box left around for debugging.
+trap 'log "boot failed (line $LINENO)"; teardown "$failure_action" "boot failure"; exit 1' ERR
 
 # Fail loud + early if the injected inputs are missing (e.g. env recovery found
 # nothing) instead of dying obscurely mid-clone.
@@ -78,7 +90,13 @@ cd /
 rm -rf /opt/hal
 # Public repo clones anonymously; the ${GITHUB_TOKEN:+…@} prefix injects auth only
 # if a token was set (private repo/image). Safe under `set -u`.
-git clone --quiet "https://${GITHUB_TOKEN:+${GITHUB_TOKEN}@}github.com/ericyuegu/hal.git" /opt/hal
+git_remote="${HAL_GIT_REMOTE:-https://github.com/ericyuegu/hal.git}"
+case "$git_remote" in
+  https://github.com/*) clone_url="https://${GITHUB_TOKEN:+${GITHUB_TOKEN}@}${git_remote#https://}" ;;
+  *) clone_url="$git_remote" ;;
+esac
+log "clone remote: ${git_remote}"
+git clone --quiet "$clone_url" /opt/hal
 cd /opt/hal
 git checkout --quiet "$HAL_GIT_SHA"
 uv sync --locked
@@ -95,7 +113,7 @@ shm_mb=$(df -m /dev/shm | awk 'NR==2 {print $2}')
 log "/dev/shm = ${shm_mb}MB"
 if [ "${shm_mb:-0}" -lt 1024 ]; then
   log "FATAL: /dev/shm ${shm_mb}MB < 1GB (remount failed/undersized) — dataloader would die at step 0; aborting"
-  teardown stop "insufficient /dev/shm (${shm_mb}MB)"
+  teardown "$failure_action" "insufficient /dev/shm (${shm_mb}MB)"
   exit 1
 fi
 
@@ -125,9 +143,9 @@ ulimit -n "$(ulimit -Hn)" && log "open files (ulimit -n) -> $(ulimit -n)"
 
 cmd="$(printf '%s' "$HAL_TRAIN_CMD_B64" | base64 -d)"
 log "training: ${cmd}"
-# Run training outside the trap so we can branch on its exit code: success destroys
-# the box (checkpoints already in R2), non-zero stops it (keeps /opt/hal/train.log
-# for inspection / --resume) — both subject to HAL_KEEP_ALIVE.
+# Run training outside the trap so we can branch on its exit code. Success always
+# destroys the box. Failure follows HAL_FAILURE_ACTION, which defaults to destroy
+# because stopped instances still bill their disk.
 set +e
 bash -c "$cmd" 2>&1 | tee /opt/hal/train.log
 code=${PIPESTATUS[0]}
@@ -136,5 +154,5 @@ set -e
 if [ "$code" -eq 0 ]; then
   teardown destroy "training succeeded (checkpoints in R2, logs in W&B)"
 else
-  teardown stop "training exited ${code}"
+  teardown "$failure_action" "training exited ${code}"
 fi

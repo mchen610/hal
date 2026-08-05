@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
 
+import melee
 import numpy as np
 import torch
 import tyro
@@ -43,6 +44,7 @@ from melee_collector import drive_rl
 from melee_collector import matchup_meta
 from nets_melee import ArchConfig
 from nets_melee import PolicyValueNet
+from nets_melee import load_009_policy
 from nets_melee import load_il_policy
 from ppo import melee_ppo_update
 from ppo import value_warmup_update
@@ -68,6 +70,8 @@ from hal.sim.session import Matchup
 from hal.sim.session import PlayerSetup
 from hal.sim.session import Session
 from hal.sim.vec import Slot
+from hal.training.checkpoints import BackgroundUploader
+from hal.training.checkpoints import download_latest
 from hal.training.checkpoints import save_checkpoint
 from hal.training.ema import EMAWeights
 from hal.training.runs import make_run_name
@@ -107,6 +111,7 @@ class Args:
     wandb: bool = False
     run_name: str | None = None
     resume: str | None = None
+    push_to_r2: bool = False
     smoke: bool = False  # 2 boots, 5 iterations, sync, no wandb
 
 
@@ -130,6 +135,27 @@ def _apply_smoke(args: Args) -> Args:
         ckpt_every_iters=5,
         wandb=False,
     )
+
+
+def _warm_start_path(rl: MeleeRLConfig) -> Path:
+    local = Path("runs") / rl.warm_start / rl.warm_start_ckpt
+    if local.is_file():
+        return local
+    pulled = download_latest(rl.warm_start, local.parent, name=rl.warm_start_ckpt)
+    if pulled is None:
+        raise FileNotFoundError(f"warm-start checkpoint not found locally or in R2: {local}")
+    return pulled
+
+
+def _load_warm_start(rl: MeleeRLConfig) -> tuple[PolicyValueNet, ArchConfig, Path]:
+    path = _warm_start_path(rl)
+    if rl.warm_start_kind == "009":
+        learner, cfg = load_009_policy(path)
+    elif rl.warm_start_kind == "012":
+        learner, cfg = load_il_policy(path)
+    else:
+        raise ValueError(f"unsupported warm_start_kind {rl.warm_start_kind!r}")
+    return learner, cfg, path
 
 
 # --- learner-side rollout math ------------------------------------------------
@@ -208,7 +234,21 @@ def _rollout_stats(iteration: RolloutIteration) -> dict[str, float]:
 
 
 # --- session wiring -----------------------------------------------------------
-def wave_matchups(wave: int, n_boots: int) -> list[Matchup]:
+def _character(name: str) -> melee.Character:
+    key = name.upper()
+    if key not in melee.Character.__members__:
+        raise ValueError(f"unknown melee character {name!r}; expected one of {sorted(melee.Character.__members__)}")
+    return melee.Character[key]
+
+
+def wave_matchups(
+    wave: int,
+    n_boots: int,
+    *,
+    opponent: str = "self_play",
+    cpu_level: int = 9,
+    fixed_character: str | None = None,
+) -> list[Matchup]:
     """The self-play ``Matchup``s for wave ``wave``: the ``wave``-th contiguous ``n_boots``
     slice of the training-prior matchups. ``matchups_for`` is prefix-stable, so
     ``matchups_for((wave + 1) * n_boots)[wave * n_boots:]`` is exactly this wave's slice —
@@ -216,21 +256,33 @@ def wave_matchups(wave: int, n_boots: int) -> list[Matchup]:
     through the FULL training matchup distribution rather than self-playing one fixed slice.
     Both ports model-driven (cpu_level 0), seeded on Battlefield (instant-restart randomizes
     the stage after)."""
-    prior = matchups_for((wave + 1) * n_boots)[wave * n_boots :]
+    if opponent not in ("self_play", "cpu"):
+        raise ValueError(f"opponent must be 'self_play' or 'cpu', got {opponent!r}")
+    if fixed_character is not None:
+        char = _character(fixed_character)
+        prior = [(char, char)] * n_boots
+    else:
+        prior = matchups_for((wave + 1) * n_boots)[wave * n_boots :]
+    opp_cpu = cpu_level if opponent == "cpu" else 0
     return [
         Matchup(
             stage=PRIOR_SWEEP_SEED_STAGE,
             players=(
                 PlayerSetup(port=1, character=ego_char, cpu_level=0),
-                PlayerSetup(port=2, character=opp_char, cpu_level=0),
+                PlayerSetup(port=2, character=opp_char, cpu_level=opp_cpu),
             ),
         )
         for ego_char, opp_char in prior
     ]
 
 
-def _slot_matchups(matchups: list[Matchup], ports: tuple[int, ...]) -> dict[Slot, dict]:
-    return {Slot(i, p): matchup_meta(m) for i, m in enumerate(matchups) for p in ports}
+def _model_ports(rl: MeleeRLConfig) -> list[tuple[int, ...]]:
+    ports = (1,) if rl.opponent == "cpu" else (1, 2)
+    return [ports] * rl.n_boots
+
+
+def _slot_matchups(matchups: list[Matchup], model_ports: list[tuple[int, ...]]) -> dict[Slot, dict]:
+    return {Slot(i, p): matchup_meta(m) for i, m in enumerate(matchups) for p in model_ports[i]}
 
 
 def _boot_builder(session_cfg: SessionConfig, n_boots: int, base_port: int, replay_root: Path | None) -> BuildBoot:
@@ -272,15 +324,12 @@ def main(args: Args) -> None:
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    ports = (1, 2)
+    model_ports = _model_ports(args.rl)
 
-    warm_start = Path("runs") / args.rl.warm_start / "final.pt"
-    if not warm_start.is_file():
-        raise FileNotFoundError(f"warm-start checkpoint not found: {warm_start}")
+    learner, cfg, warm_start = _load_warm_start(args.rl)
     data_root = torch.load(warm_start, map_location="cpu", weights_only=False)["cfg"]["data_root"]
     stats = load_consolidated_stats(Path(data_root) / "stats.json")
 
-    learner, cfg = load_il_policy(warm_start)
     if not 1 <= args.rl.ppo_window_stride <= cfg.L_ctx:
         raise ValueError(f"--rl.ppo-window-stride must be in [1, L_ctx={cfg.L_ctx}], got {args.rl.ppo_window_stride}")
     learner = learner.to(device).train()
@@ -297,6 +346,7 @@ def main(args: Args) -> None:
     ckpt_dir = Path("runs") / run_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     replay_root = ckpt_dir / "replays"
+    uploader = BackgroundUploader(run_name) if args.push_to_r2 else None
 
     counters = {"iter": 0, "transitions": 0, "empty_iters": 0}
     total_iters = args.total_iterations
@@ -340,17 +390,20 @@ def main(args: Args) -> None:
             name=run_name,
             id=wandb_id,
             resume="allow" if wandb_id else None,
-            tags=["014", "rl", "selfplay"],
+            tags=["014", "rl", args.rl.opponent, args.rl.warm_start_kind],
             config={**dataclasses.asdict(args), "L_ctx": cfg.L_ctx, "resolved_run": run_name},
         )
         wandb_id = run.id
         wandb.define_metric("global_step")
         wandb.define_metric("*", step_metric="global_step")
 
-    logger.info(f"run={run_name} device={device} overlap={args.pipeline.overlap} n_boots={args.rl.n_boots}")
+    logger.info(
+        f"run={run_name} device={device} overlap={args.pipeline.overlap} n_boots={args.rl.n_boots} "
+        f"opponent={args.rl.opponent} warm_start={args.rl.warm_start_kind}:{warm_start}"
+    )
     logger.info(f"ppo={args.ppo}")
 
-    n_slots = args.rl.n_boots * len(ports)
+    n_slots = sum(len(p) for p in model_ports)
     handle = NetActingPolicy(
         act_net,
         n_slots=n_slots,
@@ -363,8 +416,14 @@ def main(args: Args) -> None:
     # restarting at slice 0 (attrition reboots aren't counted — the seed is the scheduled
     # floor, which is enough to keep long runs from re-grinding the head of the prior).
     wave0 = counters["iter"] // args.rl.reboot_every_iters if args.rl.reboot_every_iters else 0
-    matchups = wave_matchups(wave0, args.rl.n_boots)
-    slot_matchup = _slot_matchups(matchups, ports)
+    matchups = wave_matchups(
+        wave0,
+        args.rl.n_boots,
+        opponent=args.rl.opponent,
+        cpu_level=args.rl.cpu_level,
+        fixed_character=args.rl.fixed_character,
+    )
+    slot_matchup = _slot_matchups(matchups, model_ports)
     slots = list(slot_matchup)
     pol = RLBatchPolicy(
         handles={"ema": handle},
@@ -480,7 +539,19 @@ def main(args: Args) -> None:
                 }
             )
         if counters["iter"] % args.ckpt_every_iters == 0:
-            _save(ckpt_dir / "latest.pt", counters, learner, opt_ppo, opt_warm, const_sched, ema, args, cfg, wandb_id)
+            _save(
+                ckpt_dir / "latest.pt",
+                counters,
+                learner,
+                opt_ppo,
+                opt_warm,
+                const_sched,
+                ema,
+                args,
+                cfg,
+                wandb_id,
+                uploader,
+            )
 
     # --- collector thread + main-thread learner loop (direct wiring) ----------
     drive_error: list[BaseException] = []
@@ -490,8 +561,14 @@ def main(args: Args) -> None:
         try:
             drive_rl(
                 build_boot,
-                lambda w: wave_matchups(w, args.rl.n_boots),
-                [ports] * args.rl.n_boots,
+                lambda w: wave_matchups(
+                    w,
+                    args.rl.n_boots,
+                    opponent=args.rl.opponent,
+                    cpu_level=args.rl.cpu_level,
+                    fixed_character=args.rl.fixed_character,
+                ),
+                model_ports,
                 pol,
                 n_iterations=remaining,
                 queue_out=q,
@@ -535,7 +612,11 @@ def main(args: Args) -> None:
                 interrupted = True
                 signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    _save(ckpt_dir / "latest.pt", counters, learner, opt_ppo, opt_warm, const_sched, ema, args, cfg, wandb_id)
+    _save(ckpt_dir / "latest.pt", counters, learner, opt_ppo, opt_warm, const_sched, ema, args, cfg, wandb_id, uploader)
+    if uploader is not None:
+        n = uploader.upload_tree(replay_root, base=ckpt_dir, pattern="*.slp")
+        logger.info(f"[ckpt] queued {n} replay(s) for R2 upload")
+        uploader.close()
     if drive_error and not interrupted:
         raise drive_error[0]
     logger.info(f"done: {counters['iter']} iterations, {counters['transitions']} transitions")
@@ -580,6 +661,7 @@ def _save(
     args: Args,
     cfg: ArchConfig,
     wandb_id: str | None,
+    uploader: BackgroundUploader | None = None,
 ) -> None:
     save_checkpoint(
         path,
@@ -589,6 +671,7 @@ def _save(
         sched=sched,
         cfg={**dataclasses.asdict(args), "L_ctx": cfg.L_ctx},
         wandb_id=wandb_id,
+        uploader=uploader,
         extra={
             "opt_warm": opt_warm.state_dict(),
             "ema": ema.state_dict(),

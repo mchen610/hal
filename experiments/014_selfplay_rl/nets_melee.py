@@ -1,20 +1,21 @@
-"""Melee policy/value network, warm-started byte-exactly from the 012 IL checkpoint.
+"""Melee policy/value network, warm-started byte-exactly from an IL checkpoint.
 
-The trunk (rotary causal GPT over per-frame tokens) is COPIED verbatim from
-``experiments/012_multi_token.py`` — experiments can't import each other, and
-checkpoint compatibility is the contract, so the math here must not drift from
-012's. ``PolicyValueNet`` wraps that trunk with an RL-shaped output surface:
+The trunk (rotary causal GPT over per-frame tokens) is COPIED verbatim from the
+009/012 GPT family — experiments can't import each other, and checkpoint
+compatibility is the contract, so the math here must not drift from those
+models. ``PolicyValueNet`` wraps that trunk with an RL-shaped output surface:
 
-* ``policy_head`` — the deployed offset-1 head lifted out of 012's multi-token
-  ``heads`` stack (the far-horizon auxiliary heads are dropped; they were a
-  training-only signal). Its weights load VERBATIM from ``heads.{primary_idx}``.
+* ``policy_head`` — either 009's ``lm_head`` or the deployed offset-1 head lifted
+  out of 012's multi-token ``heads`` stack (the far-horizon auxiliary heads are
+  dropped; they were a training-only signal).
 * ``value_head`` — a fresh zero-initialised scalar critic. Zero init means the
-  warm-started policy predicts identical logits to 012 while V(s) starts at 0
+  warm-started policy predicts identical logits to the IL model while V(s) starts at 0
   and is learned during the value-warmup phase.
 
-``load_il_policy`` remaps a 012 checkpoint onto this module and loads it with
-``strict=True`` (value-head zeros are ADDED to the remapped dict rather than
-tolerated via ``strict=False``) so any key/shape drift fails loud.
+``load_il_policy`` remaps a 012 checkpoint; ``load_009_policy`` remaps a 009
+checkpoint. Both load with ``strict=True`` (value-head zeros are ADDED to the
+remapped dict rather than tolerated via ``strict=False``) so any key/shape drift
+fails loud.
 
 ``FactoredCategorical`` is the single action-distribution definition shared by
 the rollout collector and the PPO learner: a product of the four independent
@@ -139,6 +140,15 @@ class ArchConfig:
         missing = [k for k in fields if k not in cfg]
         if missing:
             raise KeyError(f"012 cfg missing trunk-identity fields: {missing}")
+        return ArchConfig(**{k: cfg[k] for k in fields})
+
+    @staticmethod
+    def from_009_cfg(cfg: dict) -> ArchConfig:
+        """Reconstruct the trunk shape from a 009 checkpoint's ``cfg`` dict."""
+        fields = ("d_model", "n_layers", "n_heads", "L_ctx", "char_vocab", "char_dim", "stage_vocab", "stage_dim")
+        missing = [k for k in fields if k not in cfg]
+        if missing:
+            raise KeyError(f"009 cfg missing trunk-identity fields: {missing}")
         return ArchConfig(**{k: cfg[k] for k in fields})
 
     @property
@@ -330,10 +340,10 @@ class Critic(Protocol):
 
 
 class PolicyValueNet(nn.Module):
-    """012's trunk + an RL output surface (offset-1 policy head + a scalar value head).
+    """009/012 trunk + an RL output surface (policy head + scalar value head).
 
-    The backbone submodule names/shapes match 012's ``GPT`` exactly so a 012 state
-    dict loads verbatim (see ``load_il_policy``). ``forward_full`` reproduces 012's
+    The backbone submodule names/shapes match the IL GPT state dicts exactly so
+    warm-start remaps can load the trunk verbatim. ``forward_full`` reproduces the
     per-frame backbone hidden; ``kv_cache`` reuses the same blocks for incremental
     decode."""
 
@@ -493,6 +503,16 @@ class FactoredCategorical:
 
 
 # %%
+def _load_remapped_policy(remapped: dict[str, Tensor], cfg: ArchConfig) -> tuple[PolicyValueNet, ArchConfig]:
+    net = PolicyValueNet(cfg)
+    # Add the fresh zero value head so strict=True sees an exact key/shape match.
+    remapped["value_head.weight"] = net.value_head.weight.detach().clone()
+    remapped["value_head.bias"] = net.value_head.bias.detach().clone()
+    net.load_state_dict(remapped, strict=True)
+    net.eval()
+    return net, cfg
+
+
 def load_il_policy(ckpt_path: Path) -> tuple[PolicyValueNet, ArchConfig]:
     """Warm-start a ``PolicyValueNet`` from a 012 checkpoint, byte-exactly.
 
@@ -519,10 +539,26 @@ def load_il_policy(ckpt_path: Path) -> tuple[PolicyValueNet, ArchConfig]:
         else:
             remapped[k] = v  # backbone verbatim (incl. rotary.inv_freq + center buffers)
 
-    net = PolicyValueNet(cfg)
-    # Add the fresh zero value head so strict=True sees an exact key/shape match.
-    remapped["value_head.weight"] = net.value_head.weight.detach().clone()
-    remapped["value_head.bias"] = net.value_head.bias.detach().clone()
-    net.load_state_dict(remapped, strict=True)
-    net.eval()
-    return net, cfg
+    return _load_remapped_policy(remapped, cfg)
+
+
+def load_009_policy(ckpt_path: Path) -> tuple[PolicyValueNet, ArchConfig]:
+    """Warm-start a ``PolicyValueNet`` from a 009 next-token GPT checkpoint.
+
+    The backbone loads verbatim; 009's single ``lm_head`` becomes ``policy_head``.
+    A fresh zero value head is added for PPO value learning.
+    """
+    state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    cfg = ArchConfig.from_009_cfg(state["cfg"])
+
+    remapped: dict[str, Tensor] = {}
+    saw_lm_head = False
+    for k, v in state["model"].items():
+        if k.startswith("lm_head."):
+            remapped["policy_head." + k[len("lm_head.") :]] = v
+            saw_lm_head = True
+        else:
+            remapped[k] = v
+    if not saw_lm_head:
+        raise ValueError(f"009 checkpoint has no lm_head: {ckpt_path}")
+    return _load_remapped_policy(remapped, cfg)

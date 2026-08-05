@@ -4,7 +4,8 @@ The instance is fire-and-forget: this launcher pushes the current git SHA, waits
 for an offer that clears the hardware bar, rents it, and injects the SHA + the
 (base64'd) training command. The box then clones that SHA, trains, and tears
 *itself* down — destroy on success (checkpoints are already in R2, logs in W&B),
-stop on failure (for inspection). See docker/on-start.sh.
+destroy on failure by default so stopped disks cannot keep billing. See
+docker/on-start.sh.
 
     python scripts/launch_vast.py                         # search-only: print offers, rent nothing
     python scripts/launch_vast.py --dry-run -- uv run experiments/001_flow_matching_baseline.py
@@ -25,6 +26,7 @@ import time
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
+from typing import Literal
 
 import tyro
 from loguru import logger
@@ -189,18 +191,20 @@ def _account_env_keys(vast: VastAI) -> set[str]:
     return set()
 
 
-def preflight(vast: VastAI) -> tuple[str, str | None]:
+def preflight(vast: VastAI) -> tuple[str, str, str | None]:
     """Ensure the run is reproducible and credentialed before spending money.
 
-    Returns (sha, github_token_or_none). Exits with a clear message on a dirty tree,
-    an unpushed SHA we can't push, or missing account secrets. Secrets come from vast
-    account env-vars (not the host, not `-e`); the GitHub token is optional (only used
-    to pull a private ghcr image).
+    Returns (sha, git_remote, github_token_or_none). Exits with a clear message on
+    a dirty tree, an unpushed SHA we can't push, or missing account secrets.
+    Secrets come from vast account env-vars (not the host, not `-e`); the GitHub
+    token is optional (only used to pull a private ghcr image).
     """
     if _git("status", "--porcelain"):
         raise SystemExit("working tree is dirty — commit before launching (the box runs the pushed SHA).")
     sha = _git("rev-parse", "HEAD")
-    if not _git("branch", "-r", "--contains", sha):
+    remote = _git("remote", "get-url", "origin")
+    remote_branches = _git("branch", "-r", "--contains", sha).splitlines()
+    if not any(branch.strip().startswith("origin/") for branch in remote_branches):
         branch = _git("rev-parse", "--abbrev-ref", "HEAD")
         logger.info(f"{sha[:10]} not on origin; pushing {branch}")
         subprocess.run(["git", "push", "origin", branch], check=True)
@@ -213,7 +217,7 @@ def preflight(vast: VastAI) -> tuple[str, str | None]:
             "leaking into extra_env."
         )
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    return sha, token
+    return sha, remote, token
 
 
 def queue(
@@ -250,12 +254,17 @@ def queue(
         time.sleep(poll_interval_s)
 
 
-def _instance_env(*, sha: str, train_cmd: str) -> dict[str, str]:
+FailureAction = Literal["destroy", "stop"]
+
+
+def _instance_env(*, sha: str, git_remote: str, train_cmd: str, failure_action: FailureAction) -> dict[str, str]:
     # Only non-secret per-run vars go through `-e` (these are visible in extra_env).
     # Secrets come from the vast account env-vars; see REQUIRED_ACCOUNT_VARS.
     return {
         "HAL_GIT_SHA": sha,
+        "HAL_GIT_REMOTE": git_remote,
         "HAL_TRAIN_CMD_B64": base64.b64encode(train_cmd.encode()).decode(),
+        "HAL_FAILURE_ACTION": failure_action,
     }
 
 
@@ -448,8 +457,12 @@ class Args:
     """How long to wait for `running` — the ~9 GB image can pull slowly on a cheap box."""
     dry_run: bool = False
     """Run preflight + one search and print exactly what would be sent, without renting."""
+    failure_action: FailureAction = "destroy"
+    """What the instance does after boot/training fails. Default destroys the box so a stopped
+    instance cannot keep billing disk; set to `stop` only when you need failed-run forensics."""
     keep_alive: bool = False
-    """Debug: leave the box up on crash/finish (no self stop/destroy) so you can SSH in."""
+    """Debug: leave the box up on crash/finish (no self stop/destroy) so you can SSH in.
+    This can keep billing until you manually destroy the instance."""
     data_gb: float = 40.0
     """Estimated GB the box downloads once at startup (the MDS dataset; the ~1.4 GB ISO is
     added on top). Priced at the offer's $/GB ingress and amortized into the ranking metric.
@@ -485,9 +498,9 @@ def main(args: Args) -> None:
         logger.info("search-only (pass a training command after `--` to launch). Nothing rented.")
         return
 
-    sha, token = preflight(vast)
+    sha, git_remote, token = preflight(vast)
     train_cmd = shlex.join(args.cmd)
-    env = _instance_env(sha=sha, train_cmd=train_cmd)
+    env = _instance_env(sha=sha, git_remote=git_remote, train_cmd=train_cmd, failure_action=args.failure_action)
     if args.keep_alive:
         env["HAL_KEEP_ALIVE"] = "1"
 
@@ -499,6 +512,7 @@ def main(args: Args) -> None:
         logger.info(f"[dry-run] env (non-secret; secrets come from vast account env-vars)={env}")
         logger.info(f"[dry-run] onstart=<inline {ONSTART_PATH.name}, {len(ONSTART_PATH.read_text())} bytes>")
         logger.info(f"[dry-run] HAL_GIT_SHA={sha}")
+        logger.info(f"[dry-run] HAL_GIT_REMOTE={git_remote}")
         logger.info(f"[dry-run] train cmd: {train_cmd}")
         return
 
@@ -539,7 +553,7 @@ def main(args: Args) -> None:
     teardown = (
         "kept up regardless (--keep-alive); destroy manually"
         if args.keep_alive
-        else "self-destructs on success / self-stops on failure"
+        else f"self-destructs on success / self-{args.failure_action}s on failure"
     )
     logger.info(f"teardown: box {teardown}.")
 

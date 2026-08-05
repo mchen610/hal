@@ -11,6 +11,10 @@ overrides a few ``PPOConfig`` defaults at the entry-script level (see
 """
 
 from dataclasses import dataclass
+from typing import Literal
+
+WarmStartKind = Literal["012", "009"]
+OpponentKind = Literal["self_play", "cpu"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +79,13 @@ class MeleeRLConfig:
     value_warmup_iters: int = 20
     kl_il_coef: float = 0.05
     warm_start: str = "260616-004736_012_multi_token_gpt-d256-L8-h4-Lc256-o1.5.9.13_ranked-anon-1_gpt-16k-b1024"
+    warm_start_ckpt: str = "final.pt"
+    warm_start_kind: WarmStartKind = "012"
+    opponent: OpponentKind = "self_play"
+    cpu_level: int = 9
+    # When set, every boot uses this character for both ports instead of rotating
+    # through the matchup prior. Useful for matchup-specific checkpoints.
+    fixed_character: str | None = None
     # Reboot the whole self-play wave every N learned iterations so the character matchups
     # rotate through the full training prior (each reboot advances to the next prior slice),
     # not just the first n_boots. In-progress streams flush truncated via the orphan path.

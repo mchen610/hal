@@ -45,9 +45,12 @@ from melee_collector import ActingPolicy
 from melee_collector import NetActingPolicy
 from melee_collector import _KVStepper
 from melee_collector import _StepSlot
+from nets_melee import ArchConfig
 from nets_melee import PolicyValueNet
+from nets_melee import load_009_policy
 from nets_melee import load_il_policy
 from rl_config import MeleeRLConfig
+from rl_config import WarmStartKind
 
 from hal.eval.cross_stage import FRAMES_PER_MINUTE
 from hal.eval.cross_stage import PRIOR_SWEEP_SEED_STAGE
@@ -65,6 +68,7 @@ from hal.sim.session import PlayerSetup
 from hal.sim.trajectory import Trajectory
 from hal.sim.vec import Slot
 from hal.sim.vec import VecMatch
+from hal.training.checkpoints import download_latest
 from hal.training.stats import load_consolidated_stats
 
 _BOOTSTRAP_DRAWS = 10_000
@@ -272,24 +276,55 @@ class LoadedPolicy:
     refresh_every: int
     stats: dict
     warm_start: str
+    warm_start_kind: WarmStartKind = "012"
 
 
-def _load(ckpt: Path | None, warm_start_name: str, refresh_every: int, device: str) -> LoadedPolicy:
+def _warm_start_path(warm_start_name: str, warm_start_ckpt: str) -> Path:
+    local = Path("runs") / warm_start_name / warm_start_ckpt
+    if local.is_file():
+        return local
+    pulled = download_latest(warm_start_name, local.parent, name=warm_start_ckpt)
+    if pulled is None:
+        raise FileNotFoundError(f"warm-start checkpoint not found locally or in R2: {local}")
+    return pulled
+
+
+def _load_warm_start(warm_path: Path, warm_start_kind: WarmStartKind) -> tuple[PolicyValueNet, ArchConfig]:
+    if warm_start_kind == "009":
+        return load_009_policy(warm_path)
+    if warm_start_kind == "012":
+        return load_il_policy(warm_path)
+    raise ValueError(f"unsupported warm_start_kind {warm_start_kind!r}")
+
+
+def _load(
+    ckpt: Path | None,
+    warm_start_name: str,
+    warm_start_ckpt: str,
+    warm_start_kind: WarmStartKind,
+    refresh_every: int,
+    device: str,
+) -> LoadedPolicy:
     """Build the evaluated net: the warm-start IL net (``--il-only``) or the checkpoint's EMA
     weights loaded onto that architecture (``--ckpt``). Stats come from the warm-start's
     training data root (same source as ``melee_train``)."""
-    warm_path = Path("runs") / warm_start_name / "final.pt"
-    if not warm_path.is_file():
-        raise FileNotFoundError(f"warm-start checkpoint not found: {warm_path}")
+    warm_path = _warm_start_path(warm_start_name, warm_start_ckpt)
     data_root = torch.load(warm_path, map_location="cpu", weights_only=False)["cfg"]["data_root"]
     stats = load_consolidated_stats(Path(data_root) / "stats.json")
-    net, cfg = load_il_policy(warm_path)
+    net, cfg = _load_warm_start(warm_path, warm_start_kind)
     if ckpt is not None:
         state = torch.load(ckpt, map_location="cpu", weights_only=False)
         net.load_state_dict(state["ema"])  # EMA weights == full param+buffer state_dict
         logger.info(f"loaded EMA weights from {ckpt} (train iter {state.get('step')})")
     net = net.to(device).eval().requires_grad_(False)
-    return LoadedPolicy(net=net, L_ctx=cfg.L_ctx, refresh_every=refresh_every, stats=stats, warm_start=warm_start_name)
+    return LoadedPolicy(
+        net=net,
+        L_ctx=cfg.L_ctx,
+        refresh_every=refresh_every,
+        stats=stats,
+        warm_start=warm_start_name,
+        warm_start_kind=warm_start_kind,
+    )
 
 
 def _acting(
@@ -512,6 +547,8 @@ class Args:
     ckpt: Path | None = None  # RL checkpoint; its EMA weights are the evaluated policy
     il_only: bool = False  # evaluate the raw warm-start IL policy instead (pins baselines)
     warm_start: str = MeleeRLConfig().warm_start  # 012 run name under runs/ (IL anchor / arch source)
+    warm_start_ckpt: str = MeleeRLConfig().warm_start_ckpt
+    warm_start_kind: WarmStartKind = MeleeRLConfig().warm_start_kind
     vs_cpu: bool = False  # run vs-CPU instead of head-to-head
     h2h_matches: int = 50  # target number of valid head-to-head matches
     n_boots: int = 4  # parallel Dolphins (head-to-head boots / vs-CPU wave width)
@@ -582,24 +619,44 @@ def main(args: Args) -> None:
         raise ValueError("--wandb-run with --il-only requires an explicit --global-step (no ckpt transitions counter)")
 
     warm_start_name = args.warm_start
+    warm_start_ckpt = args.warm_start_ckpt
+    warm_start_kind = args.warm_start_kind
     ckpt_transitions: int | None = None
     if args.ckpt is not None:
         ckpt_state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
         ckpt_transitions = int(ckpt_state["transitions"])
-        ckpt_warm = ckpt_state["cfg"]["rl"]["warm_start"]
+        rl_cfg = ckpt_state["cfg"]["rl"]
+        ckpt_warm = rl_cfg["warm_start"]
         if ckpt_warm != warm_start_name:
             logger.warning(
                 f"using checkpoint's warm_start {ckpt_warm!r} (overriding --warm-start {warm_start_name!r})"
             )
             warm_start_name = ckpt_warm
+        ckpt_warm_ckpt = rl_cfg.get("warm_start_ckpt", warm_start_ckpt)
+        if ckpt_warm_ckpt != warm_start_ckpt:
+            logger.warning(
+                f"using checkpoint's warm_start_ckpt {ckpt_warm_ckpt!r} "
+                f"(overriding --warm-start-ckpt {warm_start_ckpt!r})"
+            )
+            warm_start_ckpt = ckpt_warm_ckpt
+        ckpt_warm_kind = rl_cfg.get("warm_start_kind", warm_start_kind)
+        if ckpt_warm_kind != warm_start_kind:
+            logger.warning(
+                f"using checkpoint's warm_start_kind {ckpt_warm_kind!r} "
+                f"(overriding --warm-start-kind {warm_start_kind!r})"
+            )
+            warm_start_kind = ckpt_warm_kind
 
-    logger.info(f"eval mode={mode} policy={policy} device={device} temp={args.temp} seed={args.seed}")
+    logger.info(
+        f"eval mode={mode} policy={policy} device={device} temp={args.temp} seed={args.seed} "
+        f"warm_start={warm_start_kind}:{warm_start_name}/{warm_start_ckpt}"
+    )
     t0 = time.monotonic()
     session_cfg = default_session_cfg(instant_match_restart=True)
 
     if not args.vs_cpu:
-        ema = _load(args.ckpt, warm_start_name, args.refresh_every, device)
-        il = _load(None, warm_start_name, args.refresh_every, device)
+        ema = _load(args.ckpt, warm_start_name, warm_start_ckpt, warm_start_kind, args.refresh_every, device)
+        il = _load(None, warm_start_name, warm_start_ckpt, warm_start_kind, args.refresh_every, device)
         result = run_h2h(
             ema,
             il,
@@ -614,7 +671,7 @@ def main(args: Args) -> None:
         )
         logger.info(f"G3 H2H: {result['g3_h2h']}")
     else:
-        pol = _load(args.ckpt, warm_start_name, args.refresh_every, device)
+        pol = _load(args.ckpt, warm_start_name, warm_start_ckpt, warm_start_kind, args.refresh_every, device)
         baseline = json.loads(args.baseline.read_text()) if args.baseline is not None else None
         result = run_vs_cpu(
             pol,
@@ -636,6 +693,8 @@ def main(args: Args) -> None:
         "policy": policy,
         "ckpt": str(args.ckpt) if args.ckpt is not None else None,
         "warm_start": warm_start_name,
+        "warm_start_ckpt": warm_start_ckpt,
+        "warm_start_kind": warm_start_kind,
         "temp": args.temp,
         "seed": args.seed,
         "git_sha": _git_sha(),
