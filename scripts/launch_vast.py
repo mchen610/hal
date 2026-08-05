@@ -4,7 +4,8 @@ The instance is fire-and-forget: this launcher pushes the current git SHA, waits
 for an offer that clears the hardware bar, rents it, and injects the SHA + the
 (base64'd) training command. The box then clones that SHA, trains, and tears
 *itself* down — destroy on success (checkpoints are already in R2, logs in W&B),
-stop on failure (for inspection). See docker/on-start.sh.
+destroy on failure by default so stopped disks cannot keep billing. See
+docker/on-start.sh.
 
     python scripts/launch_vast.py                         # search-only: print offers, rent nothing
     python scripts/launch_vast.py --dry-run -- uv run experiments/001_flow_matching_baseline.py
@@ -25,6 +26,7 @@ import time
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
+from typing import Literal
 
 import tyro
 from loguru import logger
@@ -251,13 +253,17 @@ def queue(
         time.sleep(poll_interval_s)
 
 
-def _instance_env(*, sha: str, git_remote: str, train_cmd: str) -> dict[str, str]:
+FailureAction = Literal["destroy", "stop"]
+
+
+def _instance_env(*, sha: str, git_remote: str, train_cmd: str, failure_action: FailureAction) -> dict[str, str]:
     # Only non-secret per-run vars go through `-e` (these are visible in extra_env).
     # Secrets come from the vast account env-vars; see REQUIRED_ACCOUNT_VARS.
     return {
         "HAL_GIT_SHA": sha,
         "HAL_GIT_REMOTE": git_remote,
         "HAL_TRAIN_CMD_B64": base64.b64encode(train_cmd.encode()).decode(),
+        "HAL_FAILURE_ACTION": failure_action,
     }
 
 
@@ -450,8 +456,12 @@ class Args:
     """How long to wait for `running` — the ~9 GB image can pull slowly on a cheap box."""
     dry_run: bool = False
     """Run preflight + one search and print exactly what would be sent, without renting."""
+    failure_action: FailureAction = "destroy"
+    """What the instance does after boot/training fails. Default destroys the box so a stopped
+    instance cannot keep billing disk; set to `stop` only when you need failed-run forensics."""
     keep_alive: bool = False
-    """Debug: leave the box up on crash/finish (no self stop/destroy) so you can SSH in."""
+    """Debug: leave the box up on crash/finish (no self stop/destroy) so you can SSH in.
+    This can keep billing until you manually destroy the instance."""
     data_gb: float = 40.0
     """Estimated GB the box downloads once at startup (the MDS dataset; the ~1.4 GB ISO is
     added on top). Priced at the offer's $/GB ingress and amortized into the ranking metric.
@@ -489,7 +499,7 @@ def main(args: Args) -> None:
 
     sha, git_remote, token = preflight(vast)
     train_cmd = shlex.join(args.cmd)
-    env = _instance_env(sha=sha, git_remote=git_remote, train_cmd=train_cmd)
+    env = _instance_env(sha=sha, git_remote=git_remote, train_cmd=train_cmd, failure_action=args.failure_action)
     if args.keep_alive:
         env["HAL_KEEP_ALIVE"] = "1"
 
@@ -542,7 +552,7 @@ def main(args: Args) -> None:
     teardown = (
         "kept up regardless (--keep-alive); destroy manually"
         if args.keep_alive
-        else "self-destructs on success / self-stops on failure"
+        else f"self-destructs on success / self-{args.failure_action}s on failure"
     )
     logger.info(f"teardown: box {teardown}.")
 

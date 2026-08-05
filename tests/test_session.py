@@ -7,11 +7,13 @@ menu hang surfaces as a clean ``TimeoutError`` instead of spinning forever
 (``start_match`` callers already log-and-continue on that).
 """
 
+import subprocess
 import time
 
 import melee
 import pytest
 
+import hal.sim.session as session_mod
 from hal.sim.session import Session
 
 
@@ -54,3 +56,13 @@ def test_navigate_to_live_returns_on_live_menu() -> None:
     s._drive_menus = lambda gamestate: None  # type: ignore[method-assign]
 
     assert s._navigate_to_live() == {"menu": melee.Menu.IN_GAME}
+
+
+def test_pdeathsig_popen_wrapper_is_noop_off_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    popen = subprocess.Popen
+    monkeypatch.setattr(session_mod.sys, "platform", "darwin")
+
+    with session_mod._popen_with_pdeathsig():
+        assert subprocess.Popen is popen
+
+    assert subprocess.Popen is popen

@@ -17,6 +17,7 @@ Run:
     uv run experiments/009_simplify_arch.py
     uv run experiments/009_simplify_arch.py --eval <ckpt>
     uv run experiments/009_simplify_arch.py --eval <ckpt> --eval-temp 0.7
+    uv run experiments/009_simplify_arch.py --watch <ckpt>
 """
 
 # %%
@@ -60,6 +61,12 @@ from hal.eval.cross_stage import sweep_self_play
 from hal.eval.cross_stage import sweep_vs_cpu
 from hal.eval.cross_stage import vs_cpu_metrics
 from hal.eval.harness import default_session_cfg
+from hal.eval.harness import local_session_cfg
+from hal.eval.harness import run_matches_vec
+from hal.eval.scoring import summarize_trajectory
+from hal.sim.session import Matchup
+from hal.sim.session import PlayerSetup
+from hal.sim.vec import VecMatch
 from hal.training import scoring
 from hal.training.checkpoints import BackgroundUploader
 from hal.training.checkpoints import load_for_resume
@@ -884,6 +891,65 @@ def eval_ckpt(ckpt_path: str, *, decode_temp: float | None = None) -> None:
         print(f"  {stage.name:18s} r{r} {s.as_dict() if s else 'CRASHED'}", flush=True)
 
 
+def watch_ckpt(
+    ckpt_path: str,
+    *,
+    decode_temp: float | None = None,
+    max_frames: int = 0,
+    stage: melee.Stage = melee.Stage.FINAL_DESTINATION,
+    cpu_level: int = 9,
+    iso_path: str | None = None,
+    dolphin_path: str | None = None,
+) -> None:
+    """Open local Dolphin and run one watchable model-vs-CPU match.
+
+    ``max_frames=0`` means no practical frame cap; the rollout still stops when
+    the match leaves gameplay or the process is interrupted.
+    """
+    if max_frames < 0:
+        raise ValueError(f"max_frames must be >= 0, got {max_frames}")
+    effective_max_frames = max_frames if max_frames > 0 else 10_000_000
+
+    model, cfg, stats, state = _load_ckpt(ckpt_path)
+    temp = cfg.decode_temp if decode_temp is None else decode_temp
+    replay_dir = Path(ckpt_path).resolve().parent / "local_watch_replays"
+    replay_dir.mkdir(parents=True, exist_ok=True)
+    session_cfg = local_session_cfg(replay_dir, iso_path=iso_path, dolphin_path=dolphin_path)
+
+    print(
+        f"[watch] loaded {ckpt_path}  step={state['step']}  device={DEVICE}  "
+        f"temp={temp}  frames={effective_max_frames}",
+        flush=True,
+    )
+    print(f"[watch] dolphin={session_cfg.dolphin_path}", flush=True)
+    print(f"[watch] replays={replay_dir}", flush=True)
+
+    def policy_factory() -> RecedingHorizon:
+        return make_policy(model, stats, cfg, decode_temp=decode_temp)
+
+    matches = [
+        VecMatch(
+            matchup=Matchup(
+                stage=stage,
+                players=(
+                    PlayerSetup(port=1, character=melee.Character.FOX, cpu_level=0),
+                    PlayerSetup(port=2, character=melee.Character.FOX, cpu_level=cpu_level),
+                ),
+            ),
+            model_ports=(1,),
+        )
+    ]
+    traj = run_matches_vec(
+        session_cfg,
+        matches,
+        policy_factory,
+        max_frames=effective_max_frames,
+        max_parallel=1,
+        start_retries=0,
+    )[0]
+    print(f"[watch] summary={summarize_trajectory(traj).as_dict() if traj else 'CRASHED'}", flush=True)
+
+
 # %%
 def run_eval_worker(ckpt_path: str, step: int, result_path: str, replay_dir: str) -> None:
     """One-shot closed-loop eval for the async path: load a checkpoint, sweep vs CPU, and write the
@@ -906,6 +972,13 @@ class Args:
     cfg: TrainConfig = field(default_factory=TrainConfig)
     eval: str | None = None  # ckpt path; closed-loop eval instead of train
     eval_temp: float | None = None  # override decode temperature for --eval
+    watch: str | None = None  # ckpt path; open local Dolphin for a single model-vs-CPU match
+    watch_temp: float | None = None  # override decode temperature for --watch
+    watch_frames: int = 0  # 0 means no practical cap
+    watch_stage: melee.Stage = melee.Stage.FINAL_DESTINATION
+    watch_cpu_level: int = 9
+    watch_iso_path: str | None = None
+    watch_dolphin_path: str | None = None
     resume: str | None = None  # run_name to resume; pulls latest.pt (local, else R2)
     comment: str = ""
     # internal: one-shot async-eval worker (the trainer spawns this; not for manual use).
@@ -922,6 +995,17 @@ def main(args: Args) -> None:
         return
     if args.eval is not None:
         eval_ckpt(args.eval, decode_temp=args.eval_temp)
+        return
+    if args.watch is not None:
+        watch_ckpt(
+            args.watch,
+            decode_temp=args.watch_temp,
+            max_frames=args.watch_frames,
+            stage=args.watch_stage,
+            cpu_level=args.watch_cpu_level,
+            iso_path=args.watch_iso_path,
+            dolphin_path=args.watch_dolphin_path,
+        )
         return
     if args.resume is not None:
         state = load_for_resume(args.resume, Path("runs") / args.resume, device=DEVICE)

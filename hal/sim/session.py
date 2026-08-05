@@ -62,7 +62,11 @@ def _popen_with_pdeathsig() -> Iterator[None]:
     child spawned inside the block. Restores on exit. Used to wrap libmelee's
     ``Console.run`` (the actual ``Popen(...)`` call lives inside the library
     and is otherwise out of our reach). Serialized across threads via
-    ``_POPEN_PATCH_LOCK`` since it mutates a process-global."""
+    ``_POPEN_PATCH_LOCK`` since it mutates a process-global. No-op outside
+    Linux, where ``PR_SET_PDEATHSIG`` is unavailable."""
+    if sys.platform != "linux":
+        yield
+        return
     with _POPEN_PATCH_LOCK:
         original = subprocess.Popen
 

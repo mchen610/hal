@@ -11,6 +11,8 @@ to log-and-continue across many stages, not abort on the first crash.
 ``run_matches_vec`` carries the same contract per match.
 """
 
+import os
+import sys
 from collections.abc import Callable
 from collections.abc import Mapping
 from collections.abc import Sequence
@@ -55,6 +57,77 @@ class SessionConfig:
     # Eval sessions poll slippstream so a hung/paused match trips
     # step_timeout_seconds instead of blocking forever (see Session.polling_mode).
     polling_mode: bool = True
+
+
+def _macos_slippi_dolphin_path() -> Path:
+    return (
+        Path.home()
+        / "Library"
+        / "Application Support"
+        / "Slippi Launcher"
+        / "netplay"
+        / "Slippi Dolphin.app"
+        / "Contents"
+        / "MacOS"
+        / "Slippi Dolphin"
+    )
+
+
+def _resolve_local_dolphin_path(dolphin_path: str | Path | None) -> Path:
+    candidates: list[Path] = []
+    if dolphin_path is not None:
+        explicit = Path(dolphin_path).expanduser()
+        if explicit.is_file():
+            return explicit
+        raise FileNotFoundError(f"local Dolphin executable not found: {explicit}")
+    if value := os.getenv("HAL_LOCAL_DOLPHIN_PATH"):
+        candidates.append(Path(value).expanduser())
+    if sys.platform == "darwin":
+        candidates.append(_macos_slippi_dolphin_path())
+    if value := os.getenv("HAL_EMULATOR_PATH"):
+        candidates.append(Path(value).expanduser())
+    candidates.append(Path(EMULATOR_PATH).expanduser())
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    checked = ", ".join(str(p) for p in candidates)
+    raise FileNotFoundError(f"no local Dolphin executable found; checked: {checked}")
+
+
+def _resolve_local_iso_path(iso_path: str | Path | None) -> Path:
+    if iso_path is None:
+        return ensure(ISO)
+    explicit = Path(iso_path).expanduser()
+    if explicit.is_file():
+        return explicit
+    raise FileNotFoundError(f"local ISO not found: {explicit}")
+
+
+def local_session_cfg(
+    replay_dir: Path | None = None,
+    *,
+    iso_path: str | Path | None = None,
+    dolphin_path: str | Path | None = None,
+) -> SessionConfig:
+    """Interactive local Dolphin session for watching one rollout.
+
+    This intentionally avoids the Linux AppImage fixture and ExI fast-forward
+    path used by batch eval. On macOS it finds the Slippi Launcher netplay
+    Dolphin by default; both paths remain overrideable for custom installs.
+    """
+    return SessionConfig(
+        iso_path=_resolve_local_iso_path(iso_path),
+        dolphin_path=_resolve_local_dolphin_path(dolphin_path),
+        use_exi_inputs=False,
+        enable_ffw=False,
+        emulation_speed=1.0,
+        blocking_input=False,
+        step_timeout_seconds=30.0,
+        start_timeout_seconds=120.0,
+        tmp_home_directory=True,
+        replay_dir=str(replay_dir) if replay_dir is not None else None,
+    )
 
 
 def default_session_cfg(replay_dir: Path | None = None) -> SessionConfig:
