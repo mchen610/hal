@@ -65,7 +65,7 @@ class MeleeRLConfig:
     """Melee self-play run knobs; later milestones extend this.
 
     Melee PPO overrides a few ``PPOConfig`` defaults at the entry-script level:
-    gamma=0.997, ent_coef=0.003, lr=3e-5.
+    gamma=0.997, clip=0.05, target_kl=0.003, ent_coef=0.001, lr=3e-5.
     """
 
     n_boots: int = 4
@@ -76,8 +76,8 @@ class MeleeRLConfig:
     # matches the rolling collection window to within stride-1 evicted frames. Learner
     # compute scales ~L_ctx/stride; L_ctx (=256) means no burn-in (edge-to-edge tiling).
     ppo_window_stride: int = 64
-    value_warmup_iters: int = 20
-    kl_il_coef: float = 0.05
+    value_warmup_iters: int = 50
+    kl_il_coef: float = 0.2
     warm_start: str = "260616-004736_012_multi_token_gpt-d256-L8-h4-Lc256-o1.5.9.13_ranked-anon-1_gpt-16k-b1024"
     warm_start_ckpt: str = "final.pt"
     warm_start_kind: WarmStartKind = "012"
