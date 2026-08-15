@@ -51,7 +51,6 @@ FILTERS = (
     "total_flops>=28",  # >= 28 TFLOPS
     "dlperf_usd>70",  # DLPerf per $/hr
     "reliability>0.96",  # > 96%
-    "inet_down>300",  # > 300 Mbps down
     "inet_down_cost<=0.01",  # <= $10/TB down
     "cuda_max_good>=13",  # host driver must support the cuda13 image; older drivers
     # silently fail torch CUDA init (err 804 forward-compat on consumer GPUs) -> CPU run
@@ -114,15 +113,32 @@ def value_metric(offer: dict, *, disk: int, data_gb: float, upload_gb: float, ru
     return amortized_dph(offer, disk=disk, data_gb=data_gb, upload_gb=upload_gb, run_hours=run_hours) / offer["dlperf"]
 
 
-def build_query(max_price: float, disk: int, min_vram: int, min_ram: int, min_dlperf: float) -> str:
+def build_query(
+    max_price: float,
+    disk: int,
+    min_vram: int,
+    min_ram: int,
+    min_dlperf: float,
+    min_inet_down: float,
+    exclude_machine_ids: list[int],
+) -> str:
     # dph_total<max_price is a safe coarse prefilter: effective_dph >= dph_total, so any
     # offer clearing the effective cap also clears this. The real (disk-inclusive) cap is
     # enforced client-side in search(), since storage_cost*disk isn't expressible here.
-    q = [*FILTERS, f"disk_space>={disk}", f"dph_total<{max_price}", f"dlperf>={min_dlperf}"]
+    q = [
+        *FILTERS,
+        f"disk_space>={disk}",
+        f"dph_total<{max_price}",
+        f"dlperf>={min_dlperf}",
+        f"inet_down>={min_inet_down}",
+    ]
     if min_vram > 0:  # vast `gpu_ram` query is in GB; 0 = no VRAM floor
         q.append(f"gpu_ram>={min_vram}")
     if min_ram > 0:  # vast `cpu_ram` query is in GB (per-instance share); 0 = no RAM floor
         q.append(f"cpu_ram>={min_ram}")
+    if exclude_machine_ids:
+        ids = ",".join(map(str, exclude_machine_ids))
+        q.append(f"machine_id notin [{ids}]")
     return " ".join(q)
 
 
@@ -135,6 +151,8 @@ def search(
     min_vram: int,
     min_ram: int,
     min_dlperf: float,
+    min_inet_down: float,
+    exclude_machine_ids: list[int],
     data_gb: float,
     upload_gb: float,
     run_hours: float,
@@ -142,7 +160,11 @@ def search(
     """Offers whose *effective* $/hr (GPU + provisioned disk) clears --max-price, ranked by the
     value metric (eff$/dlperf/hr, transfers folded in) — best bang-for-buck first."""
     offers = vast.search_offers(
-        query=build_query(max_price, disk, min_vram, min_ram, min_dlperf), order=ORDER, limit=limit
+        query=build_query(
+            max_price, disk, min_vram, min_ram, min_dlperf, min_inet_down, exclude_machine_ids
+        ),
+        order=ORDER,
+        limit=limit,
     )
     qualifying = [o for o in offers if effective_dph(o, disk) <= max_price]
     qualifying.sort(
@@ -229,6 +251,8 @@ def queue(
     min_vram: int,
     min_ram: int,
     min_dlperf: float,
+    min_inet_down: float,
+    exclude_machine_ids: list[int],
     data_gb: float,
     upload_gb: float,
     run_hours: float,
@@ -244,6 +268,8 @@ def queue(
             min_vram=min_vram,
             min_ram=min_ram,
             min_dlperf=min_dlperf,
+            min_inet_down=min_inet_down,
+            exclude_machine_ids=exclude_machine_ids,
             data_gb=data_gb,
             upload_gb=upload_gb,
             run_hours=run_hours,
@@ -258,7 +284,13 @@ FailureAction = Literal["destroy", "stop"]
 
 
 def _instance_env(
-    *, sha: str, git_remote: str, train_cmd: str, failure_action: FailureAction, train_idle_timeout_s: int
+    *,
+    sha: str,
+    git_remote: str,
+    train_cmd: str,
+    failure_action: FailureAction,
+    boot_timeout_s: int,
+    train_idle_timeout_s: int,
 ) -> dict[str, str]:
     # Only non-secret per-run vars go through `-e` (these are visible in extra_env).
     # Secrets come from the vast account env-vars; see REQUIRED_ACCOUNT_VARS.
@@ -267,6 +299,7 @@ def _instance_env(
         "HAL_GIT_REMOTE": git_remote,
         "HAL_TRAIN_CMD_B64": base64.b64encode(train_cmd.encode()).decode(),
         "HAL_FAILURE_ACTION": failure_action,
+        "HAL_BOOT_TIMEOUT_S": str(boot_timeout_s),
         "HAL_TRAIN_IDLE_TIMEOUT_S": str(train_idle_timeout_s),
     }
 
@@ -452,6 +485,12 @@ class Args:
     """Minimum raw DLPerf score (vast `dlperf`). A floor on absolute throughput — the $/perf
     ranking alone can pick a slow-but-cheap card; raise this to force a faster GPU regardless
     of value. Distinct from the dlperf_usd>70 perf-per-dollar filter."""
+    min_inet_down: float = 300.0
+    """Minimum advertised host download speed in Mbps. Raise this when clone, image, fixture,
+    or streamed-shard downloads dominate startup and training."""
+    exclude_machine_ids: list[int] = field(default_factory=list)
+    """Vast machine IDs to omit from the offer search, for hosts with known provisioning or
+    CUDA compatibility failures."""
     limit: int = 10
     """How many offers to fetch/print."""
     poll_interval_s: int = 30
@@ -480,6 +519,9 @@ class Args:
     train_idle_timeout_s: int = 900
     """Last-resort kill switch: after training starts, destroy the box if train.log gets no
     writes for this many seconds. <=0 disables."""
+    boot_timeout_s: int = 900
+    """Kill bootstrap and apply --failure-action if clone, sync, fetch, and CUDA preflight do
+    not finish within this many seconds. <=0 disables."""
 
 
 def main(args: Args) -> None:
@@ -492,6 +534,8 @@ def main(args: Args) -> None:
         min_vram=args.min_vram,
         min_ram=args.min_ram,
         min_dlperf=args.min_dlperf,
+        min_inet_down=args.min_inet_down,
+        exclude_machine_ids=args.exclude_machine_ids,
         data_gb=args.data_gb,
         upload_gb=args.upload_gb,
         run_hours=args.run_hours,
@@ -511,6 +555,7 @@ def main(args: Args) -> None:
         git_remote=git_remote,
         train_cmd=train_cmd,
         failure_action=args.failure_action,
+        boot_timeout_s=args.boot_timeout_s,
         train_idle_timeout_s=args.train_idle_timeout_s,
     )
     if args.keep_alive:
