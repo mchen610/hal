@@ -21,6 +21,8 @@ vs-CPU.
     uv run experiments/014_selfplay_rl/melee_eval.py --ckpt runs/<run>/latest.pt --h2h-matches 50
     uv run experiments/014_selfplay_rl/melee_eval.py --ckpt runs/<run>/latest.pt --vs-cpu --baseline il.json
     uv run experiments/014_selfplay_rl/melee_eval.py --il-only --vs-cpu
+    uv run experiments/014_selfplay_rl/melee_eval.py --watch runs/<run>/latest.pt
+    uv run experiments/014_selfplay_rl/melee_eval.py --watch runs/<run>/latest.pt --watch-self-play
 """
 
 import dataclasses
@@ -41,6 +43,7 @@ import torch
 import tyro
 from loguru import logger
 from melee import Character
+from melee import Stage
 from melee_collector import ActingPolicy
 from melee_collector import NetActingPolicy
 from melee_collector import _KVStepper
@@ -59,6 +62,7 @@ from hal.eval.cross_stage import sweep_vs_cpu_prior
 from hal.eval.cross_stage import vs_cpu_metrics
 from hal.eval.harness import SessionConfig
 from hal.eval.harness import default_session_cfg
+from hal.eval.harness import local_session_cfg
 from hal.eval.harness import run_matches_vec
 from hal.eval.matchups import matchups_for
 from hal.eval.scoring import MatchSummary
@@ -340,6 +344,7 @@ def _acting(
 # =============================================================================
 # A failed boot (never reached IN_GAME) is re-queued this many times before being dropped.
 _H2H_BOOT_RETRIES = 2
+_WATCH_FOREVER_FRAME_CAP = 1_000_000_000
 
 # run_matches_vec-compatible runner, injectable so the retry/parity plumbing is testable
 # without Dolphin (see test_rl_eval.py).
@@ -539,12 +544,105 @@ def run_vs_cpu(
     return report
 
 
+def watch_ckpt(
+    ckpt: Path,
+    *,
+    max_frames: int = 0,
+    stage: Stage = Stage.FINAL_DESTINATION,
+    character: Character = Character.FOX,
+    self_play: bool = False,
+    cpu_level: int = 9,
+    temp: float = 1.0,
+    seed: int = 0,
+    refresh_every: int = 64,
+    device: str,
+    iso_path: str | Path | None = None,
+    dolphin_path: str | Path | None = None,
+    instant_match_restart: bool = True,
+    base_slippi_port: int = 51441,
+) -> None:
+    """Open local Dolphin and run the RL checkpoint against an in-game CPU."""
+    if max_frames < 0:
+        raise ValueError(f"max_frames must be >= 0, got {max_frames}")
+    run_forever = max_frames == 0
+    frames_per_boot = _WATCH_FOREVER_FRAME_CAP if run_forever else max_frames
+
+    state = torch.load(ckpt, map_location="cpu", weights_only=False)
+    rl_cfg = state["cfg"]["rl"]
+    warm_start = rl_cfg["warm_start"]
+    warm_start_ckpt = rl_cfg.get("warm_start_ckpt", MeleeRLConfig().warm_start_ckpt)
+    warm_start_kind = rl_cfg.get("warm_start_kind", MeleeRLConfig().warm_start_kind)
+    pol = _load(ckpt, warm_start, warm_start_ckpt, warm_start_kind, refresh_every, device)
+
+    replay_dir = ckpt.resolve().parent / "local_watch_replays"
+    replay_dir.mkdir(parents=True, exist_ok=True)
+    session_cfg = local_session_cfg(
+        replay_dir,
+        iso_path=iso_path,
+        dolphin_path=dolphin_path,
+        instant_match_restart=instant_match_restart,
+    )
+
+    logger.info(
+        f"watch ckpt={ckpt} train_iter={state.get('step')} transitions={state.get('transitions')} "
+        f"device={device} temp={temp} frames={'forever' if run_forever else frames_per_boot} "
+        f"opponent={'self' if self_play else f'cpu{cpu_level}'}"
+    )
+    if run_forever:
+        logger.info("watch stops when Dolphin exits; stop with Ctrl-C")
+    logger.info(f"watch dolphin={session_cfg.dolphin_path}")
+    logger.info(f"watch replays={replay_dir}")
+
+    def factory() -> EvalBatchPolicy:
+        handle = _acting(
+            pol.net,
+            n_slots=2 if self_play else 1,
+            L_ctx=pol.L_ctx,
+            refresh_every=pol.refresh_every,
+            temp=temp,
+            seed=seed,
+            device=device,
+        )
+        return EvalBatchPolicy(
+            handles={"pol": handle},
+            handle_of=lambda _slot: "pol",
+            stats=pol.stats,
+            L_ctx=pol.L_ctx,
+            refresh_every=pol.refresh_every,
+        )
+
+    matches = [
+        VecMatch(
+            matchup=Matchup(
+                stage=stage,
+                players=(
+                    PlayerSetup(port=1, character=character, cpu_level=0),
+                    PlayerSetup(port=2, character=character, cpu_level=0 if self_play else cpu_level),
+                ),
+            ),
+            model_ports=(1, 2) if self_play else (1,),
+        )
+    ]
+    boots = run_matches_vec(
+        session_cfg,
+        matches,
+        factory,
+        max_frames=frames_per_boot,
+        max_parallel=1,
+        base_slippi_port=base_slippi_port,
+        start_retries=0,
+    )
+    summaries = [summarize_trajectory(traj).as_dict() for traj in boots[0]]
+    logger.info(f"watch summary={summaries if summaries else 'CRASHED'}")
+
+
 # =============================================================================
 # Entry
 # =============================================================================
 @dataclass
 class Args:
     ckpt: Path | None = None  # RL checkpoint; its EMA weights are the evaluated policy
+    watch: Path | None = None  # open local Dolphin for one watchable model-vs-CPU boot
     il_only: bool = False  # evaluate the raw warm-start IL policy instead (pins baselines)
     warm_start: str = MeleeRLConfig().warm_start  # 012 run name under runs/ (IL anchor / arch source)
     warm_start_ckpt: str = MeleeRLConfig().warm_start_ckpt
@@ -555,6 +653,14 @@ class Args:
     sweep_matches: int = 40  # vs-CPU: number of prior matchups (boots) in the sweep
     cpu_level: int = 9  # vs-CPU opponent level
     max_frames: int = 30_000  # per-boot frame budget (spans a boot's instant-restart matches)
+    watch_frames: int = 0  # 0 means run until Ctrl-C
+    watch_stage: Stage = Stage.FINAL_DESTINATION
+    watch_character: Character = Character.FOX
+    watch_self_play: bool = False
+    watch_cpu_level: int = 9
+    watch_iso_path: str | None = None
+    watch_dolphin_path: str | None = None
+    watch_instant_match_restart: bool = True
     refresh_every: int = 64  # KV rebuild period (drift reset + max_pos bound)
     temp: float = 1.0  # sampling temperature (1.0 == training collection)
     seed: int = 0
@@ -607,11 +713,29 @@ def _default_out(args: Args, mode: str, policy: str) -> Path:
 
 
 def main(args: Args) -> None:
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if args.watch is not None:
+        watch_ckpt(
+            args.watch,
+            max_frames=args.watch_frames,
+            stage=args.watch_stage,
+            character=args.watch_character,
+            self_play=args.watch_self_play,
+            cpu_level=args.watch_cpu_level,
+            temp=args.temp,
+            seed=args.seed,
+            refresh_every=args.refresh_every,
+            device=device,
+            iso_path=args.watch_iso_path,
+            dolphin_path=args.watch_dolphin_path,
+            instant_match_restart=args.watch_instant_match_restart,
+            base_slippi_port=args.base_slippi_port,
+        )
+        return
     if (args.ckpt is None) == (not args.il_only):
         raise ValueError("pass exactly one of --ckpt <path> or --il-only")
     if not args.vs_cpu and args.il_only:
         raise ValueError("--il-only has no head-to-head meaning (IL vs IL); pair it with --vs-cpu")
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     policy = "il" if args.il_only else "ema"
     mode = "vs_cpu" if args.vs_cpu else "h2h"
 
