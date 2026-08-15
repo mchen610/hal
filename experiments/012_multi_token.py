@@ -1,22 +1,24 @@
-"""GPT next-token action policy (simplified architecture).
+"""A nanoGPT/GPT-2-style causal decoder over per-frame tokens with multi-token
+(multi-frame) auxiliary output heads. One token per frame concatenates all four
+players' gamestate (ego, ego-nana, opp-nana, opp — float + mask + categorical
+embeddings, nana masked when absent) with the ego's own controller history and
+the matchup char/stage embeddings, projected to ``d_model``.
 
-A nanoGPT/GPT-2-style causal decoder over per-frame tokens doing plain LLM
-next-token prediction: each frame's hidden state predicts the *next* frame's
-action. One token per frame concatenates all four players' gamestate
-(ego, ego-nana, opp-nana, opp — float + mask + categorical embeddings, nana
-masked when absent) with the ego's own controller history and the matchup
-char/stage embeddings, projected to ``d_model``.
-
-The output head jointly emits the concatenation of every action group's vocab
-(buttons 256 + main-stick 65 + c-stick 9 + triggers 25 = 355 logits). At decode
-each group's slice is softmax-sampled independently, so the groups are
-conditionally independent given the backbone context (the autoregressive-groups
-variant lives in 010_ar_groups.py).
+Each frame's hidden state feeds one INDEPENDENT output head per future offset in
+``cfg.head_offsets`` (default ``(1, 5, 9, 13)``): head ``o`` predicts the action
+``o`` frames ahead. Every head jointly emits the concatenation of the action
+groups' vocabs (buttons 256 + main-stick 65 + c-stick 9 + triggers 25 = 355
+logits), each group's slice softmax-sampled independently (groups conditionally
+independent given context; the autoregressive-groups variant lives in
+010_ar_groups.py). The far-horizon heads are an AUXILIARY training signal à la
+Meta/DeepSeek multi-token prediction — they shape the trunk but are never used at
+inference: closed-loop play decodes ONLY the offset-1 head (``head_offsets`` must
+contain ``1``), so the deployed policy is byte-for-byte the 011 next-token policy.
 
 Run:
-    uv run experiments/009_simplify_arch.py
-    uv run experiments/009_simplify_arch.py --eval <ckpt>
-    uv run experiments/009_simplify_arch.py --eval <ckpt> --eval-temp 0.7
+    uv run experiments/012_multi_token.py
+    uv run experiments/012_multi_token.py --cfg.head-offsets 1 5 9 13
+    uv run experiments/012_multi_token.py --eval <ckpt> --eval-temp 0.7
 """
 
 # %%
@@ -35,10 +37,10 @@ import time
 from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import fields
 from dataclasses import replace
 from pathlib import Path
 
-import melee
 import numpy as np
 import torch
 import torch.nn as nn
@@ -50,14 +52,12 @@ from jaxtyping import Float
 from jaxtyping import Int
 from jaxtyping import jaxtyped
 from torch import Tensor
-from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 import wandb
 from hal import streams
 from hal.data.stats import FeatureStats
-from hal.eval.cross_stage import sweep_self_play
-from hal.eval.cross_stage import sweep_vs_cpu
+from hal.eval.cross_stage import sweep_vs_cpu_prior
 from hal.eval.cross_stage import vs_cpu_metrics
 from hal.eval.harness import default_session_cfg
 from hal.training import scoring
@@ -73,6 +73,7 @@ from hal.training.features import FLOAT_FEATURES
 from hal.training.features import Context
 from hal.training.features import TrainBatch
 from hal.training.features import stack_actions
+from hal.training.muon import SingleDeviceMuonWithAuxAdam
 from hal.training.runs import make_run_name
 from hal.training.runs import profile
 from hal.training.runs import setup_run_dir
@@ -80,7 +81,9 @@ from hal.training.stats import load_consolidated_stats
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _LN2 = math.log(2.0)
-L_CHUNK = 1  # next-token: predict one frame ahead, replan every frame
+# Closed-loop decodes ONLY the offset-1 head: one frame ahead, replan every frame. The dataloader's
+# target horizon is wider (max(head_offsets)) so the auxiliary far-horizon heads have targets.
+CLOSED_LOOP_L_CHUNK = 1
 
 # Action-vector channel split (A_DIM=14): [0:6] sticks+triggers (continuous), [6:14] buttons {0,1}.
 _N_CONT = 6
@@ -110,6 +113,11 @@ class TrainConfig:
     d_model: int = 256
     n_layers: int = 8
     n_heads: int = 4
+    # Multi-token (multi-frame) auxiliary output heads: one independent head per future-frame offset;
+    # head o predicts the action o frames ahead. MUST contain 1 — closed-loop decodes only the offset-1
+    # head, so the far-horizon heads are a training-only signal. Spread-out offsets beat contiguous.
+    head_offsets: tuple[int, ...] = (1, 5, 9, 13)
+    aux_loss_weight: float = 1.0  # weight on the non-primary (offset != 1) heads' NLL in the objective
     # Matchup conditioning (schema v4). char/stage embeddings are indexed by the RAW libmelee id
     # (characters 0-26 dense; stages sparse in 0-26), so the vocab must exceed the max id, not the
     # number of included categories; out-of-range ids clamp to the last row.
@@ -123,9 +131,11 @@ class TrainConfig:
     seed: int = 0
     L_ctx: int = 256
     # optimization
-    batch_size: int = 128
+    batch_size: int = 1024
     grad_accum_steps: int = 1
-    lr: float = 1e-3
+    # Two LRs: Muon for the blocks' hidden matrices, AdamW for the input proj / head / embeddings / biases.
+    muon_lr: float = 0.02
+    adam_lr: float = 8.5e-4
     weight_decay: float = 0.01
     warmup_steps: int = 500
     max_steps: int = 2**15
@@ -136,8 +146,10 @@ class TrainConfig:
     val_n_batches: int = 16
     eval_every: int = 2048
     eval_max_frames: int = 7200
-    eval_replicas: int = 16
-    eval_max_parallel: int = 8
+    # Closed-loop eval parallelism scales with the box: max_parallel = round(this * cpu_count).
+    # Each parallel slot is one Dolphin boot that (via instant-restart) plays many prior-sampled
+    # matches back-to-back. Profile {0.5, 1, 2, 4} for the best eval throughput vs trainer impact.
+    eval_parallel_per_cpu: float = 1.0
     # Closed-loop eval always runs in a background subprocess (training keeps using the GPU); the
     # trainer drains its result between steps. If a prior eval is still running at the next boundary
     # the trainer waits for it, bounded by eval_timeout_seconds (then kills the worker).
@@ -148,13 +160,24 @@ class TrainConfig:
     data_root: str = "data/processed/ranked-anonymized-1/mds"
     cache_limit_gb: int = 440
     shuffle_block_size: int = 2000
+    # Each replay deserialized off disk yields this many non-overlapping windows,
+    # amortizing the whole-replay read (the disk bottleneck) over K samples. Train
+    # only; val stays 1/replay so its loss stays comparable across runs. Small (4)
+    # keeps same-replay windows per batch low.
+    windows_per_replay: int = 4
     val_split: str = "val"
-    num_workers: int = 8
+    num_workers: int = 16
     prefetch_factor: int = 4
 
 
 def _model_tag(cfg: TrainConfig) -> str:
-    return f"gpt-d{cfg.d_model}-L{cfg.n_layers}-h{cfg.n_heads}-Lc{cfg.L_ctx}"
+    offs = ".".join(str(o) for o in cfg.head_offsets)
+    return f"gpt-d{cfg.d_model}-L{cfg.n_layers}-h{cfg.n_heads}-Lc{cfg.L_ctx}-o{offs}"
+
+
+def _eval_max_parallel(cfg: TrainConfig) -> int:
+    """Concurrent Dolphin boots per eval wave, scaled to the host's CPU count."""
+    return max(1, round(cfg.eval_parallel_per_cpu * (os.cpu_count() or 1)))
 
 
 # %%
@@ -300,13 +323,26 @@ class Block(nn.Module):
 
 # %%
 class GPT(nn.Module):
-    """Causal GPT over per-frame tokens. ``hidden[i]`` (causal) predicts the next frame's action
-    via a single joint head emitting ``A_VOCAB`` logits (the concatenation of the four group vocabs)."""
+    """Causal GPT over per-frame tokens with multi-token auxiliary heads. ``hidden[i]`` (causal) feeds
+    one independent head per offset in ``cfg.head_offsets``; head ``o`` predicts the action ``o`` frames
+    ahead via a joint ``A_VOCAB`` logit vector (the concatenation of the four group vocabs). Closed-loop
+    decode uses only the offset-1 head (``primary_head_idx``); the rest are an auxiliary training signal."""
 
     def __init__(self, cfg: TrainConfig) -> None:
         super().__init__()
         if not cfg.decode_temp > 0:
             raise ValueError(f"decode_temp must be > 0, got {cfg.decode_temp}")
+        offs = tuple(cfg.head_offsets)
+        if not offs:
+            raise ValueError("head_offsets must be non-empty")
+        if any(o < 1 for o in offs):
+            raise ValueError(f"head_offsets must all be >= 1, got {offs}")
+        if len(set(offs)) != len(offs):
+            raise ValueError(f"head_offsets must be unique, got {offs}")
+        if 1 not in offs:
+            raise ValueError(f"head_offsets must contain 1 (closed-loop next-frame decode), got {offs}")
+        self.head_offsets = offs
+        self.primary_head_idx = offs.index(1)
         self.L_ctx = cfg.L_ctx
 
         # Gamestate categoricals: one table per feature name, shared across the four players.
@@ -320,7 +356,8 @@ class GPT(nn.Module):
 
         self.ctx_proj = nn.Linear(d_in, cfg.d_model)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
-        self.lm_head = nn.Linear(cfg.d_model, A_VOCAB)
+        # One independent joint head per future-frame offset (order matches self.head_offsets).
+        self.heads = nn.ModuleList([nn.Linear(cfg.d_model, A_VOCAB) for _ in offs])
 
         # Stick/trigger center grids (registered so they move with .to() and serialize).
         self.register_buffer("main_centers", scoring.STICK_CLUSTER_CENTERS_MAIN.clone())
@@ -356,12 +393,13 @@ class GPT(nn.Module):
         diag = torch.eye(L, dtype=torch.bool, device=device)
         return (causal[None] & (key_real[:, None, :] | diag[None]))[:, None]
 
-    def forward(self, features: dict[str, Tensor], ctx_pad: Int[Tensor, " B"]) -> Float[Tensor, "B L_ctx A_VOCAB"]:
+    def forward(self, features: dict[str, Tensor], ctx_pad: Int[Tensor, " B"]) -> Float[Tensor, "B L_ctx d_model"]:
+        """Backbone hidden (one rmsnorm'd vector per frame); callers apply the per-offset heads."""
         x = self._context_tokens(features)
         mask = self._attn_mask(ctx_pad, x.size(1), x.device)
         for block in self.blocks:
             x = block(x, mask)
-        return self.lm_head(rmsnorm(x)).float()
+        return rmsnorm(x)
 
 
 # %%
@@ -373,15 +411,18 @@ def _dequantize(model: GPT, idx: Tensor) -> Tensor:
     return dequantize_groups(model.main_centers, model.c_centers, model.trig_centers, idx)
 
 
-def _next_action_targets(ctx: Context, target: Tensor) -> tuple[Tensor, Tensor]:
-    """Per context position ``i``, the next frame's action + a validity mask. The ego controller
-    history already lives in ``ctx.features``, so ``a_full = [history | target]`` and position
-    ``i``'s leak-free target is ``a_full[i+1]`` (last position recovers ``target``)."""
-    a_full = torch.cat([stack_actions(ctx.features), target], dim=1)  # [B, L_ctx+1, A_DIM]
-    nxt = a_full[:, 1:]  # [B, L_ctx, A_DIM]
-    pos = torch.arange(nxt.size(1), device=nxt.device)
-    valid = pos[None, :] >= ctx.ctx_pad[:, None]
-    return nxt, valid
+def _multi_offset_targets(ctx: Context, target: Tensor, offsets: tuple[int, ...]) -> tuple[dict[int, Tensor], Tensor]:
+    """Per context position ``i`` and offset ``o``, the action ``o`` frames ahead + a shared validity
+    mask. The ego controller history already lives in ``ctx.features``, so ``a_full = [history | target]``
+    spans frames ``0 .. L_ctx + max(offsets) - 1`` and offset ``o``'s target is ``a_full[:, o : o + L_ctx]``
+    (offset 1 recovers 011's next-frame target). A position is valid iff it is a real (non-pad) context
+    frame; ``i >= ctx_pad`` then guarantees the target frame ``i + o`` is real too (``o >= 1``)."""
+    a_full = torch.cat([stack_actions(ctx.features), target], dim=1)  # [B, L_ctx + max_off, A_DIM]
+    L_ctx = a_full.size(1) - target.size(1)
+    pos = torch.arange(L_ctx, device=a_full.device)
+    valid = pos[None, :] >= ctx.ctx_pad[:, None]  # [B, L_ctx], shared by all offsets
+    targets = {o: a_full[:, o : o + L_ctx] for o in offsets}  # each [B, L_ctx, A_DIM]
+    return targets, valid
 
 
 def group_nll(logits: Tensor, tgt_idx: Tensor, valid: Tensor) -> dict[str, Tensor]:
@@ -396,23 +437,30 @@ def group_nll(logits: Tensor, tgt_idx: Tensor, valid: Tensor) -> dict[str, Tenso
     return out
 
 
-def action_loss(model: GPT, batch: TrainBatch) -> dict[str, Tensor]:
-    """Dense next-token NLL: every valid context position predicts its next frame's action."""
+def action_loss(model: GPT, batch: TrainBatch) -> dict[tuple[int, str], Tensor]:
+    """Dense multi-token NLL: every valid context position predicts the action at each head offset.
+    Keyed by ``(offset, group_name)`` → ``[n_valid]`` nats; one shared backbone forward, one head each."""
     ctx = batch.context
-    nxt, valid = _next_action_targets(ctx, batch.target)
-    tgt_idx = _quantize(model, nxt)
-    logits = model(ctx.features, ctx.ctx_pad)
-    return group_nll(logits, tgt_idx, valid)
+    h = model(ctx.features, ctx.ctx_pad)  # [B, L_ctx, d_model]
+    targets, valid = _multi_offset_targets(ctx, batch.target, model.head_offsets)
+    comps: dict[tuple[int, str], Tensor] = {}
+    for hi, o in enumerate(model.head_offsets):
+        logits = model.heads[hi](h).float()  # [B, L_ctx, A_VOCAB]
+        tgt_idx = _quantize(model, targets[o])
+        for name, c in group_nll(logits, tgt_idx, valid).items():
+            comps[(o, name)] = c
+    return comps
 
 
 @torch.no_grad()
 def decode(
     model: GPT, ctx: Context, *, temp: float = 1.0, argmax: bool = False, gen: torch.Generator | None = None
 ) -> Float[Tensor, "B 1 d_action"]:
-    """One next-frame action per sample from the LAST context position, in raw action ranges.
-    Each group's logit slice is sampled (``temp``-scaled softmax) or taken greedily (``argmax``,
-    for the recon metric) independently."""
-    logits = model(ctx.features, ctx.ctx_pad)[:, -1]  # [B, A_VOCAB]
+    """One next-frame action per sample from the LAST context position, in raw action ranges, via the
+    offset-1 (primary) head only. Each group's logit slice is sampled (``temp``-scaled softmax) or taken
+    greedily (``argmax``, for the recon metric) independently."""
+    h = model(ctx.features, ctx.ctx_pad)[:, -1]  # [B, d_model]
+    logits = model.heads[model.primary_head_idx](h).float()  # [B, A_VOCAB]
     picks: list[Tensor] = []
     for g in range(N_GROUPS):
         lo = _GROUP_OFFSETS[g]
@@ -442,14 +490,15 @@ def make_policy(
         return decode(model, ctx, temp=temp).cpu().numpy()
 
     return RecedingHorizon(
-        predict_chunk=predict_chunk, stats=stats, L_ctx=cfg.L_ctx, L_chunk=L_CHUNK, s=1, d=0, device=device
+        predict_chunk=predict_chunk, stats=stats, L_ctx=cfg.L_ctx, L_chunk=CLOSED_LOOP_L_CHUNK, s=1, d=0, device=device
     )
 
 
 # %%
 def lr_schedule(cfg: TrainConfig):
-    """Linear warmup → cosine to floor."""
-    floor = 1e-5 / cfg.lr
+    """Linear warmup → cosine to a small floor. The returned multiplier scales every param group's
+    base lr uniformly, so the Muon and AdamW groups share one schedule shape."""
+    floor = 0.01
 
     def fn(step: int) -> float:
         if step < cfg.warmup_steps:
@@ -460,48 +509,98 @@ def lr_schedule(cfg: TrainConfig):
     return fn
 
 
+def make_optimizer(model: GPT, cfg: TrainConfig) -> SingleDeviceMuonWithAuxAdam:
+    """Muon for the transformer blocks' hidden weight matrices (attn + MLP); AdamW for everything
+    else — input projection, output head, embeddings, biases — split by weight-decay eligibility.
+    Exactly two LRs (``cfg.muon_lr`` / ``cfg.adam_lr``); the partition asserts full coverage so no
+    parameter can silently escape an optimizer."""
+    muon_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
+    muon_ids = {id(p) for p in muon_params}
+    embed_ids = {id(p) for m in (model.cat_embeds, model.char_emb, model.stage_emb) for p in m.parameters()}
+
+    decay: list[nn.Parameter] = []
+    no_decay: list[nn.Parameter] = []
+    for p in model.parameters():
+        if id(p) in muon_ids:
+            continue
+        # AdamW: no weight decay on embeddings or 1D params (biases); decay the remaining matrices.
+        (no_decay if id(p) in embed_ids or p.ndim < 2 else decay).append(p)
+
+    n_assigned = len(muon_params) + len(decay) + len(no_decay)
+    n_total = sum(1 for _ in model.parameters())
+    if n_assigned != n_total:
+        raise RuntimeError(f"optimizer param partition covers {n_assigned}/{n_total} params")
+
+    adam = dict(betas=(0.9, 0.95), eps=1e-10, use_muon=False)
+    param_groups = [
+        dict(params=muon_params, lr=cfg.muon_lr, momentum=0.95, weight_decay=cfg.weight_decay, use_muon=True),
+        dict(params=decay, lr=cfg.adam_lr, weight_decay=cfg.weight_decay, **adam),
+        dict(params=no_decay, lr=cfg.adam_lr, weight_decay=0.0, **adam),
+    ]
+    return SingleDeviceMuonWithAuxAdam(param_groups)
+
+
 def nll_breakdown(comps: dict[str, Tensor]) -> dict[str, float]:
-    """Per-group NLL (bits) + ``total`` bits/frame, from the per-group ``[n_valid]`` nats. Flat keys
-    (``buttons``/``main_stick``/``c_stick``/``triggers``/``total``) so callers land in one W&B section."""
+    """Per-group NLL (bits) + ``total`` bits/frame, from one head's per-group ``[n_valid]`` nats. Flat
+    keys (``buttons``/``main_stick``/``c_stick``/``triggers``/``total``) so callers land in one W&B section."""
     out = {name: (c.mean().item() / _LN2) for name, c in comps.items()}
     out["total"] = sum(c.mean() for c in comps.values()).item() / _LN2
     return out
 
 
+def objective(comps: dict[tuple[int, str], Tensor], aux_weight: float) -> Tensor:
+    """Weighted-sum multi-token training objective (nats): the offset-1 (primary) head's per-group mean
+    NLL at weight 1, every auxiliary head (offset != 1) at ``aux_weight``."""
+    terms = [(1.0 if o == 1 else aux_weight) * c.mean() for (o, _name), c in comps.items()]
+    return torch.stack(terms).sum()
+
+
+def _offset_total_bits(comps: dict[tuple[int, str], Tensor], o: int) -> float:
+    """Total bits/frame summed over the four groups for one head offset ``o``."""
+    return sum(comps[(o, name)].mean() for name in _GROUP_NAMES).item() / _LN2
+
+
 @torch.no_grad()
 def val_metrics(model: GPT, val_cache: list[TrainBatch], cfg: TrainConfig) -> dict[str, float]:
-    """Dense next-token proper-scoring metrics over the cached val batches. Per-element tensors are
-    concatenated then reduced once, so the means are exactly sample-weighted."""
+    """Dense multi-token proper-scoring metrics over the cached val batches. Button proper-scoring/recon
+    use the offset-1 (deployed) head; per-offset NLL (``nll_off{o}``) tracks how predictability decays
+    with horizon. Per-element tensors are concatenated then reduced once (exactly sample-weighted)."""
     was_training = model.training
     model.eval()
-    comps_cat: dict[str, list[Tensor]] = {}
+    comps_cat: dict[tuple[int, str], list[Tensor]] = {}
     btn_probs: list[Tensor] = []
     btn_tgts: list[Tensor] = []
     multipress: list[Tensor] = []
     for batch in val_cache:
         ctx = batch.context
-        nxt, valid = _next_action_targets(ctx, batch.target)
-        tgt_idx = _quantize(model, nxt)
-        logits = model(ctx.features, ctx.ctx_pad)
-        for k, v in group_nll(logits, tgt_idx, valid).items():
-            comps_cat.setdefault(k, []).append(v)
+        h = model(ctx.features, ctx.ctx_pad)
+        targets, valid = _multi_offset_targets(ctx, batch.target, model.head_offsets)
         flat_valid = valid.reshape(-1)
-        btn_logits = logits[..., : scoring.N_BUTTON_COMBOS].reshape(-1, scoring.N_BUTTON_COMBOS)[flat_valid]
-        btn_probs.append(scoring.combo_marginal_probs(btn_logits))
-        tgt_btn = _dequantize(model, tgt_idx)[..., _N_CONT:].reshape(-1, _N_BUTTONS)[flat_valid]
-        btn_tgts.append(tgt_btn)
-        multipress.append((tgt_btn > 0.5).sum(-1) >= 2)
+        for hi, o in enumerate(model.head_offsets):
+            logits = model.heads[hi](h).float()
+            tgt_idx = _quantize(model, targets[o])
+            for name, c in group_nll(logits, tgt_idx, valid).items():
+                comps_cat.setdefault((o, name), []).append(c)
+            if o == 1:  # deployed head drives the button proper-scoring stats
+                btn_logits = logits[..., : scoring.N_BUTTON_COMBOS].reshape(-1, scoring.N_BUTTON_COMBOS)[flat_valid]
+                btn_probs.append(scoring.combo_marginal_probs(btn_logits))
+                tgt_btn = _dequantize(model, tgt_idx)[..., _N_CONT:].reshape(-1, _N_BUTTONS)[flat_valid]
+                btn_tgts.append(tgt_btn)
+                multipress.append((tgt_btn > 0.5).sum(-1) >= 2)
     comps = {k: torch.cat(v) for k, v in comps_cat.items()}
-    nll = nll_breakdown(comps)
+    primary = nll_breakdown({name: comps[(1, name)] for name in _GROUP_NAMES})
     logloss, brier = scoring.bernoulli_scores_from_probs(torch.cat(btn_probs), torch.cat(btn_tgts))
     out = {
-        "loss": nll["total"],  # total bits/frame (== action NLL); per-group below
-        **{f"nll_{name}": nll[name] for name in _GROUP_NAMES},
-        "cont_discrete_bits": (comps["main_stick"].mean() + comps["c_stick"].mean() + comps["triggers"].mean()).item()
+        "loss": primary["total"],  # offset-1 total bits/frame (deployed policy); per-group below
+        **{f"nll_{name}": primary[name] for name in _GROUP_NAMES},
+        "cont_discrete_bits": (
+            comps[(1, "main_stick")].mean() + comps[(1, "c_stick")].mean() + comps[(1, "triggers")].mean()
+        ).item()
         / _LN2,
         "btn_logloss": logloss.item(),
         "btn_brier": brier.item(),
         "btn_multipress": torch.cat(multipress).float().mean().item(),
+        **{f"nll_off{o}": _offset_total_bits(comps, o) for o in model.head_offsets},
     }
     if was_training:
         model.train()
@@ -546,16 +645,21 @@ def recon_metrics(
 def eval_vs_cpu(
     model: GPT, stats: dict[str, FeatureStats], cfg: TrainConfig, *, max_frames: int, replay_dir: Path | None = None
 ) -> dict[str, float]:
-    """In-training closed-loop eval on FD vs lvl-9 CPU, reduced to a flat metric dict."""
+    """In-training closed-loop eval vs lvl-9 CPU over prior-sampled char matchups.
+
+    ``max_parallel`` Dolphin boots (one per distinct prior-sampled matchup, scaled to
+    the box's CPUs) each play many matches back-to-back via instant-restart on random
+    legal stages — broad, prior-weighted coverage that navigates the flaky stage-select
+    menu only once per boot. Reduced to a flat metric dict."""
     was_training = model.training
     model.eval()
+    n = _eval_max_parallel(cfg)
     try:
-        results = sweep_vs_cpu(
+        results = sweep_vs_cpu_prior(
             lambda: make_policy(model, stats, cfg),
-            session_cfg=default_session_cfg(replay_dir),
-            stages=(melee.Stage.FINAL_DESTINATION,),
-            replicas=cfg.eval_replicas,
-            max_parallel=cfg.eval_max_parallel,
+            session_cfg=default_session_cfg(replay_dir, instant_match_restart=True),
+            n_matchups=n,
+            max_parallel=n,
             max_frames=max_frames,
         )
     finally:
@@ -612,16 +716,20 @@ def train(
         shuffle_block_size=cfg.shuffle_block_size,
         stats=stats,
         L_ctx=cfg.L_ctx,
-        L_chunk=L_CHUNK,
+        L_chunk=max(cfg.head_offsets),  # target horizon must cover the farthest auxiliary head
         batch_size=cfg.batch_size,
         seed=cfg.seed,
     )
     train_loader = make_loader(
-        split="train", num_workers=cfg.num_workers, prefetch_factor=cfg.prefetch_factor, **loader_kwargs
+        split="train",
+        num_workers=cfg.num_workers,
+        prefetch_factor=cfg.prefetch_factor,
+        windows_per_replay=cfg.windows_per_replay,
+        **loader_kwargs,
     )
     val_loader = make_loader(split=cfg.val_split, num_workers=0, **loader_kwargs)
 
-    opt = AdamW(model.parameters(), lr=cfg.lr, betas=(0.9, 0.95), weight_decay=cfg.weight_decay)
+    opt = make_optimizer(model, cfg)
     sched = LambdaLR(opt, lr_schedule(cfg))
     if resume_state is not None:
         model.load_state_dict(resume_state["model"])
@@ -765,7 +873,7 @@ def train(
     for step in range(start_step, cfg.max_steps):
         with profile("step") as sw:
             opt.zero_grad()
-            comps_acc: dict[str, list[Tensor]] = {}
+            comps_acc: dict[tuple[int, str], list[Tensor]] = {}
             for _ in range(cfg.grad_accum_steps):
                 try:
                     batch = next(it).to(DEVICE)
@@ -774,7 +882,7 @@ def train(
                     batch = next(it).to(DEVICE)
                 with autocast:
                     comps = action_loss(model, batch)
-                    loss = sum(comps.values()).mean() / cfg.grad_accum_steps
+                    loss = objective(comps, cfg.aux_loss_weight) / cfg.grad_accum_steps
                 loss.backward()
                 for k, v in comps.items():
                     comps_acc.setdefault(k, []).append(v.detach())
@@ -783,23 +891,30 @@ def train(
             sched.step()
             if DEVICE == "cuda":
                 torch.cuda.synchronize()
-        breakdown = nll_breakdown({k: torch.cat(v) for k, v in comps_acc.items()})
+        comps_cat = {k: torch.cat(v) for k, v in comps_acc.items()}
+        primary = nll_breakdown({name: comps_cat[(1, name)] for name in _GROUP_NAMES})
+        aux_offsets = [o for o in cfg.head_offsets if o != 1]
+        aux_loss = (
+            sum(_offset_total_bits(comps_cat, o) for o in aux_offsets) / len(aux_offsets) if aux_offsets else 0.0
+        )
         sps = cfg.batch_size * cfg.grad_accum_steps / sw.elapsed
         samples = (step + 1) * cfg.batch_size * cfg.grad_accum_steps
         log = {
             "global_step": step,
             "samples": samples,
             "tokens": samples * cfg.L_ctx,
-            "train/loss": breakdown["total"],
-            **{f"train/nll_{name}": breakdown[name] for name in _GROUP_NAMES},
-            "train/lr": opt.param_groups[0]["lr"],
+            "train/loss": primary["total"],  # offset-1 head (deployed); aux heads tracked separately
+            **{f"train/nll_{name}": primary[name] for name in _GROUP_NAMES},
+            "train/aux_loss": aux_loss,  # mean total bits/frame over the auxiliary (offset != 1) heads
+            "lr/muon": next(g["lr"] for g in opt.param_groups if g["use_muon"]),
+            "lr/adam": next(g["lr"] for g in opt.param_groups if not g["use_muon"]),
             "train/gnorm": grad_norm.item(),
-            "train/step_s": sw.elapsed,
-            "train/samples_per_s": sps,
+            "throughput/step_s": sw.elapsed,
+            "throughput/samples_per_s": sps,
         }
         if step < 20 or step % 50 == 0:
             print(
-                f"[t+{time.monotonic() - run_t0:.0f}s] step {step}: loss {breakdown['total']:.4f} "
+                f"[t+{time.monotonic() - run_t0:.0f}s] step {step}: loss {primary['total']:.4f} "
                 f"step_dt={sw.elapsed * 1000:.0f}ms ({sps:.1f} samples/s)",
                 flush=True,
             )
@@ -828,9 +943,23 @@ def train(
 
 
 # %%
+def _cfg_from_state(saved: dict) -> TrainConfig:
+    """Rebuild a ``TrainConfig`` from a checkpoint's saved cfg dict, tolerating
+    schema drift in *eval/host* knobs across code versions: keys no longer on
+    ``TrainConfig`` (e.g. the old ``eval_max_parallel``/``eval_replicas``, replaced
+    by ``eval_parallel_per_cpu``) are dropped and new fields take their defaults, so
+    past checkpoints still load. Model-identity fields (``d_model``, ``head_offsets``,
+    …) are unaffected — they're always present and reconstruct exactly."""
+    known = {f.name for f in fields(TrainConfig)}
+    dropped = sorted(set(saved) - known)
+    if dropped:
+        print(f"[ckpt] dropping {len(dropped)} stale cfg key(s) not on current TrainConfig: {dropped}", flush=True)
+    return TrainConfig(**{k: v for k, v in saved.items() if k in known})
+
+
 def _load_ckpt(ckpt_path: str) -> tuple[GPT, TrainConfig, dict[str, FeatureStats], dict]:
     state = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
-    cfg = TrainConfig(**state["cfg"])
+    cfg = _cfg_from_state(state["cfg"])
     model = GPT(cfg).to(DEVICE)
     model.load_state_dict(state["model"])
     model.eval()
@@ -839,41 +968,29 @@ def _load_ckpt(ckpt_path: str) -> tuple[GPT, TrainConfig, dict[str, FeatureStats
 
 
 def eval_ckpt(ckpt_path: str, *, decode_temp: float | None = None) -> None:
-    """Load a checkpoint, sweep stages vs CPU + self-play, print summaries. ``decode_temp`` overrides
-    the trained cfg for this eval only (test-time temperature sweep)."""
-    from hal.policy import INCLUDED_STAGES
-
+    """Load a checkpoint and run the prior-distribution vs-CPU sweep, printing the
+    pooled metrics. ``decode_temp`` overrides the trained cfg for this eval only
+    (test-time temperature sweep)."""
     model, cfg, stats, state = _load_ckpt(ckpt_path)
     temp = cfg.decode_temp if decode_temp is None else decode_temp
     print(f"[eval] loaded {ckpt_path}  step={state['step']}  device={DEVICE}  temp={temp}", flush=True)
     replay_dir = Path(ckpt_path).resolve().parent / "eval_replays"
     replay_dir.mkdir(parents=True, exist_ok=True)
-    session_cfg = default_session_cfg(replay_dir)
-    stages = tuple(s for s in INCLUDED_STAGES if s is not melee.Stage.FOUNTAIN_OF_DREAMS)
+    session_cfg = default_session_cfg(replay_dir, instant_match_restart=True)
+    n = _eval_max_parallel(cfg)
 
     def policy_factory() -> RecedingHorizon:
         return make_policy(model, stats, cfg, decode_temp=decode_temp)
 
-    print("\n[eval] ============== vs-cpu ==============", flush=True)
-    for stage, r, s in sweep_vs_cpu(
+    print(f"\n[eval] ===== vs-cpu, {n} prior-sampled matchups (instant-restart) =====", flush=True)
+    results = sweep_vs_cpu_prior(
         policy_factory,
         session_cfg=session_cfg,
-        stages=stages,
-        replicas=cfg.eval_replicas,
-        max_parallel=cfg.eval_max_parallel,
+        n_matchups=n,
+        max_parallel=n,
         max_frames=15_000,
-    ):
-        print(f"  {stage.name:18s} r{r} {s.as_dict() if s else 'CRASHED'}", flush=True)
-    print("\n[eval] ============== self-play ==============", flush=True)
-    for stage, r, s in sweep_self_play(
-        policy_factory,
-        session_cfg=session_cfg,
-        stages=stages,
-        replicas=cfg.eval_replicas,
-        max_parallel=cfg.eval_max_parallel,
-        max_frames=15_000,
-    ):
-        print(f"  {stage.name:18s} r{r} {s.as_dict() if s else 'CRASHED'}", flush=True)
+    )
+    print(f"  {vs_cpu_metrics(results)}", flush=True)
 
 
 # %%
@@ -922,7 +1039,7 @@ def main(args: Args) -> None:
         # Only pure host-scaling knobs (worker/prefetch counts) follow the current code; the
         # model-identity knobs MUST come from the checkpoint so a resume can't silently change them.
         d = TrainConfig()
-        cfg = replace(TrainConfig(**state["cfg"]), num_workers=d.num_workers, prefetch_factor=d.prefetch_factor)
+        cfg = replace(_cfg_from_state(state["cfg"]), num_workers=d.num_workers, prefetch_factor=d.prefetch_factor)
         stats = load_consolidated_stats(Path(cfg.data_root) / "stats.json")
         train(cfg, stats, resume_run=args.resume, resume_state=state)
         return
