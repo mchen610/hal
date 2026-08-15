@@ -1,9 +1,10 @@
-"""012 warm-start remap + FactoredCategorical + discretizer round-trip tests.
+"""009/012 warm-start remap + FactoredCategorical + discretizer round-trip tests.
 
 Checkpoint compatibility is the contract: ``load_il_policy`` must load a 012 state
-dict with strict=True and reproduce the SOURCE model's offset-1 logits exactly.
-These tests pin that with a synthetic 012-shaped checkpoint (no GPU/real data),
-plus the real d256/L8 checkpoint when present.
+dict with strict=True and reproduce the SOURCE model's offset-1 logits exactly;
+``load_009_policy`` must do the same for a 009 checkpoint's ``lm_head``. These
+tests pin that with synthetic checkpoints (no GPU/real data), plus the real
+d256/L8 checkpoint when present.
 """
 
 from pathlib import Path
@@ -17,6 +18,7 @@ from nets_melee import ArchConfig
 from nets_melee import FactoredCategorical
 from nets_melee import PolicyValueNet
 from nets_melee import dequantize_groups
+from nets_melee import load_009_policy
 from nets_melee import load_il_policy
 from nets_melee import quantize_groups
 
@@ -81,6 +83,31 @@ def _synthetic_012_ckpt(cfg: ArchConfig, offsets: tuple[int, ...], *, seed: int 
     return {"step": 100, "model": model, "cfg": cfg_dict, "opt": {}, "sched": {}, "wandb_id": None}
 
 
+def _synthetic_009_ckpt(cfg: ArchConfig, *, seed: int = 0) -> dict:
+    torch.manual_seed(seed)
+    ref = PolicyValueNet(cfg)
+    model: dict[str, torch.Tensor] = {}
+    for k, v in ref.state_dict().items():
+        if k.startswith(("policy_head.", "value_head.")):
+            continue
+        model[k] = v.clone()
+    head = torch.nn.Linear(cfg.d_model, A_VOCAB)
+    model["lm_head.weight"] = head.weight.detach().clone()
+    model["lm_head.bias"] = head.bias.detach().clone()
+    cfg_dict = {
+        "d_model": cfg.d_model,
+        "n_layers": cfg.n_layers,
+        "n_heads": cfg.n_heads,
+        "L_ctx": cfg.L_ctx,
+        "char_vocab": cfg.char_vocab,
+        "char_dim": cfg.char_dim,
+        "stage_vocab": cfg.stage_vocab,
+        "stage_dim": cfg.stage_dim,
+        "batch_size": 512,  # stale training key from_009_cfg must ignore
+    }
+    return {"step": 100, "model": model, "cfg": cfg_dict, "opt": {}, "sched": {}, "wandb_id": None}
+
+
 def test_warmstart_reproduces_offset1_logits(tmp_path: Path) -> None:
     # The remap must reproduce the SOURCE offset-1 head's logits exactly: policy_head ==
     # heads[index(1)] applied to the same backbone hidden.
@@ -100,6 +127,23 @@ def test_warmstart_reproduces_offset1_logits(tmp_path: Path) -> None:
     b = ckpt["model"][f"heads.{primary}.bias"]
     want = (hidden @ w.T + b).float()
     assert torch.allclose(got, want, atol=ATOL), f"remap not exact: {(got - want).abs().max()}"
+
+
+def test_009_warmstart_reproduces_lm_head_logits(tmp_path: Path) -> None:
+    ckpt = _synthetic_009_ckpt(CFG, seed=11)
+    path = tmp_path / "synthetic_009.pt"
+    torch.save(ckpt, path)
+    net, cfg = load_009_policy(path)
+    assert cfg == CFG
+
+    ctx = _ctx(2, CFG.L_ctx, CFG, seed=13)
+    hidden = net.forward_full(ctx)
+    got = net.policy_logits(hidden)
+
+    w = ckpt["model"]["lm_head.weight"]
+    b = ckpt["model"]["lm_head.bias"]
+    want = (hidden @ w.T + b).float()
+    assert torch.allclose(got, want, atol=ATOL), f"009 remap not exact: {(got - want).abs().max()}"
 
 
 def test_warmstart_value_head_zero_and_strict(tmp_path: Path) -> None:

@@ -23,6 +23,7 @@ if mp.get_start_method(allow_none=True) != "fork":
 from dataclasses import replace
 from pathlib import Path
 
+import melee
 import numpy as np
 import pytest
 import torch
@@ -31,6 +32,7 @@ from melee_collector import RLBatchPolicy
 from nets_melee import ArchConfig
 from nets_melee import FactoredCategorical
 from nets_melee import PolicyValueNet
+from rl_config import MeleeRLConfig
 from rl_config import RewardConfig
 from rollout import build_windows
 from rollout import collate_windows
@@ -413,6 +415,29 @@ def test_wave_matchups_tile_the_prior_in_nonoverlapping_slices() -> None:
         assert len(wave) == n
         got = [(m.players[0].character, m.players[1].character) for m in wave]
         assert got == full[w * n : (w + 1) * n]
+
+
+def test_cpu_wave_matchups_fixed_character_and_model_ports() -> None:
+    from melee_train import _model_ports
+    from melee_train import wave_matchups
+
+    rl = MeleeRLConfig(n_boots=3, opponent="cpu", cpu_level=9, fixed_character="FOX")
+    assert _model_ports(rl) == [(1,), (1,), (1,)]
+
+    wave = wave_matchups(
+        0,
+        rl.n_boots,
+        opponent=rl.opponent,
+        cpu_level=rl.cpu_level,
+        fixed_character=rl.fixed_character,
+    )
+    assert len(wave) == rl.n_boots
+    for matchup in wave:
+        p1, p2 = matchup.players
+        assert p1.character is melee.Character.FOX
+        assert p1.cpu_level == 0
+        assert p2.character is melee.Character.FOX
+        assert p2.cpu_level == 9
 
 
 def test_reset_slots_rotation_rebinds_fresh_stream_matchup() -> None:
