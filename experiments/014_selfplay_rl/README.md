@@ -2,15 +2,17 @@
 
 ## Goal
 
-Fine-tune the 012 imitation-learning policy with **EMA mirror self-play PPO**.
+Fine-tune an imitation-learning policy with **EMA mirror self-play PPO**.
 Both ports are driven by the *same* network: the learner updates fast weights
 while an EMA copy (`hal/training/ema.py`) supplies the trailing **behavior**
 policy that acts in the collector, stabilizing the opponent distribution. (This
 is a single trailing opponent, not AlphaStar-style league training — a diverse
 population with PFSP matchmaking remains an extension seam, see below.) Every
-run **warm-starts** from the 012 IL checkpoint (see `MeleeRLConfig.warm_start`)
-so the policy begins competent and RL only has to sharpen it. A KL-to-IL penalty
-(`kl_il_coef`) keeps the policy from drifting off the human-data manifold.
+run **warm-starts** from a BC/IL checkpoint (012 by default; 009 via
+`--rl.warm-start-kind 009`) so the policy begins competent and RL only has to
+sharpen it. The Melee PPO defaults are intentionally teacher-anchored: small PPO
+clip, low target KL, a value warmup phase, and a KL-to-IL penalty
+(`kl_il_coef`) keep the policy from drifting off the human-data manifold.
 
 The core PPO loop is validated first on Gym/Atari (tianshou + envpool), then
 reused verbatim for Melee behind a shared collector interface, so the RL math is
@@ -37,8 +39,22 @@ uv run experiments/014_selfplay_rl/gym_train.py --task CartPole-v1
 # G2: Atari/Pong PPO
 uv run experiments/014_selfplay_rl/gym_train.py --task Pong-v5
 
-# G3: Melee self-play PPO (warm-started from 012)
+# G3: Melee self-play PPO (warm-started from 012 by default)
 uv run experiments/014_selfplay_rl/melee_train.py --wandb --run-name <name> --rl.n-boots 6
+
+# Matchup-specific self-play from the Fox/Fox 009 BC teacher
+uv run scripts/launch_vast.py --min-ram 64 --min-dlperf 150 --run-hours 6 -- \
+  uv run experiments/014_selfplay_rl/melee_train.py \
+    --wandb \
+    --push-to-r2 \
+    --run-name 014_teacher_anchored_009_fox_vs_fox \
+    --total-iterations 800 \
+    --ckpt-every-iters 25 \
+    --rl.warm-start 260615-041800_gpt-d256-L8-h4-Lc256_ranked-anon-1_fox-vs-fox \
+    --rl.warm-start-kind 009 \
+    --rl.opponent self_play \
+    --rl.fixed-character FOX \
+    --rl.n-boots 8
 
 # G3 eval: EMA vs frozen 012 IL head-to-head, then vs lvl-9 CPU vs pinned baseline.
 # NEVER run evals concurrently with a live trainer on the dev box (10+ Dolphins +

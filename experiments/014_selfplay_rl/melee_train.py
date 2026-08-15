@@ -79,17 +79,21 @@ from hal.training.stats import load_consolidated_stats
 
 
 def _melee_ppo() -> PPOConfig:
-    """Melee PPO preset (overrides the shared ``PPOConfig`` defaults)."""
+    """Teacher-anchored Melee PPO preset.
+
+    The learner starts from BC, so PPO should make small closed-loop corrections
+    instead of quickly moving into narrow reward hacks.
+    """
     return PPOConfig(
         lr=3e-5,
-        clip=0.2,
-        epochs=3,
+        clip=0.05,
+        epochs=2,
         minibatch_size=16,  # WINDOWS per minibatch (each window is up to L_ctx transitions)
         gamma=0.997,
         gae_lambda=0.95,
-        ent_coef=0.003,
+        ent_coef=0.001,
         vf_coef=0.5,
-        target_kl=0.015,
+        target_kl=0.003,
         max_grad_norm=0.5,
     )
 
