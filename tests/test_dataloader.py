@@ -11,17 +11,27 @@ L_CTX, L_CHUNK = 6, 4
 _L = L_CTX + L_CHUNK
 
 
-def _fake_mds(n_samples: int = 6, length: int = 60) -> list[dict[str, np.ndarray]]:
+def _fake_mds(
+    n_samples: int = 6,
+    length: int = 60,
+    *,
+    character_pairs: list[tuple[int, int]] | None = None,
+) -> list[dict[str, np.ndarray]]:
     """In-memory stand-in for a StreamingDataset: each sample is one replay."""
-    return [
-        {
-            "schema_version": SCHEMA_VERSION,
-            "frame": np.arange(length, dtype=np.int32),
-            "p1_position_x": np.arange(length, dtype=np.float32),
-            "p2_position_x": np.arange(length, dtype=np.float32) + 1000.0,
-        }
-        for _ in range(n_samples)
-    ]
+    out = []
+    for i in range(n_samples):
+        p1, p2 = character_pairs[i] if character_pairs is not None else (1, 1)
+        out.append(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "frame": np.arange(length, dtype=np.int32),
+                "p1_character": np.full(length, p1, dtype=np.int32),
+                "p1_position_x": np.arange(length, dtype=np.float32),
+                "p2_character": np.full(length, p2, dtype=np.int32),
+                "p2_position_x": np.arange(length, dtype=np.float32) + 1000.0,
+            }
+        )
+    return out
 
 
 def _fingerprint(sampler: WindowDataset) -> list[tuple[int, str]]:
@@ -112,3 +122,23 @@ def test_windows_per_replay_default_is_one() -> None:
     """Default K=1 keeps the historical one-window-per-replay behavior."""
     wins = list(WindowDataset(_fake_mds(n_samples=3, length=60), L_CTX, L_CHUNK, seed=0))
     assert len(wins) == 3
+
+
+def test_character_pair_filter_keeps_matching_replays() -> None:
+    mds = _fake_mds(
+        n_samples=4,
+        length=60,
+        character_pairs=[(1, 1), (1, 22), (22, 1), (1, 1)],
+    )
+    wins = list(WindowDataset(mds, L_CTX, L_CHUNK, seed=0, character_pair=(1, 1)))
+    assert len(wins) == 2
+    assert all((w["ego_character"][0], w["opp_character"][0]) in {(1, 1)} for w in wins)
+
+
+def test_windows_per_replay_must_be_positive() -> None:
+    try:
+        WindowDataset(_fake_mds(), L_CTX, L_CHUNK, seed=0, windows_per_replay=0)
+    except ValueError as e:
+        assert "windows_per_replay" in str(e)
+    else:
+        raise AssertionError("expected ValueError")

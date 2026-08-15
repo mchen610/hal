@@ -146,6 +146,8 @@ class TrainConfig:
     ckpt_every: int = 2048
     # data (v4 MDS carries the stage + p{1,2}_character + nana columns)
     data_root: str = "data/processed/ranked-anonymized-1/mds"
+    character_pair: tuple[int, int] | None = None
+    windows_per_replay: int = 1
     cache_limit_gb: int = 440
     shuffle_block_size: int = 2000
     val_split: str = "val"
@@ -155,6 +157,12 @@ class TrainConfig:
 
 def _model_tag(cfg: TrainConfig) -> str:
     return f"gpt-d{cfg.d_model}-L{cfg.n_layers}-h{cfg.n_heads}-Lc{cfg.L_ctx}"
+
+
+def _character_pair_tag(pair: tuple[int, int] | None) -> str:
+    if pair is None:
+        return ""
+    return f"{melee.Character(pair[0]).name.lower()}-vs-{melee.Character(pair[1]).name.lower()}"
 
 
 # %%
@@ -615,6 +623,8 @@ def train(
         L_chunk=L_CHUNK,
         batch_size=cfg.batch_size,
         seed=cfg.seed,
+        windows_per_replay=cfg.windows_per_replay,
+        character_pair=cfg.character_pair,
     )
     train_loader = make_loader(
         split="train", num_workers=cfg.num_workers, prefetch_factor=cfg.prefetch_factor, **loader_kwargs
@@ -928,7 +938,12 @@ def main(args: Args) -> None:
         return
     cfg = args.cfg
     stats = load_consolidated_stats(Path(cfg.data_root) / "stats.json")
-    auto_comment = f"gpt-{cfg.max_steps // 1000}k-b{cfg.batch_size}"
+    auto_comment_parts = [f"gpt-{cfg.max_steps // 1000}k-b{cfg.batch_size}"]
+    if cfg.windows_per_replay > 1:
+        auto_comment_parts.append(f"clip{cfg.L_ctx // 60}s-k{cfg.windows_per_replay}")
+    if tag := _character_pair_tag(cfg.character_pair):
+        auto_comment_parts.append(tag)
+    auto_comment = "-".join(auto_comment_parts)
     train(cfg, stats, comment=args.comment or auto_comment)
 
 
