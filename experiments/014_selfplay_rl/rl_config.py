@@ -53,6 +53,32 @@ class RewardConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class WatchdogConfig:
+    """Run-health limits that fail the trainer so Vast can tear the box down."""
+
+    max_iteration_wait_s: float = 300.0
+    """Maximum learner wait for the next rollout iteration. <=0 disables."""
+
+    shutdown_grace_s: float = 30.0
+    """How long to wait for the collector thread after a watchdog failure."""
+
+    max_empty_iters: int = 3
+    """Abort after this many empty rollout payloads. <=0 disables."""
+
+    min_live_boot_fraction: float = 0.75
+    """Minimum fraction of Dolphin boots that must still be alive. <=0 disables."""
+
+    max_low_live_iters: int = 3
+    """Abort after this many consecutive iterations below min_live_boot_fraction."""
+
+    min_lockstep_sps: float = 10.0
+    """Minimum collector stepping rate. <=0 disables."""
+
+    max_low_sps_iters: int = 3
+    """Abort after this many consecutive low-sps iterations."""
+
+
+@dataclass(frozen=True, slots=True)
 class GymConfig:
     task: str = "CartPole-v1"
     num_envs: int = 8

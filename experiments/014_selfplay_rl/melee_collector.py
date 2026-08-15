@@ -571,6 +571,8 @@ class CollectStats:
 
     frames: int
     lockstep_sps: float
+    live_boots: int
+    total_boots: int
 
 
 IterationPayload = tuple[RolloutIteration, CollectStats]
@@ -696,6 +698,8 @@ def drive_rl(
                     stats = CollectStats(
                         frames=frames_stepped - frames_mark,
                         lockstep_sps=(frames_stepped - frames_mark) / max(1e-9, step_s),
+                        live_boots=sum(not d for d in done),
+                        total_boots=n,
                     )
                     _put(queue_out, (iteration, stats), stop)
                     emitted += 1

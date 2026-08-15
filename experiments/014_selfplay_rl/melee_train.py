@@ -22,6 +22,7 @@ bidirectional shutdown (a stop event both sides honor).
 
 import copy
 import dataclasses
+import os
 import queue
 import signal
 import threading
@@ -53,6 +54,7 @@ from rl_config import MeleeRLConfig
 from rl_config import PipelineConfig
 from rl_config import PPOConfig
 from rl_config import RewardConfig
+from rl_config import WatchdogConfig
 from rollout import FinalizedStream
 from rollout import RolloutIteration
 from rollout import Window
@@ -105,6 +107,7 @@ class Args:
     reward: RewardConfig = field(default_factory=RewardConfig)
     ema: EMAConfig = field(default_factory=lambda: EMAConfig(decay=0.995))
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
+    watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     seed: int = 0
     temp: float = 1.0  # collection sampling temperature (1.0 keeps behavior == recompute policy)
     value_warmup_lr: float = 1e-3
@@ -134,6 +137,7 @@ def _apply_smoke(args: Args) -> Args:
             value_warmup_iters=2,
             reboot_every_iters=2,  # exercise wave-reboot matchup rotation within the 5-iter smoke
         ),
+        watchdog=dataclasses.replace(args.watchdog, max_iteration_wait_s=60.0, shutdown_grace_s=5.0),
         pipeline=PipelineConfig(overlap=False),
         total_iterations=5,
         ckpt_every_iters=5,
@@ -352,7 +356,7 @@ def main(args: Args) -> None:
     replay_root = ckpt_dir / "replays"
     uploader = BackgroundUploader(run_name) if args.push_to_r2 else None
 
-    counters = {"iter": 0, "transitions": 0, "empty_iters": 0}
+    counters = {"iter": 0, "transitions": 0, "empty_iters": 0, "low_live_iters": 0, "low_sps_iters": 0}
     total_iters = args.total_iterations
     wandb_id = None
     if args.resume is not None:
@@ -470,6 +474,11 @@ def main(args: Args) -> None:
                 f"empty_iters={counters['empty_iters']} (learner iter={counters['iter']} now trails drive's emitted "
                 "count by this much; a persistent gap means the collector keeps yielding stepless iterations)"
             )
+            if 0 < args.watchdog.max_empty_iters <= counters["empty_iters"]:
+                raise RuntimeError(
+                    f"watchdog: {counters['empty_iters']} empty rollout iteration(s), "
+                    f"limit={args.watchdog.max_empty_iters}"
+                )
             return
         warmup = counters["iter"] < args.rl.value_warmup_iters
         if not warmup and not phase["ppo_started"]:
@@ -512,13 +521,15 @@ def main(args: Args) -> None:
             "learner_s_per_iter": learn_s,
             "queue_wait_s": queue_wait_s,  # real blocking time in _next_iteration
             "lockstep_sps": cstats.lockstep_sps,  # collector-measured stepping rate
+            "live_boots": cstats.live_boots,
+            "total_boots": cstats.total_boots,
         }
         common = (
             f"iter={counters['iter']} transitions={counters['transitions']} "
             f"reward_mean={rl_stats['reward_mean']:.4f} dmg/min={rl_stats['dmg_dealt_per_min']:.1f} "
             f"ep_return={rl_stats['ep_return_mean']:.2f} n_eps={int(rl_stats['n_episodes'])} "
             f"vf={metrics['vf_loss']:.3f} v_ev={vdiag['v_explained_var']:.3f} "
-            f"sps={cstats.lockstep_sps:.0f} learn_s={learn_s:.1f}"
+            f"sps={cstats.lockstep_sps:.0f} live={cstats.live_boots}/{cstats.total_boots} learn_s={learn_s:.1f}"
         )
         if warmup:  # value-head-only phase: policy metrics don't exist, so none are printed
             logger.info(f"{common} phase=warmup")
@@ -529,6 +540,7 @@ def main(args: Args) -> None:
                 f"epochs={int(metrics['epochs_used'])} ratio_dev0={metrics['ratio_dev_epoch0']:.4f}"
             )
         _check_finite(metrics)
+        _check_run_health(args.watchdog, counters, cstats)
         if args.wandb:
             import wandb
 
@@ -590,9 +602,11 @@ def main(args: Args) -> None:
     collector = threading.Thread(target=drive_target, name="rl-drive", daemon=True)
     collector.start()
     interrupted = False
+    run_error: BaseException | None = None
+    collector_stuck = False
     try:
         for _ in range(remaining):
-            payload, wait_s = _next_iteration(q, collector, stop)
+            payload, wait_s = _next_iteration(q, collector, stop, max_wait_s=args.watchdog.max_iteration_wait_s)
             if payload is None:
                 break
             iteration, cstats = payload
@@ -605,16 +619,31 @@ def main(args: Args) -> None:
         # would blow through the shutdown path before the final save — ignore from here on.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         logger.warning("SIGINT: stopping collection; final checkpoint follows (further SIGINT ignored)")
+    except BaseException as exc:  # noqa: BLE001 — save/upload latest before letting Vast tear down
+        run_error = exc
+        logger.exception(f"training loop failed: {exc!r}; final checkpoint follows")
     finally:
         stop.set()
         if sync_gate is not None:
             sync_gate.set()  # unblock a collector parked on the gate so it can wind down
+        deadline = (
+            time.monotonic() + args.watchdog.shutdown_grace_s
+            if (run_error is not None and args.watchdog.shutdown_grace_s > 0)
+            else None
+        )
         while collector.is_alive():
             try:
-                collector.join()
+                collector.join(timeout=_POLL)
             except KeyboardInterrupt:  # a repeat SIGINT racing the SIG_IGN swap above
                 interrupted = True
                 signal.signal(signal.SIGINT, signal.SIG_IGN)
+            if deadline is not None and time.monotonic() >= deadline:
+                collector_stuck = True
+                logger.error(
+                    f"collector did not stop within {args.watchdog.shutdown_grace_s:.1f}s after failure; "
+                    "saving latest checkpoint and forcing process exit"
+                )
+                break
 
     _save(ckpt_dir / "latest.pt", counters, learner, opt_ppo, opt_warm, const_sched, ema, args, cfg, wandb_id, uploader)
     if uploader is not None:
@@ -622,7 +651,11 @@ def main(args: Args) -> None:
         logger.info(f"[ckpt] queued {n} replay(s) for R2 upload")
         uploader.close()
     if drive_error and not interrupted:
-        raise drive_error[0]
+        run_error = run_error or drive_error[0]
+    if run_error is not None:
+        if collector_stuck:
+            os._exit(1)
+        raise run_error
     logger.info(f"done: {counters['iter']} iterations, {counters['transitions']} transitions")
 
 
@@ -630,7 +663,11 @@ _POLL = 0.1
 
 
 def _next_iteration(
-    q: queue.Queue[IterationPayload], collector: threading.Thread, stop: threading.Event
+    q: queue.Queue[IterationPayload],
+    collector: threading.Thread,
+    stop: threading.Event,
+    *,
+    max_wait_s: float,
 ) -> tuple[IterationPayload | None, float]:
     """Block for the next payload; returns it plus the real time spent blocked here
     (``queue_wait_s`` — the honest learner-starvation signal). ``None`` when the
@@ -640,12 +677,43 @@ def _next_iteration(
         try:
             return q.get(timeout=_POLL), time.monotonic() - t0
         except queue.Empty:
+            waited = time.monotonic() - t0
+            if max_wait_s > 0 and waited >= max_wait_s and collector.is_alive() and not stop.is_set():
+                stop.set()
+                raise TimeoutError(
+                    f"watchdog: no rollout iteration for {waited:.1f}s while collector is still alive"
+                )
             if collector.is_alive() and not stop.is_set():
                 continue
             try:
                 return q.get_nowait(), time.monotonic() - t0
             except queue.Empty:
                 return None, time.monotonic() - t0
+
+
+def _check_run_health(watchdog: WatchdogConfig, counters: dict[str, int], cstats: CollectStats) -> None:
+    if watchdog.min_live_boot_fraction > 0 and cstats.total_boots > 0:
+        live_frac = cstats.live_boots / cstats.total_boots
+        if live_frac < watchdog.min_live_boot_fraction:
+            counters["low_live_iters"] += 1
+        else:
+            counters["low_live_iters"] = 0
+        if 0 < watchdog.max_low_live_iters <= counters["low_live_iters"]:
+            raise RuntimeError(
+                f"watchdog: live boots {cstats.live_boots}/{cstats.total_boots} "
+                f"below {watchdog.min_live_boot_fraction:.2f} for {counters['low_live_iters']} iteration(s)"
+            )
+
+    if watchdog.min_lockstep_sps > 0:
+        if cstats.lockstep_sps < watchdog.min_lockstep_sps:
+            counters["low_sps_iters"] += 1
+        else:
+            counters["low_sps_iters"] = 0
+        if 0 < watchdog.max_low_sps_iters <= counters["low_sps_iters"]:
+            raise RuntimeError(
+                f"watchdog: lockstep_sps={cstats.lockstep_sps:.1f} below {watchdog.min_lockstep_sps:.1f} "
+                f"for {counters['low_sps_iters']} iteration(s)"
+            )
 
 
 def _check_finite(metrics: dict[str, float]) -> None:

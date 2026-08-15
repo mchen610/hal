@@ -16,6 +16,7 @@
 #   GITHUB_TOKEN         optional; only set when the repo/image is private
 #   HAL_FAILURE_ACTION   optional; "destroy" (default) or "stop" on boot/train failure
 #   HAL_KEEP_ALIVE       optional; "1" disables all self-teardown (debug: leave box up)
+#   HAL_TRAIN_IDLE_TIMEOUT_S optional; kill training if train.log stops changing
 # vast injects CONTAINER_ID + CONTAINER_API_KEY (a per-instance key) so the box
 # can stop/destroy itself.
 set -euo pipefail
@@ -147,8 +148,44 @@ log "training: ${cmd}"
 # destroys the box. Failure follows HAL_FAILURE_ACTION, which defaults to destroy
 # because stopped instances still bill their disk.
 set +e
-bash -c "$cmd" 2>&1 | tee /opt/hal/train.log
-code=${PIPESTATUS[0]}
+idle_timeout_s="${HAL_TRAIN_IDLE_TIMEOUT_S:-900}"
+case "$idle_timeout_s" in
+  '' | *[!0-9]*)
+    log "WARN: invalid HAL_TRAIN_IDLE_TIMEOUT_S=${idle_timeout_s}; defaulting to 900"
+    idle_timeout_s=900
+    ;;
+esac
+if [ "$idle_timeout_s" -gt 0 ]; then
+  log "training idle timeout: ${idle_timeout_s}s without /opt/hal/train.log writes"
+else
+  log "training idle timeout disabled"
+fi
+: > /opt/hal/train.log
+setsid bash -c "$cmd" > >(tee -a /opt/hal/train.log) 2>&1 &
+train_pid=$!
+code=0
+while true; do
+  if ! kill -0 "$train_pid" 2>/dev/null; then
+    wait "$train_pid"
+    code=$?
+    break
+  fi
+  if [ "$idle_timeout_s" -gt 0 ]; then
+    last_write=$(stat -c %Y /opt/hal/train.log 2>/dev/null || date +%s)
+    now=$(date +%s)
+    idle_s=$((now - last_write))
+    if [ "$idle_s" -ge "$idle_timeout_s" ]; then
+      log "training idle timeout: no /opt/hal/train.log writes for ${idle_s}s; terminating training process group"
+      kill -TERM "-$train_pid" 2>/dev/null || kill -TERM "$train_pid" 2>/dev/null || true
+      sleep 20
+      kill -KILL "-$train_pid" 2>/dev/null || kill -KILL "$train_pid" 2>/dev/null || true
+      wait "$train_pid" 2>/dev/null || true
+      code=124
+      break
+    fi
+  fi
+  sleep 30
+done
 set -e
 
 if [ "$code" -eq 0 ]; then

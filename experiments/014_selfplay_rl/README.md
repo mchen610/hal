@@ -43,9 +43,8 @@ uv run experiments/014_selfplay_rl/gym_train.py --task Pong-v5
 uv run experiments/014_selfplay_rl/melee_train.py --wandb --run-name <name> --rl.n-boots 6
 
 # Matchup-specific self-play from the Fox/Fox 009 BC teacher
-uv run scripts/launch_vast.py --min-ram 64 --min-dlperf 150 --run-hours 6 -- \
+uv run scripts/launch_vast.py --min-ram 64 --min-dlperf 150 --run-hours 6 --train-idle-timeout-s 900 -- \
   uv run experiments/014_selfplay_rl/melee_train.py \
-    --wandb \
     --push-to-r2 \
     --run-name 014_teacher_anchored_009_fox_vs_fox \
     --total-iterations 800 \
@@ -54,7 +53,11 @@ uv run scripts/launch_vast.py --min-ram 64 --min-dlperf 150 --run-hours 6 -- \
     --rl.warm-start-kind 009 \
     --rl.opponent self_play \
     --rl.fixed-character FOX \
-    --rl.n-boots 8
+    --rl.n-boots 4
+
+# Watchdog defaults fail the trainer if rollout iterations stall for 5 minutes,
+# if repeated rollout payloads are empty, if live Dolphin boots drop too far, or
+# if collector stepping stays very slow. Vast then destroys the box by default.
 
 # G3 eval: EMA vs frozen 012 IL head-to-head, then vs lvl-9 CPU vs pinned baseline.
 # NEVER run evals concurrently with a live trainer on the dev box (10+ Dolphins +

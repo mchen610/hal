@@ -257,7 +257,9 @@ def queue(
 FailureAction = Literal["destroy", "stop"]
 
 
-def _instance_env(*, sha: str, git_remote: str, train_cmd: str, failure_action: FailureAction) -> dict[str, str]:
+def _instance_env(
+    *, sha: str, git_remote: str, train_cmd: str, failure_action: FailureAction, train_idle_timeout_s: int
+) -> dict[str, str]:
     # Only non-secret per-run vars go through `-e` (these are visible in extra_env).
     # Secrets come from the vast account env-vars; see REQUIRED_ACCOUNT_VARS.
     return {
@@ -265,6 +267,7 @@ def _instance_env(*, sha: str, git_remote: str, train_cmd: str, failure_action: 
         "HAL_GIT_REMOTE": git_remote,
         "HAL_TRAIN_CMD_B64": base64.b64encode(train_cmd.encode()).decode(),
         "HAL_FAILURE_ACTION": failure_action,
+        "HAL_TRAIN_IDLE_TIMEOUT_S": str(train_idle_timeout_s),
     }
 
 
@@ -474,6 +477,9 @@ class Args:
     """Expected run length, used only to amortize the one-time download+upload costs into the
     per-hour ranking metric (eff$/dlperf/hr = (effective $/hr + one-time$/run_hours) / dlperf).
     A shorter run makes the transfer tax weigh more. Does not gate anything."""
+    train_idle_timeout_s: int = 900
+    """Last-resort kill switch: after training starts, destroy the box if train.log gets no
+    writes for this many seconds. <=0 disables."""
 
 
 def main(args: Args) -> None:
@@ -500,7 +506,13 @@ def main(args: Args) -> None:
 
     sha, git_remote, token = preflight(vast)
     train_cmd = shlex.join(args.cmd)
-    env = _instance_env(sha=sha, git_remote=git_remote, train_cmd=train_cmd, failure_action=args.failure_action)
+    env = _instance_env(
+        sha=sha,
+        git_remote=git_remote,
+        train_cmd=train_cmd,
+        failure_action=args.failure_action,
+        train_idle_timeout_s=args.train_idle_timeout_s,
+    )
     if args.keep_alive:
         env["HAL_KEEP_ALIVE"] = "1"
 
