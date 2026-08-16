@@ -231,6 +231,8 @@ class TrainConfig:
     # Each replay supplies four windows, but no batch contains the same replay twice.
     windows_per_replay: int = 4
     reservoir_capacity: int = 4096
+    # Optional ordered (p1, p2) libmelee character IDs for matchup-specific runs.
+    character_pair: tuple[int, int] | None = None
     val_split: str = "val"
     num_workers: int = 16
     prefetch_factor: int = 2
@@ -248,9 +250,10 @@ def _model_tag(cfg: TrainConfig) -> str:
     else:
         order = ".".join(name.replace("_stick", "") for name in cfg.action_group_order)
         head = f"factored-mlp-r{cfg.action_mlp_ratio}-c{cfg.action_condition_dim}-{order}"
+    matchup = "" if cfg.character_pair is None else f"-chars{cfg.character_pair[0]}v{cfg.character_pair[1]}"
     return (
         f"gpt-d{cfg.d_model}-L{cfg.n_layers}-h{cfg.n_heads}-Lc{cfg.L_ctx}-a{cfg.action_vocab}-"
-        f"{attention}-recompute-o{offs}-{head}"
+        f"{attention}-recompute-o{offs}-{head}{matchup}"
     )
 
 
@@ -1056,6 +1059,16 @@ def validate_config(cfg: TrainConfig, *, has_button_combo_counts: bool) -> None:
             f"reservoir_capacity={cfg.reservoir_capacity} must be at least twice the micro-batch "
             f"size {_micro_batch(cfg)} to enforce one-batch replay cooldown"
         )
+    if cfg.character_pair is not None:
+        if len(cfg.character_pair) != 2 or any(
+            not isinstance(character, int) or isinstance(character, bool) for character in cfg.character_pair
+        ):
+            raise ValueError(f"character_pair must contain two integer libmelee IDs, got {cfg.character_pair!r}")
+        for character in cfg.character_pair:
+            try:
+                melee.Character(character)
+            except ValueError as error:
+                raise ValueError(f"unknown libmelee character ID in character_pair: {character}") from error
     if not isinstance(cfg.attn_window, int) or isinstance(cfg.attn_window, bool) or cfg.attn_window < 0:
         raise ValueError(f"attn_window must be a non-negative integer (0 = full context), got {cfg.attn_window!r}")
     if cfg.final_h2h_reference_run is not None:
@@ -2001,6 +2014,7 @@ class EvalProtocol:
     ego_port: int
     seed_stage: int
     matchup_schedule_sha256: str
+    character_pair: tuple[int, int] | None
     instant_match_restart: bool
     stage_policy: str
     completion_policy: str
@@ -2038,7 +2052,11 @@ def _eval_protocol(
         raise ValueError(f"max_parallel must be in 1..{n}, got {parallel}")
     if frames <= 0:
         raise ValueError(f"max_frames must be > 0, got {frames}")
-    matchups = matchups_for_vs_cpu(n)
+    matchups = (
+        matchups_for_vs_cpu(n)
+        if cfg.character_pair is None
+        else [(melee.Character(cfg.character_pair[0]), melee.Character(cfg.character_pair[1]))] * n
+    )
     schedule = [[int(ego.value), int(opp.value)] for ego, opp in matchups]
     schedule_sha256 = hashlib.sha256(json.dumps(schedule, separators=(",", ":")).encode()).hexdigest()
     return EvalProtocol(
@@ -2050,6 +2068,7 @@ def _eval_protocol(
         ego_port=1,
         seed_stage=int(PRIOR_SWEEP_SEED_STAGE.value),
         matchup_schedule_sha256=schedule_sha256,
+        character_pair=cfg.character_pair,
         instant_match_restart=True,
         stage_policy="battlefield_then_random_legal",
         completion_policy="finish_in_flight_wave",
@@ -2120,6 +2139,12 @@ def _run_eval_sweep(
         return tracked
 
     started_at = time.perf_counter()
+    matchups = (
+        None
+        if protocol.character_pair is None
+        else [(melee.Character(protocol.character_pair[0]), melee.Character(protocol.character_pair[1]))]
+        * protocol.n_matchups
+    )
     results, rows = sweep_vs_cpu_prior_with_rows(
         tracked_factory,
         session_cfg=default_session_cfg(replay_dir, instant_match_restart=protocol.instant_match_restart),
@@ -2130,6 +2155,7 @@ def _run_eval_sweep(
         ego_port=protocol.ego_port,
         seed_stage=melee.Stage(protocol.seed_stage),
         start_retries=protocol.start_retries,
+        matchups=matchups,
     )
     metrics = vs_cpu_metrics(results, seed=protocol.seed)
     metrics["eval_wall_seconds"] = time.perf_counter() - started_at
@@ -2216,6 +2242,7 @@ def _loader_kwargs(cfg: TrainConfig, stats: dict[str, FeatureStats]) -> dict:
         seed=cfg.seed,
         schema_version=cfg.mds_schema_version,
         projection=_INPUT_PROJECTION,
+        character_pair=cfg.character_pair,
     )
 
 

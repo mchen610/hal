@@ -4,7 +4,9 @@ import inspect
 import json
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
+import melee
 import numpy as np
 import pytest
 import torch
@@ -452,6 +454,7 @@ def test_eval_sweep_uses_recorded_cpu_protocol(monkeypatch) -> None:
         seen.update(kwargs)
         return [], []
 
+    monkeypatch.setattr(exp, "default_session_cfg", lambda *_args, **kwargs: SimpleNamespace(**kwargs))
     monkeypatch.setattr(exp, "sweep_vs_cpu_prior_with_rows", fake_sweep)
     exp._run_eval_sweep(lambda: object(), protocol=protocol, replay_dir=None, rows_path=None)
 
@@ -460,6 +463,32 @@ def test_eval_sweep_uses_recorded_cpu_protocol(monkeypatch) -> None:
     assert int(seen["seed_stage"].value) == protocol.seed_stage
     assert seen["session_cfg"].instant_match_restart is protocol.instant_match_restart
     assert seen["start_retries"] == protocol.start_retries
+    assert seen["matchups"] is None
+
+
+def test_fixed_character_pair_controls_training_tag_and_eval_schedule(monkeypatch) -> None:
+    fox = int(melee.Character.FOX.value)
+    cfg = exp.TrainConfig(character_pair=(fox, fox))
+    protocol = exp._eval_protocol(
+        cfg,
+        settings=exp.DecodeSettings(1.0, None, 0, 0.0, False),
+        exec_horizon=1,
+        default_n_matchups=3,
+        model_dtype="torch.float16",
+    )
+    seen = {}
+
+    def fake_sweep(_factory, **kwargs):
+        seen.update(kwargs)
+        return [], []
+
+    monkeypatch.setattr(exp, "default_session_cfg", lambda *_args, **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(exp, "sweep_vs_cpu_prior_with_rows", fake_sweep)
+    exp._run_eval_sweep(lambda: object(), protocol=protocol, replay_dir=None, rows_path=None)
+
+    assert protocol.character_pair == (fox, fox)
+    assert "-chars1v1" in exp._model_tag(cfg)
+    assert seen["matchups"] == [(melee.Character.FOX, melee.Character.FOX)] * 3
 
 
 def test_eval_sweep_records_decode_telemetry(tmp_path, monkeypatch) -> None:
@@ -478,6 +507,7 @@ def test_eval_sweep_records_decode_telemetry(tmp_path, monkeypatch) -> None:
         policy(0, {"a": object(), "b": object()})
         return [], []
 
+    monkeypatch.setattr(exp, "default_session_cfg", lambda *_args, **kwargs: SimpleNamespace(**kwargs))
     monkeypatch.setattr(exp, "sweep_vs_cpu_prior_with_rows", fake_sweep)
     metrics = exp._run_eval_sweep(
         lambda: lambda _frame_index, _obs: {},
