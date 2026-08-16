@@ -16,10 +16,11 @@
 #   GITHUB_TOKEN         optional; only set when the repo/image is private
 #   HAL_FAILURE_ACTION   optional; "destroy" (default) or "stop" on boot/train failure
 #   HAL_KEEP_ALIVE       optional; "1" disables all self-teardown (debug: leave box up)
+#   HAL_BOOT_TIMEOUT_S   optional; kill bootstrap if clone/sync/fetch/preflight exceeds this
 #   HAL_TRAIN_IDLE_TIMEOUT_S optional; kill training if train.log stops changing
 # vast injects CONTAINER_ID + CONTAINER_API_KEY (a per-instance key) so the box
 # can stop/destroy itself.
-set -euo pipefail
+set -Eeuo pipefail
 
 log() { echo "[on-start] $*"; }
 
@@ -38,7 +39,52 @@ if [ -r /proc/1/environ ]; then
     case "$kv" in AWS_*=* | WANDB_*=* | GITHUB_TOKEN=* | HAL_*=*) export "$kv" ;; esac
   done < /proc/1/environ
 fi
+
+# Vast removes container logs when a self-destroying instance exits. Mirror the
+# complete lifecycle output to a file so the final success or failure path can
+# preserve it in R2 before teardown.
+lifecycle_log=/tmp/hal-lifecycle.log
+: > "$lifecycle_log"
+exec > >(tee -a "$lifecycle_log") 2>&1
+
 log "env check: AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL:+set} WANDB_API_KEY=${WANDB_API_KEY:+set} HAL_GIT_SHA=${HAL_GIT_SHA:+set} HAL_GIT_REMOTE=${HAL_GIT_REMOTE:+set} HAL_TRAIN_CMD_B64=${HAL_TRAIN_CMD_B64:+set} HAL_FAILURE_ACTION=${HAL_FAILURE_ACTION:-destroy}"
+
+upload_lifecycle_log() {
+  outcome="$1"
+  if [ -z "${AWS_ENDPOINT_URL:-}" ] || [ -z "${AWS_BUCKET:-}" ]; then
+    log "WARN: cannot preserve lifecycle log: R2 endpoint or bucket is missing"
+    return
+  fi
+
+  sha_tag="${HAL_GIT_SHA:-unknown}"
+  sha_tag="${sha_tag:0:10}"
+  instance_tag="${CONTAINER_ID:-unknown}"
+  timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+  key="runs/_launch_logs/${sha_tag}/${timestamp}_${instance_tag}_${outcome}.log"
+  snapshot=$(mktemp)
+  cp "$lifecycle_log" "$snapshot"
+  if /opt/venv/bin/python - "$snapshot" "$key" <<'PY'
+import os
+import sys
+
+import boto3
+
+source, key = sys.argv[1:]
+client = boto3.client(
+    "s3",
+    endpoint_url=os.environ["AWS_ENDPOINT_URL"],
+    aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+    aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+)
+client.upload_file(source, os.environ["AWS_BUCKET"], key)
+PY
+  then
+    log "preserved lifecycle log: s3://${AWS_BUCKET}/${key}"
+  else
+    log "WARN: failed to preserve lifecycle log at s3://${AWS_BUCKET}/${key}"
+  fi
+  rm -f "$snapshot"
+}
 
 # Teardown, gated on HAL_KEEP_ALIVE so a debug run leaves the box SSH-able. $1 is the
 # vast verb (stop|destroy), $2 a human reason for the log.
@@ -67,13 +113,48 @@ esac
 # Any failure during boot (clone, sync, fetch) destroys the box by default so a stopped
 # instance cannot keep billing disk. Use HAL_FAILURE_ACTION=stop or HAL_KEEP_ALIVE=1
 # only when you intentionally want a failed box left around for debugging.
-trap 'log "boot failed (line $LINENO)"; teardown "$failure_action" "boot failure"; exit 1' ERR
+boot_failure() {
+  code="$1"
+  line="$2"
+  trap - ERR TERM
+  if [ -n "${boot_watchdog_pid:-}" ]; then
+    kill "$boot_watchdog_pid" 2>/dev/null || true
+    wait "$boot_watchdog_pid" 2>/dev/null || true
+  fi
+  log "boot failed (line ${line}, exit ${code})"
+  upload_lifecycle_log boot-failed
+  teardown "$failure_action" "boot failure"
+  exit "$code"
+}
+trap 'boot_failure "$?" "$LINENO"' ERR
+trap 'boot_failure 124 "$LINENO"' TERM
 
 # Fail loud + early if the injected inputs are missing (e.g. env recovery found
 # nothing) instead of dying obscurely mid-clone.
 : "${HAL_GIT_SHA:?missing — vast -e env not recovered from /proc/1/environ}"
 : "${HAL_TRAIN_CMD_B64:?missing — vast -e env not recovered from /proc/1/environ}"
 : "${AWS_ENDPOINT_URL:?missing — R2 creds not recovered from /proc/1/environ}"
+
+boot_timeout_s="${HAL_BOOT_TIMEOUT_S:-900}"
+case "$boot_timeout_s" in
+  '' | *[!0-9]*)
+    log "WARN: invalid HAL_BOOT_TIMEOUT_S=${boot_timeout_s}; defaulting to 900"
+    boot_timeout_s=900
+    ;;
+esac
+if [ "$boot_timeout_s" -gt 0 ]; then
+  boot_shell_pid=$$
+  (
+    sleep "$boot_timeout_s"
+    log "bootstrap timeout after ${boot_timeout_s}s; terminating on-start"
+    kill -TERM "$boot_shell_pid"
+  ) &
+  boot_watchdog_pid=$!
+  log "bootstrap timeout: ${boot_timeout_s}s"
+else
+  boot_watchdog_pid=""
+  log "bootstrap timeout disabled"
+fi
 
 # Persist creds so an interactive `ssh` peek (e.g. to --resume) sees them too.
 # `|| true`: grep exits 1 on no match, which must not trip `set -e`.
@@ -114,8 +195,7 @@ shm_mb=$(df -m /dev/shm | awk 'NR==2 {print $2}')
 log "/dev/shm = ${shm_mb}MB"
 if [ "${shm_mb:-0}" -lt 1024 ]; then
   log "FATAL: /dev/shm ${shm_mb}MB < 1GB (remount failed/undersized) — dataloader would die at step 0; aborting"
-  teardown "$failure_action" "insufficient /dev/shm (${shm_mb}MB)"
-  exit 1
+  boot_failure 1 "$LINENO"
 fi
 
 # Datasets/fixtures from R2 (sha-pinned, idempotent); stats.json sits outside the
@@ -141,6 +221,12 @@ uv run python -c "import torch; assert torch.cuda.is_available(), 'torch.cuda.is
 # "RuntimeError: received 0 items of ancdata" in recvfds. Raise the soft limit to the
 # hard cap so fd-passing has headroom.
 ulimit -n "$(ulimit -Hn)" && log "open files (ulimit -n) -> $(ulimit -n)"
+
+if [ -n "$boot_watchdog_pid" ]; then
+  kill "$boot_watchdog_pid" 2>/dev/null || true
+  wait "$boot_watchdog_pid" 2>/dev/null || true
+fi
+trap - TERM
 
 cmd="$(printf '%s' "$HAL_TRAIN_CMD_B64" | base64 -d)"
 log "training: ${cmd}"
@@ -189,7 +275,9 @@ done
 set -e
 
 if [ "$code" -eq 0 ]; then
+  upload_lifecycle_log training-succeeded
   teardown destroy "training succeeded (checkpoints in R2, logs in W&B)"
 else
+  upload_lifecycle_log training-exited-${code}
   teardown "$failure_action" "training exited ${code}"
 fi

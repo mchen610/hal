@@ -118,7 +118,7 @@ class TrainConfig:
     d_model: int = 256
     n_layers: int = 8
     n_heads: int = 4
-    # Matchup conditioning (schema v4). char/stage embeddings are indexed by the RAW libmelee id
+    # Matchup conditioning (schema v5). Character/stage embeddings are indexed by libmelee ids
     # (characters 0-26 dense; stages sparse in 0-26), so the vocab must exceed the max id, not the
     # number of included categories; out-of-range ids clamp to the last row.
     char_vocab: int = 32
@@ -152,7 +152,7 @@ class TrainConfig:
     eval_timeout_seconds: float = 900.0
     # checkpointing
     ckpt_every: int = 2048
-    # data (v4 MDS carries the stage + p{1,2}_character + nana columns)
+    # data (v5 MDS carries libmelee-valued stage + p{1,2}_character plus nana columns)
     data_root: str = "data/processed/ranked-anonymized-1/mds"
     character_pair: tuple[int, int] | None = None
     windows_per_replay: int = 1
