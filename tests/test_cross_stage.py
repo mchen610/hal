@@ -12,6 +12,7 @@ from melee import Character
 from melee import Stage
 
 from hal.data.replay_stats import cumulative_damage
+from hal.eval import cross_stage
 from hal.eval.cross_stage import FRAMES_PER_MINUTE
 from hal.eval.cross_stage import PREGAME_FRAMES
 from hal.eval.cross_stage import STARTING_STOCKS
@@ -353,6 +354,20 @@ def test_combined_prior_sweep_reuses_identical_boots_for_summaries_and_rows(monk
     assert len(result) == len(rows) == 1
     assert result[0][1] == rows[0].boot_index == 0
     assert result[0][2] is not None and result[0][2].frames == rows[0].total_frames == 3
+
+
+def test_prior_match_builder_accepts_an_explicit_matchup_schedule() -> None:
+    fox_dittos = [(Character.FOX, Character.FOX)] * 3
+
+    matches = cross_stage._prior_vec_matches(
+        3,
+        cpu_level=9,
+        ego_port=1,
+        seed_stage=Stage.BATTLEFIELD,
+        matchups=fox_dittos,
+    )
+
+    assert [tuple(player.character for player in match.matchup.players) for match in matches] == fox_dittos
 
 
 # --------------------------------------------------------------- matched comparison

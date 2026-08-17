@@ -4,6 +4,7 @@ import functools
 from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Iterator
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
@@ -47,6 +48,15 @@ type BatchTransform = Callable[[list[Window], TrainBatch], object]
 
 def _loader_generator(seed: int) -> torch.Generator:
     return torch.Generator().manual_seed(seed)
+
+
+def _matches_character_pair(sample: Mapping[str, object], character_pair: tuple[int, int] | None) -> bool:
+    if character_pair is None:
+        return True
+    return all(
+        int(np.asarray(sample[f"p{port}_character"]).reshape(-1)[0]) == character
+        for port, character in enumerate(character_pair, start=1)
+    )
 
 
 class PolicyReplayDataset(IterableDataset):
@@ -153,6 +163,7 @@ class WindowDataset(IterableDataset):
         schema_version: int = SCHEMA_VERSION,
         projection: FeatureProjection | None = None,
         replay_transform: ReplayTransform | None = None,
+        character_pair: tuple[int, int] | None = None,
     ) -> None:
         self._mds = mds
         self.L_ctx = L_ctx
@@ -163,6 +174,7 @@ class WindowDataset(IterableDataset):
         self._schema_version = schema_version
         self._projection = projection
         self._replay_transform = replay_transform
+        self._character_pair = character_pair
         self._epoch = 0
 
     def __iter__(self) -> Iterator[Window]:
@@ -176,6 +188,8 @@ class WindowDataset(IterableDataset):
         self._epoch += 1
         for sample in self._mds:
             check_schema_version(sample, expected=self._schema_version)
+            if not _matches_character_pair(sample, self._character_pair):
+                continue
             if self._replay_transform is not None:
                 sample = self._replay_transform(sample)
             frame = sample["frame"]
@@ -280,6 +294,7 @@ def make_loader(
     compact: bool = False,
     replay_transform: ReplayTransform | None = None,
     batch_transform: BatchTransform | None = None,
+    character_pair: tuple[int, int] | None = None,
 ) -> DataLoader:
     """Build the (StreamingDataset → WindowDataset → DataLoader) chain. The
     DataLoader yields ``TrainBatch`` by default (preprocessing runs in the
@@ -340,6 +355,7 @@ def make_loader(
         schema_version=schema_version,
         projection=projection,
         replay_transform=replay_transform,
+        character_pair=character_pair,
     )
     collate = functools.partial(
         _collate_with_batch_transform,

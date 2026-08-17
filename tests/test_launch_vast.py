@@ -12,6 +12,7 @@ _SPEC.loader.exec_module(_MODULE)
 
 Args = _MODULE.Args
 build_query = _MODULE.build_query
+instance_env = _MODULE._instance_env
 
 
 def test_build_query_can_select_one_compute_capability() -> None:
@@ -43,3 +44,13 @@ def test_compute_capability_bounds_are_disabled_by_default() -> None:
     )
 
     assert "compute_cap" not in query
+
+
+def test_instance_receives_the_origin_containing_the_commit() -> None:
+    env = instance_env(
+        sha="a" * 40,
+        origin_url="https://github.com/example/hal.git",
+        train_cmd="uv run experiment.py",
+    )
+
+    assert env["HAL_GIT_REMOTE"] == "https://github.com/example/hal.git"

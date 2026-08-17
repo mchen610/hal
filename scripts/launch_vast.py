@@ -3,8 +3,8 @@
 The instance is fire-and-forget: this launcher pushes the current git SHA, waits
 for an offer that clears the hardware bar, rents it, and injects the SHA + the
 (base64'd) training command. The box then clones that SHA, trains, and tears
-*itself* down — destroy on success (checkpoints are already in R2, logs in W&B),
-stop on failure (for inspection). See docker/on-start.sh.
+*itself* down after success or failure (checkpoints are in R2 and training logs are
+in W&B). Use ``--keep-alive`` only for a supervised debugging run. See docker/on-start.sh.
 
     python scripts/launch_vast.py                         # search-only: print offers, rent nothing
     python scripts/launch_vast.py --dry-run -- uv run experiments/001_flow_matching_baseline.py
@@ -213,18 +213,20 @@ def _account_env_keys(vast: VastAI) -> set[str]:
     return set()
 
 
-def preflight(vast: VastAI) -> tuple[str, str | None]:
+def preflight(vast: VastAI) -> tuple[str, str, str | None]:
     """Ensure the run is reproducible and credentialed before spending money.
 
-    Returns (sha, github_token_or_none). Exits with a clear message on a dirty tree,
-    an unpushed SHA we can't push, or missing account secrets. Secrets come from vast
-    account env-vars (not the host, not `-e`); the GitHub token is optional (only used
-    to pull a private ghcr image).
+    Returns (sha, origin_url, github_token_or_none). Exits with a clear message on a
+    dirty tree, an unpushed SHA we can't push, or missing account secrets. Secrets
+    come from vast account env-vars (not the host, not `-e`); the GitHub token is
+    optional (only used to pull a private ghcr image).
     """
     if _git("status", "--porcelain"):
         raise SystemExit("working tree is dirty — commit before launching (the box runs the pushed SHA).")
     sha = _git("rev-parse", "HEAD")
-    if not _git("branch", "-r", "--contains", sha):
+    origin_url = _git("remote", "get-url", "origin")
+    remote_branches = _git("branch", "-r", "--contains", sha).splitlines()
+    if not any(branch.strip().startswith("origin/") for branch in remote_branches):
         branch = _git("rev-parse", "--abbrev-ref", "HEAD")
         logger.info(f"{sha[:10]} not on origin; pushing {branch}")
         subprocess.run(["git", "push", "origin", branch], check=True)
@@ -237,7 +239,7 @@ def preflight(vast: VastAI) -> tuple[str, str | None]:
             "leaking into extra_env."
         )
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    return sha, token
+    return sha, origin_url, token
 
 
 def queue(
@@ -278,11 +280,12 @@ def queue(
         time.sleep(poll_interval_s)
 
 
-def _instance_env(*, sha: str, train_cmd: str) -> dict[str, str]:
+def _instance_env(*, sha: str, origin_url: str, train_cmd: str) -> dict[str, str]:
     # Only non-secret per-run vars go through `-e` (these are visible in extra_env).
     # Secrets come from the vast account env-vars; see REQUIRED_ACCOUNT_VARS.
     return {
         "HAL_GIT_SHA": sha,
+        "HAL_GIT_REMOTE": origin_url,
         "HAL_TRAIN_CMD_B64": base64.b64encode(train_cmd.encode()).decode(),
     }
 
@@ -559,9 +562,9 @@ def main(args: Args) -> None:
         logger.info("search-only (pass a training command after `--` to launch). Nothing rented.")
         return
 
-    sha, token = preflight(vast)
+    sha, origin_url, token = preflight(vast)
     train_cmd = shlex.join(args.cmd)
-    env = _instance_env(sha=sha, train_cmd=train_cmd)
+    env = _instance_env(sha=sha, origin_url=origin_url, train_cmd=train_cmd)
     if args.keep_alive:
         env["HAL_KEEP_ALIVE"] = "1"
 
@@ -573,6 +576,7 @@ def main(args: Args) -> None:
         logger.info(f"[dry-run] env (non-secret; secrets come from vast account env-vars)={env}")
         logger.info(f"[dry-run] onstart=<inline {ONSTART_PATH.name}, {len(ONSTART_PATH.read_text())} bytes>")
         logger.info(f"[dry-run] HAL_GIT_SHA={sha}")
+        logger.info(f"[dry-run] HAL_GIT_REMOTE={origin_url}")
         logger.info(f"[dry-run] train cmd: {train_cmd}")
         return
 
@@ -613,7 +617,7 @@ def main(args: Args) -> None:
     teardown = (
         "kept up regardless (--keep-alive); destroy manually"
         if args.keep_alive
-        else "self-destructs on success / self-stops on failure"
+        else "self-destructs on success or failure"
     )
     logger.info(f"teardown: box {teardown}.")
 

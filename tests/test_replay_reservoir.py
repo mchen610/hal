@@ -90,6 +90,48 @@ def test_compact_replay_transform_sees_full_episode_before_windowing(monkeypatch
     np.testing.assert_array_equal(window["ego_label"][pad:], window["frame"][pad:] + 100)
 
 
+def test_compact_character_pair_filter_runs_before_decode(monkeypatch) -> None:
+    frames = 12
+    compact = [
+        {
+            "replay_id": replay_id,
+            "source_schema_version": 7,
+            "num_frames": frames,
+            "p1_character": p1,
+            "p2_character": p2,
+        }
+        for replay_id, p1, p2 in (("fox", 1, 1), ("falco", 1, 20))
+    ]
+    decoded_ids: list[str] = []
+
+    def decode(row):
+        decoded_ids.append(row["replay_id"])
+        return {
+            "schema_version": 7,
+            "frame": np.arange(frames, dtype=np.int32),
+            "p1_value": np.arange(frames, dtype=np.float32),
+            "p2_value": -np.arange(frames, dtype=np.float32),
+        }
+
+    monkeypatch.setattr(replay_reservoir, "decode_policy_replay", decode)
+    packs = list(
+        PolicyReplayPackDataset(
+            compact,
+            L_ctx=3,
+            L_chunk=2,
+            seed=4,
+            windows_per_replay=1,
+            schema_version=7,
+            projection=None,
+            replay_transform=lambda row: row,
+            character_pair=(1, 1),
+        )
+    )
+
+    assert decoded_ids == ["fox"]
+    assert [pack.replay_id for pack in packs] == ["fox"]
+
+
 def test_prefetch_preserves_order_at_requested_depth() -> None:
     prepared = Event()
 

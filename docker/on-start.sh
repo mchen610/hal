@@ -10,6 +10,7 @@
 #
 # Driven entirely by env injected at create time:
 #   HAL_GIT_SHA          commit to check out
+#   HAL_GIT_REMOTE       repository containing that commit
 #   HAL_TRAIN_CMD_B64    base64 of the training command (base64 survives the env string)
 #   AWS_*, WANDB_API_KEY  R2 + W&B credentials
 #   GITHUB_TOKEN         optional; only set when the repo/image is private
@@ -24,7 +25,7 @@ log() { echo "[on-start] $*"; }
 #   - account env-vars (R2 + W&B secrets, set in the vast console) — written to
 #     /etc/environment, deliberately kept out of the per-instance config so they
 #     don't leak into `show instance`/extra_env.
-#   - the per-run `-e` vars (HAL_GIT_SHA, HAL_TRAIN_CMD_B64, HAL_KEEP_ALIVE) — these
+#   - the per-run `-e` vars (HAL_GIT_*, HAL_TRAIN_CMD_B64, HAL_KEEP_ALIVE) — these
 #     live in the container's PID 1 environ (NUL-separated).
 # Export both so this script and the training child inherit them.
 set -a
@@ -35,7 +36,7 @@ if [ -r /proc/1/environ ]; then
     case "$kv" in AWS_*=* | WANDB_*=* | GITHUB_TOKEN=* | HAL_*=*) export "$kv" ;; esac
   done < /proc/1/environ
 fi
-log "env check: AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL:+set} WANDB_API_KEY=${WANDB_API_KEY:+set} HAL_GIT_SHA=${HAL_GIT_SHA:+set} HAL_TRAIN_CMD_B64=${HAL_TRAIN_CMD_B64:+set}"
+log "env check: AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL:+set} WANDB_API_KEY=${WANDB_API_KEY:+set} HAL_GIT_SHA=${HAL_GIT_SHA:+set} HAL_GIT_REMOTE=${HAL_GIT_REMOTE:+set} HAL_TRAIN_CMD_B64=${HAL_TRAIN_CMD_B64:+set}"
 
 # Teardown, gated on HAL_KEEP_ALIVE so a debug run leaves the box SSH-able. $1 is the
 # vast verb (stop|destroy), $2 a human reason for the log.
@@ -52,13 +53,14 @@ teardown() {
   VAST_API_KEY="$CONTAINER_API_KEY" vastai "$1" instance "$CONTAINER_ID" $yes_flag || true
 }
 
-# Any failure during boot (clone, sync, fetch) stops the box (or keeps it under
-# HAL_KEEP_ALIVE) rather than leaving it idle-billing.
-trap 'log "boot failed (line $LINENO)"; teardown stop "boot failure"; exit 1' ERR
+# Any unattended failure destroys the box. Use HAL_KEEP_ALIVE only when a human
+# intends to inspect it immediately.
+trap 'log "boot failed (line $LINENO)"; teardown destroy "boot failure"; exit 1' ERR
 
 # Fail loud + early if the injected inputs are missing (e.g. env recovery found
 # nothing) instead of dying obscurely mid-clone.
 : "${HAL_GIT_SHA:?missing — vast -e env not recovered from /proc/1/environ}"
+: "${HAL_GIT_REMOTE:?missing — vast -e env not recovered from /proc/1/environ}"
 : "${HAL_TRAIN_CMD_B64:?missing — vast -e env not recovered from /proc/1/environ}"
 : "${AWS_ENDPOINT_URL:?missing — R2 creds not recovered from /proc/1/environ}"
 
@@ -81,7 +83,11 @@ rm -rf /opt/hal
 # github.com is reachable from a vast host only most of the time — during a github edge
 # incident the connect times out after ~2 minutes and one blip burns the whole (billed)
 # boot. Retry a few times, then fail loud.
-clone_url="https://${GITHUB_TOKEN:+${GITHUB_TOKEN}@}github.com/ericyuegu/hal.git"
+case "$HAL_GIT_REMOTE" in
+  https://github.com/*) clone_url="https://${GITHUB_TOKEN:+${GITHUB_TOKEN}@}${HAL_GIT_REMOTE#https://}" ;;
+  *) clone_url="$HAL_GIT_REMOTE" ;;
+esac
+log "clone remote: ${HAL_GIT_REMOTE}"
 cloned=0
 for attempt in 1 2 3; do
   if git clone --quiet "$clone_url" /opt/hal; then
@@ -94,7 +100,7 @@ for attempt in 1 2 3; do
 done
 if [ "$cloned" -ne 1 ]; then
   log "FATAL: cannot clone hal after 3 attempts — github.com unreachable from this host"
-  teardown stop "git clone failed (github.com unreachable)"
+  teardown destroy "git clone failed (github.com unreachable)"
   exit 1
 fi
 cd /opt/hal
@@ -113,7 +119,7 @@ shm_mb=$(df -m /dev/shm | awk 'NR==2 {print $2}')
 log "/dev/shm = ${shm_mb}MB"
 if [ "${shm_mb:-0}" -lt 1024 ]; then
   log "FATAL: /dev/shm ${shm_mb}MB < 1GB (remount failed/undersized) — dataloader would die at step 0; aborting"
-  teardown stop "insufficient /dev/shm (${shm_mb}MB)"
+  teardown destroy "insufficient /dev/shm (${shm_mb}MB)"
   exit 1
 fi
 
@@ -141,7 +147,7 @@ mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$CUDA_CACHE_PATH" "$TMP
 for d in "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$CUDA_CACHE_PATH" "$TMPDIR"; do
   if ! touch "$d/.write-test" 2>/dev/null; then
     log "FATAL: compile cache ${d} is not writable — inductor would fall back to a full pool stall; aborting"
-    teardown stop "compile cache unwritable (${d})"
+    teardown destroy "compile cache unwritable (${d})"
     exit 1
   fi
   rm -f "$d/.write-test"
@@ -157,7 +163,7 @@ cache_free_gb=$(df -BG --output=avail /opt/hal-cache | awk 'NR==2 {gsub("G","");
 log "compile-cache free = ${cache_free_gb}GB"
 if [ "${cache_free_gb:-0}" -lt 10 ]; then
   log "FATAL: /opt/hal-cache has ${cache_free_gb}GB free (< 10GB) — a compile worker dying mid-write stalls the run at 0% GPU; aborting"
-  teardown stop "insufficient compile-cache disk (${cache_free_gb}GB)"
+  teardown destroy "insufficient compile-cache disk (${cache_free_gb}GB)"
   exit 1
 fi
 
@@ -182,8 +188,7 @@ ulimit -n "$(ulimit -Hn)" && log "open files (ulimit -n) -> $(ulimit -n)"
 cmd="$(printf '%s' "$HAL_TRAIN_CMD_B64" | base64 -d)"
 log "training: ${cmd}"
 # Run training outside the trap so we can branch on its exit code: success destroys
-# the box (checkpoints already in R2), non-zero stops it (keeps /opt/hal/train.log
-# for inspection / --resume) — both subject to HAL_KEEP_ALIVE.
+# the box. HAL_KEEP_ALIVE preserves it for an explicitly supervised debug run.
 #
 # The trainer writes STRAIGHT to train.log, never through a pipe. A crashed trainer
 # can orphan children (forkserver workers, Dolphin) that inherit its stdout; with
@@ -198,7 +203,7 @@ setsid bash -c "$cmd" >> /opt/hal/train.log 2>&1 & train_pid=$!
 
 # Stall watchdog: a healthy run logs at least every minute (per-step prints, Dolphin
 # output during evals). A trainer silent past the deadline is hung — kill its whole
-# group so `wait` returns and the normal non-zero exit path stops the box.
+# group so `wait` returns and the normal non-zero exit path destroys the box.
 stall_s=$(( ${HAL_STALL_MINUTES:-60} * 60 ))
 (
   while kill -0 "$train_pid" 2>/dev/null; do
@@ -225,5 +230,5 @@ set -e
 if [ "$code" -eq 0 ]; then
   teardown destroy "training succeeded (checkpoints in R2, logs in W&B)"
 else
-  teardown stop "training exited ${code}"
+  teardown destroy "training exited ${code}"
 fi

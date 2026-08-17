@@ -247,6 +247,19 @@ def test_replay_transform_runs_after_validation_and_before_windowing() -> None:
     assert calls == [SCHEMA_VERSION]
 
 
+def test_character_pair_filter_keeps_only_matching_replays() -> None:
+    rows = _fake_mds(n_samples=2)
+    for row, pair in zip(rows, ((1, 1), (1, 20)), strict=True):
+        row["p1_character"] = np.full(len(row["frame"]), pair[0], dtype=np.int32)
+        row["p2_character"] = np.full(len(row["frame"]), pair[1], dtype=np.int32)
+
+    windows = list(WindowDataset(rows, L_CTX, L_CHUNK, seed=0, character_pair=(1, 1)))
+
+    assert len(windows) == 1
+    assert np.all(windows[0]["ego_character"] == 1)
+    assert np.all(windows[0]["opp_character"] == 1)
+
+
 def test_batch_transform_receives_windows_and_normal_train_batch() -> None:
     normal = _train_batch(5)
     windows = [{"ego_return": np.array([3.5], dtype=np.float32)}]

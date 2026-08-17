@@ -223,6 +223,7 @@ class PolicyReplayPackDataset(IterableDataset):
         schema_version: int,
         projection: FeatureProjection | None,
         replay_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        character_pair: tuple[int, int] | None = None,
     ) -> None:
         self._dataset = dataset
         self._L_ctx = L_ctx
@@ -232,12 +233,14 @@ class PolicyReplayPackDataset(IterableDataset):
         self._schema_version = schema_version
         self._projection = projection
         self._replay_transform = replay_transform
+        self._character_pair = character_pair
         self._epoch = 0
 
     def __iter__(self) -> Iterator[ReplayPack]:
         # Defer shared helpers so dataloader can re-export this module safely.
         from hal.training.dataloader import _choose_chunk_starts
         from hal.training.dataloader import _make_window
+        from hal.training.dataloader import _matches_character_pair
 
         epoch = self._epoch
         self._epoch += 1
@@ -246,6 +249,8 @@ class PolicyReplayPackDataset(IterableDataset):
             check_schema_version(
                 {"schema_version": int(compact["source_schema_version"])}, expected=self._schema_version
             )
+            if not _matches_character_pair(compact, self._character_pair):
+                continue
             frames = int(compact["num_frames"])
             rng = _stable_replay_rng(self._seed, epoch, replay_id)
             starts = [
@@ -385,6 +390,7 @@ def make_reservoir_loader(
     projection: FeatureProjection | None = None,
     replay_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     batch_transform: Callable[[list[dict[str, np.ndarray]], TrainBatch], object] | None = None,
+    character_pair: tuple[int, int] | None = None,
 ) -> ReservoirLoader:
     """Build a compact replay loader with replay-aware batches."""
     if predownload < 1:
@@ -411,6 +417,7 @@ def make_reservoir_loader(
         schema_version=schema_version,
         projection=projection,
         replay_transform=replay_transform,
+        character_pair=character_pair,
     )
     if num_workers > 0:
         torch.multiprocessing.set_sharing_strategy("file_system")
